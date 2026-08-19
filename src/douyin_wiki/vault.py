@@ -1,0 +1,819 @@
+from __future__ import annotations
+
+import fcntl
+import os
+import re
+import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import yaml
+
+from .models import (
+    AnalysisResult,
+    EntryRecord,
+    InspirationInput,
+    RetentionPolicy,
+    SourceKind,
+)
+from .time_utils import parse_datetime, utc_now
+
+VAULT_AGENTS = """# Douyin Wiki 维护规则
+
+这个 Vault 是由 AI 维护、供 AI 检索的个人抖音知识库。
+
+- `raw/` 是不可变来源；不得覆盖或删除原始分享文本、ASR、校正版逐字稿和 OCR。
+- `wiki/sources/` 是每条作品的主资料页。
+- `wiki/concepts/`、`wiki/entities/`、`wiki/syntheses/` 保存跨资料知识。
+- 用户填写的“灵感”必须逐字保留，AI 不得代写或改写。
+- 知识页区分作品原话、作品正文、OCR、AI 推断和用户灵感。
+- 回答问题时返回原作品链接；视频引用提供时间戳，图文引用提供图片编号。
+- 过期内容标记为 stale，不静默删除 Markdown。
+- `log.md` 只追加，不改写历史记录。
+"""
+
+
+@dataclass
+class WrittenEntry:
+    raw_path: Path
+    source_path: Path
+    machine_path: Path
+    changed_paths: list[Path]
+
+
+def safe_filename(value: str, *, max_length: int = 80) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|\n\r\t]+", " ", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return (cleaned or "抖音作品")[:max_length].rstrip()
+
+
+def format_timestamp(milliseconds: int | None) -> str:
+    if milliseconds is None:
+        return ""
+    total_seconds = milliseconds // 1000
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def encode_markdown_path(value: str) -> str:
+    """Encode a Vault-relative Markdown destination without escaping path separators."""
+    return quote(Path(value).as_posix(), safe="/.-_~")
+
+
+class VaultWriter:
+    def __init__(self, vault_path: Path) -> None:
+        self.vault_path = vault_path
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        lock_path = self.vault_path / ".douyin-wiki" / "vault.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def initialize(self, *, initialize_git: bool = True) -> list[Path]:
+        directories = [
+            ".obsidian",
+            "raw/assets",
+            "raw/covers",
+            "raw/images",
+            "wiki/sources",
+            "wiki/.data/sources",
+            "wiki/concepts",
+            "wiki/entities",
+            "wiki/syntheses",
+            "wiki/questions",
+            ".douyin-wiki/work",
+        ]
+        for relative in directories:
+            (self.vault_path / relative).mkdir(parents=True, exist_ok=True)
+
+        defaults = {
+            "AGENTS.md": VAULT_AGENTS,
+            "index.md": "---\ntype: index\nupdated: null\n---\n\n# 抖音知识库\n\n暂无内容。\n",
+            "log.md": "---\ntype: log\n---\n\n# 维护日志\n",
+            ".gitignore": (
+                ".DS_Store\n.obsidian/\n.douyin-wiki/\nraw/assets/**/original.*\n"
+                "raw/assets/**/cover.*\nraw/assets/**/audio.wav\n"
+                "raw/assets/**/frames/\nraw/covers/\n"
+                "raw/images/\n"
+            ),
+        }
+        changed: list[Path] = []
+        for relative, content in defaults.items():
+            path = self.vault_path / relative
+            if not path.exists():
+                self._atomic_write(path, content)
+                changed.append(path)
+        gitignore = self.vault_path / ".gitignore"
+        gitignore_content = gitignore.read_text(encoding="utf-8")
+        required_ignores = [
+            ".obsidian/",
+            "raw/assets/**/cover.*",
+            "raw/covers/",
+            "raw/images/",
+        ]
+        missing_ignores = [
+            rule for rule in required_ignores if rule not in gitignore_content.splitlines()
+        ]
+        if missing_ignores:
+            updated = gitignore_content.rstrip() + "\n" + "\n".join(missing_ignores) + "\n"
+            self._atomic_write(gitignore, updated)
+            if gitignore not in changed:
+                changed.append(gitignore)
+        if initialize_git:
+            self._ensure_git()
+            self.commit(changed, "chore: initialize Douyin Wiki vault")
+        return changed
+
+    def write_entry(self, entry: EntryRecord, data: dict[str, Any]) -> WrittenEntry:
+        raw_path = self.vault_path / entry.raw_path
+        source_path = self.vault_path / entry.source_path
+        machine_path = self.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+        changed: list[Path] = []
+        # Render every document before replacing any path. Keep the previous bytes
+        # so a later filesystem failure can restore the complete visible pair.
+        raw_content = None if raw_path.exists() else self._render_raw(entry, data)
+        source_content = self._render_source(entry, data)
+        machine_content = self._render_machine(entry, data)
+        previous = {
+            path: path.read_text(encoding="utf-8") if path.exists() else None
+            for path in (raw_path, source_path, machine_path)
+        }
+        try:
+            if raw_content is not None:
+                self._atomic_write(raw_path, raw_content)
+                changed.append(raw_path)
+            self._atomic_write(source_path, source_content)
+            self._atomic_write(machine_path, machine_content)
+            changed.extend([source_path, machine_path])
+        except Exception:
+            for path, content in previous.items():
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    self._atomic_write(path, content)
+            raise
+
+        analysis = AnalysisResult.model_validate(data["analysis"])
+        for concept in analysis.concepts:
+            path = self.vault_path / "wiki" / "concepts" / f"{safe_filename(concept)}.md"
+            if self._ensure_link_page(path, "concept", concept, entry):
+                changed.append(path)
+        for entity in analysis.entities:
+            path = self.vault_path / "wiki" / "entities" / f"{safe_filename(entity.name)}.md"
+            if self._ensure_link_page(path, "entity", entity.name, entry, entity.description):
+                changed.append(path)
+        return WrittenEntry(
+            raw_path=raw_path,
+            source_path=source_path,
+            machine_path=machine_path,
+            changed_paths=changed,
+        )
+
+    def migrate_inspiration_vocabulary(self) -> list[Path]:
+        """Update system labels while preserving all captured user content."""
+        candidates = [self.vault_path / "AGENTS.md"]
+        candidates.extend((self.vault_path / "raw").glob("*.md"))
+        candidates.extend((self.vault_path / "wiki" / "sources").glob("*.md"))
+        replacements = (
+            ("用户填写的“用途”", "用户填写的“灵感”"),
+            ("用户用途和外部核验", "用户灵感和外部核验"),
+            ("## 采集时用途（逐字保留）", "## 采集时灵感（逐字保留）"),
+            ("## 用户用途（逐字保留）", "## 用户灵感（逐字保留）"),
+            ("## 用户灵感（逐字保留）", "## 灵感"),
+            ("\npurposes:\n", "\ninspirations:\n"),
+            ("AI 不推测用户用途", "AI 不推测用户灵感"),
+        )
+        changed: list[Path] = []
+        for path in candidates:
+            if not path.exists():
+                continue
+            original = path.read_text(encoding="utf-8")
+            updated = original
+            for old, new in replacements:
+                updated = updated.replace(old, new)
+            if updated != original:
+                self._atomic_write(path, updated)
+                changed.append(path)
+        return changed
+
+    def remove_external_validation_labels(self) -> list[Path]:
+        path = self.vault_path / "AGENTS.md"
+        if not path.exists():
+            return []
+        original = path.read_text(encoding="utf-8")
+        updated = original.replace(
+            "- 区分视频原话、AI 推断、用户灵感和外部核验；未核验主张必须标为 `unverified`。",
+            "- 知识页只区分视频原话、AI 推断和用户灵感。",
+        )
+        if updated == original:
+            return []
+        self._atomic_write(path, updated)
+        return [path]
+
+    def refresh_source(self, entry: EntryRecord, data: dict[str, Any]) -> Path:
+        path = self.vault_path / entry.source_path
+        self._atomic_write(path, self._render_source(entry, data))
+        return path
+
+    def rebuild_index(self, entries: list[EntryRecord]) -> Path:
+        now = utc_now().date().isoformat()
+        lines = ["---", "type: index", f"updated: {now}", "---", "", "# 抖音知识库", ""]
+        if not entries:
+            lines.append("暂无内容。")
+        else:
+            lines.extend(["## 作品资料", ""])
+            for entry in sorted(entries, key=lambda item: item.created_at, reverse=True):
+                source_no_suffix = str(Path(entry.source_path).with_suffix(""))
+                status = "（已过期）" if entry.status == "stale" else ""
+                lines.append(
+                    f"- [[{source_no_suffix}|{entry.title}]]{status} — {entry.summary[:120]}"
+                )
+        path = self.vault_path / "index.md"
+        self._atomic_write(path, "\n".join(lines).rstrip() + "\n")
+        return path
+
+    def append_log(self, action: str, title: str, summary: str, paths: list[Path]) -> Path:
+        path = self.vault_path / "log.md"
+        relative_paths = [str(item.relative_to(self.vault_path)) for item in paths]
+        block = (
+            f"\n## [{utc_now().date().isoformat()}] {action} | {title}\n\n"
+            f"- 摘要：{summary}\n"
+            f"- 修改文件：{', '.join(relative_paths)}\n"
+            "- 开放问题：无\n"
+        )
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(block)
+        return path
+
+    def write_maintenance_report(self, report: dict[str, Any]) -> Path:
+        date = utc_now().date().isoformat()
+        path = self.vault_path / "wiki" / "syntheses" / f"维护报告 {date}.md"
+        content = [
+            "---",
+            "type: synthesis",
+            "status: active",
+            f"created: {date}",
+            f"updated: {date}",
+            "tags: [维护报告]",
+            "---",
+            "",
+            f"# 维护报告 {date}",
+            "",
+            "## 结果",
+            "",
+            f"- 标记过期片段：{report.get('stale_chunks', 0)}",
+            f"- 清理媒体：{len(report.get('media_removed', []))}",
+            f"- 孤立页面：{len(report.get('orphan_pages', []))}",
+            "",
+            "## 孤立页面",
+            "",
+        ]
+        content.extend(f"- `{item}`" for item in report.get("orphan_pages", []))
+        self._atomic_write(path, "\n".join(content).rstrip() + "\n")
+        return path
+
+    def commit(self, paths: list[Path], message: str) -> bool:
+        if not paths or not (self.vault_path / ".git").exists():
+            return False
+        relative = []
+        for path in paths:
+            try:
+                relative.append(str(path.relative_to(self.vault_path)))
+            except ValueError:
+                continue
+        if not relative:
+            return False
+        add = subprocess.run(
+            ["git", "add", "--", *relative],
+            cwd=self.vault_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if add.returncode != 0:
+            return False
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=self.vault_path, check=False
+        )
+        if diff.returncode == 0:
+            return False
+        commit = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=self.vault_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return commit.returncode == 0
+
+    def load_entries(self) -> list[tuple[EntryRecord, dict[str, Any]]]:
+        """Rehydrate the rebuildable knowledge cache from tracked Markdown files."""
+        results: list[tuple[EntryRecord, dict[str, Any]]] = []
+        machine_dir = self.vault_path / "wiki" / ".data" / "sources"
+        for machine_path in sorted(machine_dir.glob("*.md")):
+            machine_frontmatter, machine_body = self._parse_document(machine_path)
+            payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
+            if not payload_match:
+                continue
+            payload = yaml.safe_load(payload_match.group("payload")) or {}
+            if not isinstance(payload, dict):
+                continue
+            source_page = machine_frontmatter.get("source_page")
+            if not source_page:
+                continue
+            source_path = self.vault_path / str(source_page)
+            if not source_path.is_file():
+                continue
+            source_frontmatter, source_body = self._parse_document(source_path)
+            analysis = AnalysisResult.model_validate(payload.get("analysis", {}))
+            title_match = re.search(r"^#\s+(.+)$", source_body, re.M)
+            title = title_match.group(1).strip() if title_match else analysis.title
+            captured_at = parse_datetime(source_frontmatter.get("captured_at")) or utc_now()
+            updated_at = parse_datetime(machine_frontmatter.get("updated")) or captured_at
+            inspirations = [
+                InspirationInput.model_validate(item)
+                for item in source_frontmatter.get("inspirations", [])
+            ]
+            retention = RetentionPolicy(
+                source_frontmatter.get("media_retention", RetentionPolicy.TEMPORARY.value)
+            )
+            entry = EntryRecord(
+                id=f"dy-{source_frontmatter['video_id']}",
+                video_id=str(source_frontmatter["video_id"]),
+                title=title,
+                original_url=str(source_frontmatter.get("source_url") or ""),
+                canonical_url=str(source_frontmatter.get("canonical_url") or ""),
+                raw_path=str(source_frontmatter.get("source_path") or ""),
+                source_path=str(source_page),
+                status=str(source_frontmatter.get("status") or "active"),
+                media_status=str(source_frontmatter.get("media_status") or "present"),
+                retention=retention,
+                media_expires_at=parse_datetime(source_frontmatter.get("media_expires_at")),
+                summary=analysis.one_liner,
+                inspirations=inspirations,
+                tags=[str(item) for item in source_frontmatter.get("tags", [])],
+                created_at=captured_at,
+                updated_at=updated_at,
+            )
+            provenance = payload.get("model_provenance", {})
+            data = {
+                "share_text": payload.get("share_text", ""),
+                "inspirations": [item.model_dump(mode="json") for item in inspirations],
+                "metadata": payload.get("metadata", {}),
+                "ocr": payload.get("ocr", []),
+                "review_issues": payload.get("review_issues", []),
+                "relations": payload.get("relations", []),
+                "analysis": analysis.model_dump(mode="json"),
+                "provider": provenance.get("provider"),
+                "model": provenance.get("model"),
+                "prompt_version": provenance.get("prompt_version"),
+                "cover_path": source_frontmatter.get("cover_image"),
+                "cover_kind": source_frontmatter.get("cover_kind"),
+            }
+            if machine_frontmatter.get("source_kind") == SourceKind.VIDEO.value:
+                data["transcript_raw"] = payload.get("transcript_raw", [])
+                data["transcript_corrected"] = payload.get("transcript_corrected", [])
+            results.append((entry, data))
+        return results
+
+    def _ensure_git(self) -> None:
+        if not (self.vault_path / ".git").exists():
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=self.vault_path,
+                capture_output=True,
+                check=False,
+            )
+        subprocess.run(
+            ["git", "config", "user.name", "Douyin Wiki"], cwd=self.vault_path, check=False
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "douyin-wiki@local"],
+            cwd=self.vault_path,
+            check=False,
+        )
+
+    def _render_raw(self, entry: EntryRecord, data: dict[str, Any]) -> str:
+        metadata = data["metadata"]
+        if metadata.get("source_kind") == SourceKind.IMAGE_NOTE.value:
+            return self._render_raw_image_note(entry, data)
+        frontmatter = {
+            "type": "raw-video",
+            "status": "raw",
+            "video_id": entry.video_id,
+            "title": entry.title,
+            "author": metadata.get("author"),
+            "published_at": metadata.get("published_at"),
+            "captured_at": entry.created_at.isoformat(),
+            "original_url": entry.original_url,
+            "canonical_url": entry.canonical_url,
+            "media_retention": entry.retention.value,
+            "media_expires_at": entry.media_expires_at.isoformat()
+            if entry.media_expires_at
+            else None,
+            "model_provider": data.get("provider"),
+            "model": data.get("model"),
+            "prompt_version": data.get("prompt_version"),
+        }
+        lines = [self._frontmatter(frontmatter), f"# {entry.title}", "", "## 原始分享文本", ""]
+        lines.extend(["> " + line for line in data.get("share_text", "").splitlines()])
+        lines.extend(["", "## 采集时灵感（逐字保留）", ""])
+        lines.extend(self._inspiration_lines(entry.inspirations))
+        lines.extend(["", "## 原始逐字稿", ""])
+        lines.extend(self._transcript_lines(data.get("transcript_raw", [])))
+        lines.extend(["", "## 校正逐字稿", ""])
+        lines.extend(self._transcript_lines(data.get("transcript_corrected", [])))
+        lines.extend(["", "## 画面 OCR", ""])
+        for item in data.get("ocr", []):
+            lines.append(f"- [{format_timestamp(item.get('timestamp_ms'))}] {item.get('text', '')}")
+        lines.extend(["", "## 校对记录", ""])
+        for item in data.get("review_issues", []):
+            resolution = item.get("resolution") or "未人工修正"
+            lines.append(
+                f"- [{format_timestamp(item.get('start_ms'))}] `{item.get('raw_text', '')}` → "
+                f"{resolution}（{item.get('reason', '')}）"
+            )
+        lines.extend(["", "## 来源", "", f"- [打开原视频]({entry.original_url})"])
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _render_raw_image_note(self, entry: EntryRecord, data: dict[str, Any]) -> str:
+        metadata = data["metadata"]
+        frontmatter = {
+            "type": "raw-image-note",
+            "source_kind": SourceKind.IMAGE_NOTE.value,
+            "status": "raw",
+            "video_id": entry.video_id,
+            "title": entry.title,
+            "author": metadata.get("author"),
+            "published_at": metadata.get("published_at"),
+            "captured_at": entry.created_at.isoformat(),
+            "original_url": entry.original_url,
+            "canonical_url": entry.canonical_url,
+            "image_paths": metadata.get("image_paths", []),
+            "music_metadata": metadata.get("music_metadata"),
+            "model_provider": data.get("provider"),
+            "model": data.get("model"),
+            "prompt_version": data.get("prompt_version"),
+        }
+        lines = [self._frontmatter(frontmatter), f"# {entry.title}", "", "## 原始分享文本", ""]
+        lines.extend("> " + line for line in data.get("share_text", "").splitlines())
+        lines.extend(["", "## 采集时灵感（逐字保留）", ""])
+        lines.extend(self._inspiration_lines(entry.inspirations))
+        lines.extend(["", "## 作品正文", "", metadata.get("post_text") or "无正文。"])
+        lines.extend(["", "## 原图清单", ""])
+        for index, image_path in enumerate(metadata.get("image_paths", []), start=1):
+            relative = os.path.relpath(image_path, start=Path(entry.raw_path).parent)
+            lines.append(
+                f"- [第 {index} 张图片]({encode_markdown_path(Path(relative).as_posix())})"
+            )
+        lines.extend(["", "## 逐图 OCR", ""])
+        for item in data.get("ocr", []):
+            image_index = item.get("image_index") or "?"
+            lines.append(f"- 第 {image_index} 张：{item.get('text', '')}")
+        if data.get("review_issues"):
+            lines.extend(["", "## 校对记录", ""])
+            for item in data["review_issues"]:
+                resolution = item.get("resolution") or "未人工修正"
+                lines.append(
+                    f"- 第 {item.get('image_index') or '?'} 张："
+                    f"`{item.get('raw_text', '')}` → {resolution}（{item.get('reason', '')}）"
+                )
+        lines.extend(["", "## 来源", "", f"- [打开原作品]({entry.original_url})"])
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _render_source(self, entry: EntryRecord, data: dict[str, Any]) -> str:
+        analysis = AnalysisResult.model_validate(data["analysis"])
+        metadata = data.get("metadata", {})
+        source_kind = metadata.get("source_kind", SourceKind.VIDEO.value)
+        is_image_note = source_kind == SourceKind.IMAGE_NOTE.value
+        cover_path = data.get("cover_path")
+        frontmatter = {
+            "type": "source",
+            "status": entry.status,
+            "video_id": entry.video_id,
+            "source_kind": source_kind,
+            "author": metadata.get("author"),
+            "published_at": metadata.get("published_at"),
+            "captured_at": entry.created_at.isoformat(),
+            "created": entry.created_at.date().isoformat(),
+            "updated": entry.updated_at.date().isoformat(),
+            "source_path": entry.raw_path,
+            "source_url": entry.original_url,
+            "canonical_url": entry.canonical_url,
+            "media_status": entry.media_status,
+            "media_retention": entry.retention.value,
+            "media_expires_at": entry.media_expires_at.isoformat()
+            if entry.media_expires_at
+            else None,
+            "inspirations": [
+                inspiration.model_dump(mode="json") for inspiration in entry.inspirations
+            ],
+            "tags": entry.tags,
+            "model_provider": data.get("provider"),
+            "model": data.get("model"),
+            "prompt_version": data.get("prompt_version"),
+            "cover_image": cover_path,
+            "cover_kind": data.get("cover_kind"),
+            "image_paths": metadata.get("image_paths", []),
+            "analysis_version": 2,
+            "content_type": analysis.content_type,
+            "facets": analysis.facets,
+            "machine_data_path": f"wiki/.data/sources/{entry.video_id}.md",
+        }
+        lines = [self._frontmatter(frontmatter), f"# {entry.title}"]
+        if cover_path:
+            relative_cover = os.path.relpath(
+                cover_path,
+                start=Path(entry.source_path).parent,
+            )
+            alt = "抖音图文第 1 张" if is_image_note else "抖音视频封面"
+            lines.extend(
+                [
+                    "",
+                    f"![{alt}]({encode_markdown_path(Path(relative_cover).as_posix())})",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "## 灵感",
+                "",
+                *self._inspiration_lines(entry.inspirations),
+                "",
+                "## 一句话",
+                "",
+                analysis.one_liner,
+            ]
+        )
+        if analysis.relevance_to_inspiration:
+            lines.extend(
+                ["", "> [!note] AI 推断：与灵感的关系", f"> {analysis.relevance_to_inspiration}"]
+            )
+        if analysis.takeaways:
+            lines.extend(["", "## 核心收获", ""])
+            lines.extend(f"- {value}" for value in analysis.takeaways[:5])
+
+        card_lines = self._content_card_lines(analysis.content_card.model_dump(mode="json"))
+        if card_lines:
+            card_heading = f"## 内容卡片 · {self._content_type_label(analysis.content_type)}"
+            lines.extend(["", card_heading, ""])
+            lines.extend(card_lines)
+
+        remaining_images = metadata.get("image_paths", [])[1:] if is_image_note else []
+        if remaining_images:
+            lines.extend(["", "## 原图", ""])
+            for index, image_path in enumerate(remaining_images, start=2):
+                relative = os.path.relpath(image_path, start=Path(entry.source_path).parent)
+                lines.append(
+                    f"![抖音图文第 {index} 张]({encode_markdown_path(Path(relative).as_posix())})"
+                )
+
+        if analysis.key_moments:
+            lines.extend(["", "## 关键片段", ""])
+            for moment in analysis.key_moments[:5]:
+                source = {
+                    "audio": "语音",
+                    "ocr": "画面",
+                    "audio+ocr": "语音+画面",
+                    "post_text": "作品正文",
+                    "image_ocr": "图片 OCR",
+                    "post_text+image_ocr": "作品正文+图片 OCR",
+                    "ai_inference": "AI 推断",
+                }[moment.evidence_type]
+                quote = f"；原话：{moment.quote}" if moment.quote else ""
+                locator = (
+                    f"第 {moment.image_index} 张"
+                    if moment.image_index is not None
+                    else format_timestamp(moment.timestamp_ms)
+                )
+                prefix = f"[{locator}] " if locator else ""
+                lines.append(f"- {prefix}**{moment.title}** — {moment.summary}（{source}{quote}）")
+
+        if analysis.actions or analysis.reminders:
+            lines.extend(["", "## 下一步", ""])
+            lines.extend(f"- {value}" for value in analysis.actions[:3])
+            for reminder in analysis.reminders[:3]:
+                due = reminder.due_at.isoformat() if reminder.due_at else "时间待澄清"
+                lines.append(f"- 提醒候选：{reminder.title} — {due}")
+        lines.extend(
+            [
+                "",
+                "## 来源",
+                "",
+                f"- [原始采集记录]({encode_markdown_path(f'../../{entry.raw_path}')})",
+                f"- [打开原作品]({entry.original_url})",
+            ]
+        )
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _render_machine(self, entry: EntryRecord, data: dict[str, Any]) -> str:
+        analysis = AnalysisResult.model_validate(data["analysis"])
+        payload = {
+            "analysis": analysis.model_dump(mode="json"),
+            "share_text": data.get("share_text", ""),
+            "inspirations_verbatim": [item.model_dump(mode="json") for item in entry.inspirations],
+            "metadata": data.get("metadata", {}),
+            "ocr": data.get("ocr", []),
+            "review_issues": data.get("review_issues", []),
+            "relations": data.get("relations", []),
+            "model_provenance": {
+                "provider": data.get("provider"),
+                "model": data.get("model"),
+                "prompt_version": data.get("prompt_version"),
+            },
+        }
+        source_kind = data.get("metadata", {}).get("source_kind", SourceKind.VIDEO.value)
+        if source_kind == SourceKind.VIDEO.value:
+            payload["transcript_raw"] = data.get("transcript_raw", [])
+            payload["transcript_corrected"] = data.get("transcript_corrected", [])
+        frontmatter = {
+            "type": "source-machine-data",
+            "status": entry.status,
+            "video_id": entry.video_id,
+            "source_kind": source_kind,
+            "analysis_version": 2,
+            "content_type": analysis.content_type,
+            "facets": analysis.facets,
+            "source_page": entry.source_path,
+            "updated": entry.updated_at.isoformat(),
+        }
+        serialized = yaml.safe_dump(
+            payload, allow_unicode=True, sort_keys=False, default_flow_style=False
+        ).rstrip()
+        return (
+            f"{self._frontmatter(frontmatter)}# Machine Data · {entry.video_id}\n\n"
+            "此文件由 Douyin Wiki 管理，供 Agent 和索引器读取。\n\n"
+            f"```yaml\n{serialized}\n```\n"
+        )
+
+    @staticmethod
+    def _content_type_label(value: str) -> str:
+        return {
+            "tutorial": "教程",
+            "explanation": "知识解释",
+            "opinion": "观点",
+            "recommendation": "推荐",
+            "news_event": "新闻/事件",
+            "story_case": "故事/案例",
+            "collection": "清单",
+            "other": "其他",
+        }.get(value, "其他")
+
+    @staticmethod
+    def _content_card_lines(card: dict[str, Any]) -> list[str]:
+        kind = card.get("kind", "other")
+        labels = {
+            "tutorial": {
+                "goal": "目标",
+                "prerequisites": "前置",
+                "parameters": "参数",
+                "steps": "步骤",
+                "pitfalls": "易错点",
+            },
+            "explanation": {
+                "question": "问题",
+                "concepts": "概念",
+                "mechanism": "机制",
+                "examples": "例子",
+            },
+            "opinion": {
+                "thesis": "结论",
+                "reasons": "理由",
+                "assumptions": "前提",
+                "counterpoints": "反方观点",
+            },
+            "recommendation": {
+                "subjects": "对象",
+                "criteria": "标准",
+                "pros": "优点",
+                "cons": "缺点",
+                "best_for": "适合",
+            },
+            "news_event": {
+                "event": "事件",
+                "absolute_time": "时间",
+                "impact": "影响",
+                "actions": "行动",
+                "valid_until": "有效期",
+            },
+            "story_case": {
+                "context": "背景",
+                "turning_points": "转折",
+                "outcome": "结果",
+                "lessons": "经验",
+            },
+            "collection": {"items": "项目"},
+            "other": {"notes": "要点"},
+        }.get(kind, {})
+        lines: list[str] = []
+        for key, label in labels.items():
+            value = card.get(key)
+            if not value:
+                continue
+            if key == "items":
+                rendered = "; ".join(
+                    f"{item.get('name', '')}（"
+                    f"{'、'.join(item.get('traits', []) + item.get('scenarios', []))}）"
+                    for item in value
+                )
+            elif isinstance(value, list):
+                rendered = "；".join(str(item) for item in value)
+            else:
+                rendered = str(value)
+            lines.append(f"- **{label}**：{rendered}")
+        return lines
+
+    def _ensure_link_page(
+        self,
+        path: Path,
+        page_type: str,
+        title: str,
+        entry: EntryRecord,
+        description: str = "",
+    ) -> bool:
+        source_link = f"[[{Path(entry.source_path).with_suffix('')}|{entry.title}]]"
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            if source_link in content:
+                return False
+            self._atomic_write(path, content.rstrip() + f"\n- {source_link}\n")
+            return True
+        today = utc_now().date().isoformat()
+        content = (
+            f"---\ntype: {page_type}\nstatus: active\ncreated: {today}\n"
+            f"updated: {today}\ntags: []\n---\n\n"
+            f"# {title}\n\n{description}\n\n## 来源\n\n- {source_link}\n"
+        )
+        self._atomic_write(path, content)
+        return True
+
+    @staticmethod
+    def _inspiration_lines(inspirations: list[InspirationInput]) -> list[str]:
+        if not inspirations:
+            return ["- 未填写；AI 不推测用户灵感。"]
+        lines = []
+        for inspiration in inspirations:
+            suffix = ""
+            if inspiration.start_ms is not None:
+                suffix = f"（{format_timestamp(inspiration.start_ms)}"
+                if inspiration.end_ms is not None:
+                    suffix += f"–{format_timestamp(inspiration.end_ms)}"
+                suffix += "）"
+            lines.append(f"- {inspiration.text}{suffix}")
+            if inspiration.quote:
+                lines.append(f"  - 指定原句：{inspiration.quote}")
+        return lines
+
+    @staticmethod
+    def _transcript_lines(segments: list[dict[str, Any]]) -> list[str]:
+        if not segments:
+            return ["无可用逐字稿。"]
+        return [
+            f"[{format_timestamp(segment.get('start_ms'))}] {segment.get('text', '')}"
+            for segment in segments
+        ]
+
+    @staticmethod
+    def _frontmatter(data: dict[str, Any]) -> str:
+        dumped = yaml.safe_dump(
+            data, allow_unicode=True, sort_keys=False, default_flow_style=False
+        ).strip()
+        return f"---\n{dumped}\n---\n"
+
+    @staticmethod
+    def _parse_document(path: Path) -> tuple[dict[str, Any], str]:
+        content = path.read_text(encoding="utf-8")
+        match = re.match(r"^---\s*\n(?P<frontmatter>.*?)\n---\s*\n(?P<body>.*)$", content, re.S)
+        if not match:
+            return {}, content
+        frontmatter = yaml.safe_load(match.group("frontmatter")) or {}
+        return frontmatter, match.group("body")
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, path)
+        finally:
+            temporary = Path(temporary_name)
+            if temporary.exists():
+                temporary.unlink()
