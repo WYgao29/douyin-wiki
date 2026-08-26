@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from ..config import LLMSettings
+from ..config import LLMSettings, llm_api_key_required, llm_is_configured
 from ..errors import ExternalToolError, ModelConfigurationError
 from ..models import (
     AnalysisResult,
@@ -48,13 +48,14 @@ class OpenAICompatibleProvider(AnalysisProvider):
     def __init__(self, settings: LLMSettings) -> None:
         self.settings = settings
         self.model = settings.model
-        self.api_key = get_secret(settings.api_key_env)
-        self.configured = bool(settings.enabled and settings.model and self.api_key)
+        stored_key = get_secret(settings.api_key_env)
+        self.api_key = stored_key if llm_api_key_required(settings.base_url) else ""
+        self.configured = llm_is_configured(settings, self.api_key)
 
     def _require_configured(self) -> None:
         if not self.configured:
             raise ModelConfigurationError(
-                f"请配置 llm.model 和环境变量 {self.settings.api_key_env}"
+                f"请配置 llm.model；云端接口还需配置环境变量 {self.settings.api_key_env}"
             )
 
     async def _json_call(self, system: str, user: str) -> dict[str, Any]:
@@ -69,7 +70,9 @@ class OpenAICompatibleProvider(AnalysisProvider):
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         last_error: Exception | None = None
         for attempt in range(self.settings.max_retries + 1):
             try:

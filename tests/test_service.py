@@ -10,7 +10,7 @@ import pytest
 
 from douyin_wiki.adapters.embeddings import EmbeddingService
 from douyin_wiki.adapters.llm import OpenAICompatibleProvider
-from douyin_wiki.config import EmbeddingSettings
+from douyin_wiki.config import EmbeddingSettings, LLMSettings
 from douyin_wiki.errors import CookieRequiredError, ExternalToolError, JobStateError
 from douyin_wiki.models import (
     AnalysisMode,
@@ -157,7 +157,9 @@ async def test_end_to_end_capture_writes_vault_and_searches(service) -> None:
     assert "https://v.douyin.com/uvHsRpXIn8s/" in source.read_text(encoding="utf-8")
     assert "author: Nee霓公子" in source.read_text(encoding="utf-8")
     source_text = source.read_text(encoding="utf-8")
-    assert "media_retention: temporary" in source_text
+    assert "status: 正常" in source_text
+    assert "media_status: 已保留" in source_text
+    assert "media_retention: 临时保留" in source_text
     assert "cover_image: raw/covers/7672717300746907078.jpg" in source_text
     assert "cover_kind: fallback" in source_text
     assert "analysis_version: 2" in source_text
@@ -522,3 +524,64 @@ def test_worker_catches_up_missed_weekly_maintenance(service) -> None:
     second = worker.run_due_maintenance(now)
     assert first is not None and first["dry_run"] is False
     assert second is None
+
+
+def test_worker_detects_source_change_before_claiming_new_jobs(service) -> None:
+    worker = Worker(
+        service,
+        loaded_signature="loaded-code",
+        signature_provider=lambda: "updated-code",
+    )
+    assert worker.source_changed() is True
+
+
+@pytest.mark.asyncio
+async def test_worker_continues_when_catch_up_maintenance_fails(
+    service, monkeypatch, capsys
+) -> None:
+    worker = Worker(
+        service,
+        loaded_signature="loaded-code",
+        signature_provider=lambda: "updated-code",
+    )
+
+    def fail_maintenance():
+        raise ValueError("broken maintenance")
+
+    monkeypatch.setattr(worker, "run_due_maintenance", fail_maintenance)
+    await worker.run_forever()
+
+    captured = capsys.readouterr()
+    assert "Worker 将继续处理采集任务" in captured.err
+
+
+def test_embedding_model_failure_uses_deterministic_fallback(monkeypatch) -> None:
+    class BrokenSentenceTransformer:
+        def __init__(self, _: str) -> None:
+            raise ValueError("broken model cache")
+
+    monkeypatch.setattr(
+        "sentence_transformers.SentenceTransformer",
+        BrokenSentenceTransformer,
+    )
+    embeddings = EmbeddingService(
+        EmbeddingSettings(provider="sentence-transformers", fallback_dimensions=32)
+    )
+
+    first = embeddings.embed(["本地检索"])[0]
+    second = embeddings.embed(["本地检索"])[0]
+
+    assert first == second
+    assert len(first) == 32
+    assert embeddings.provider_name == "char-ngram-fallback"
+    assert embeddings.last_error == "ValueError: broken model cache"
+
+
+def test_provider_mode_allows_loopback_endpoint_without_api_key(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://localhost:11434/v1", model="local-model")
+    )
+
+    assert provider.configured is True
+    assert provider.api_key == ""

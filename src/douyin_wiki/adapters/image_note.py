@@ -245,6 +245,16 @@ def _metadata_from_aweme(
         post_text=post_text or None,
         music_metadata=music_metadata,
         source_kind=SourceKind.IMAGE_NOTE,
+        creator_sec_uid=(str(author.get("sec_uid") or "") if isinstance(author, dict) else None)
+        or None,
+        creator_uid=(str(author.get("uid") or "") if isinstance(author, dict) else None) or None,
+        creator_unique_id=(str(author.get("unique_id") or "") if isinstance(author, dict) else None)
+        or None,
+        creator_url=(
+            f"https://www.douyin.com/user/{author.get('sec_uid')}"
+            if isinstance(author, dict) and author.get("sec_uid")
+            else None
+        ),
     )
     return metadata, image_urls
 

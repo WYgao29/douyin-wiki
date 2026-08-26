@@ -21,6 +21,7 @@ from ..errors import (
     VideoUnavailableError,
 )
 from ..models import AuthCheckResult, OCRObservation, TranscriptSegment, VideoMetadata
+from .share import extract_creator_sec_uid
 
 DOUYIN_AUTH_COOKIE_NAMES = {"sessionid", "sessionid_ss", "sid_guard"}
 CHROMIUM_DATA_DIRS = {
@@ -394,6 +395,14 @@ class YtDlpDownloader:
             media_path=str(media_path),
             thumbnail_path=str(thumbnail_path) if thumbnail_path else None,
             thumbnail_kind=thumbnail_kind,
+            creator_sec_uid=extract_creator_sec_uid(str(info.get("channel_url") or "")),
+            creator_uid=str(info.get("uploader_id") or "") or None,
+            creator_unique_id=(
+                str(info.get("uploader") or "")
+                if str(info.get("uploader") or "").isdigit()
+                else None
+            ),
+            creator_url=info.get("channel_url") or info.get("uploader_url"),
         )
 
 

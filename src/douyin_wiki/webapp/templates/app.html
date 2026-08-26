@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{ page_title }} · 抖库</title>
+  <script src="/static/theme.js?v={{ web_version }}"></script>
+  <link rel="stylesheet" href="/static/app.css?v={{ web_version }}">
+</head>
+<body data-entry-id="{{ initial_entry_id }}" data-topic-id="{{ initial_topic_id | default('') }}">
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <div class="app-shell" id="app-shell">
+    <aside class="library-sidebar" id="library-sidebar" aria-label="资料库导航">
+      <div class="sidebar-brand-row">
+        <a class="brand" href="/" aria-label="抖库资料库首页">
+          <span class="brand-mark" aria-hidden="true">抖</span>
+          <span class="brand-copy"><strong>抖库</strong><small>个人知识工作台</small></span>
+        </a>
+        <button class="icon-button sidebar-collapse-button" id="sidebar-collapse" type="button" aria-label="收起导航栏" title="收起导航栏">
+          <svg aria-hidden="true"><use href="/static/icons.svg#panel-left"></use></svg>
+        </button>
+      </div>
+
+      <nav class="primary-nav" aria-label="主要导航">
+        <button class="nav-item active" type="button" data-section="all"><svg aria-hidden="true"><use href="/static/icons.svg#library"></use></svg><span>资料库</span></button>
+        <button class="nav-item" type="button" data-section="recent"><svg aria-hidden="true"><use href="/static/icons.svg#clock-3"></use></svg><span>最近加入</span></button>
+        <button class="nav-item" type="button" data-section="inspiration"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg><span>灵感</span></button>
+        <button class="nav-item" id="topics-nav" type="button"><svg aria-hidden="true"><use href="/static/icons.svg#bookmark"></use></svg><span>专题</span></button>
+      </nav>
+
+      <section class="sidebar-section saved-views" aria-labelledby="saved-views-title">
+        <div class="sidebar-section-heading"><h2 id="saved-views-title">已保存视图</h2></div>
+        <button class="saved-view-button" type="button" data-saved-view="video"><svg aria-hidden="true"><use href="/static/icons.svg#video"></use></svg><span>全部视频</span></button>
+        <button class="saved-view-button" type="button" data-saved-view="image_note"><svg aria-hidden="true"><use href="/static/icons.svg#image"></use></svg><span>全部图文</span></button>
+      </section>
+
+      <section class="sidebar-section tags-section" aria-labelledby="common-tags-title">
+        <div class="sidebar-section-heading"><h2 id="common-tags-title">常用标签</h2><button class="text-button" id="all-tags-button" type="button">查看全部</button></div>
+        <div id="sidebar-tags" class="sidebar-tags"></div>
+      </section>
+
+      <div class="sidebar-footer">
+        <label class="theme-control"><svg aria-hidden="true"><use href="/static/icons.svg#monitor"></use></svg><span>外观</span><select data-theme-select aria-label="选择页面主题"><option value="system">跟随系统</option><option value="light">亮色</option><option value="dark">暗色</option></select></label>
+        <a class="settings-nav-link" href="/settings/model"><svg aria-hidden="true"><use href="/static/icons.svg#settings"></use></svg><span>模型设置</span></a>
+        <span class="sidebar-version">Web v{{ web_version }} · 仅本机</span>
+      </div>
+    </aside>
+
+    <main class="library-main" id="main-content" tabindex="-1">
+      <header class="topbar" aria-label="资料库工具栏">
+        <button class="icon-button mobile-nav-button" id="nav-toggle" type="button" aria-label="打开导航栏" aria-controls="library-sidebar" aria-expanded="false"><svg aria-hidden="true"><use href="/static/icons.svg#menu"></use></svg></button>
+        <button class="icon-button sidebar-restore-button" id="sidebar-restore" type="button" aria-label="展开导航栏" title="展开导航栏"><svg aria-hidden="true"><use href="/static/icons.svg#panel-left"></use></svg></button>
+        <label class="search-box" for="search-input"><svg aria-hidden="true"><use href="/static/icons.svg#search"></use></svg><input id="search-input" type="search" placeholder="搜索知识库" autocomplete="off"><kbd><svg aria-hidden="true"><use href="/static/icons.svg#command"></use></svg>K</kbd></label>
+        <div class="toolbar-actions">
+          <div class="popover-anchor">
+            <button class="toolbar-button" id="filter-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="filter-popover"><svg aria-hidden="true"><use href="/static/icons.svg#filter"></use></svg><span>筛选</span><span id="filter-count" class="control-count hidden"></span></button>
+            <section class="filter-popover hidden" id="filter-popover" aria-label="筛选资料" tabindex="-1">
+              <header><div><strong>筛选资料</strong><span>分类内可多选</span></div><button class="icon-button" id="filter-close" type="button" aria-label="关闭筛选"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+              <div class="filter-scroll">
+                <fieldset><legend>博主</legend><div id="author-filters" class="choice-list"></div></fieldset>
+                <fieldset><legend>内容类型</legend><div id="type-filters" class="choice-list"></div></fieldset>
+                <fieldset><legend>来源类型</legend><div id="source-filters" class="choice-list"></div></fieldset>
+                <fieldset><legend>标签</legend><div id="tag-filters" class="choice-list wrap"></div></fieldset>
+                <label class="check-row"><input id="inspiration-only" type="checkbox"><span>仅显示有灵感的文章</span></label>
+              </div>
+              <footer><button class="text-button" id="clear-filters" type="button">清除全部</button><button class="primary-button" id="apply-filters" type="button">完成</button></footer>
+            </section>
+          </div>
+          <label class="select-control"><svg aria-hidden="true"><use href="/static/icons.svg#arrow-up-down"></use></svg><span class="sr-only">排序方式</span><select id="sort-select" aria-label="排序方式"><option value="captured_desc">最近加入</option><option value="published_desc">发布时间：从新到旧</option><option value="published_asc">发布时间：从旧到新</option><option value="title_asc">标题</option><option value="author_asc">博主</option></select></label>
+          <div class="segmented-control" role="group" aria-label="资料库视图"><button id="view-list" type="button" data-library-view="list" aria-label="列表视图" title="列表视图" aria-pressed="false"><svg aria-hidden="true"><use href="/static/icons.svg#list"></use></svg></button><button id="view-gallery" type="button" data-library-view="gallery" aria-label="专辑墙视图" title="专辑墙视图" aria-pressed="true"><svg aria-hidden="true"><use href="/static/icons.svg#layout-grid"></use></svg></button></div>
+          <button class="icon-button density-button" id="density-toggle" type="button" aria-label="切换为紧凑密度" title="切换显示密度"><svg aria-hidden="true"><use href="/static/icons.svg#sliders-horizontal"></use></svg></button>
+          <button class="toolbar-button" id="topic-select-toggle" type="button" aria-pressed="false"><svg aria-hidden="true"><use href="/static/icons.svg#check"></use></svg><span>创建专题</span></button>
+          <button class="toolbar-button chat-toggle-button" id="chat-toggle" type="button" aria-label="打开 AI 对话" aria-controls="chat-panel" aria-expanded="true"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg><span>AI</span></button>
+        </div>
+      </header>
+
+      <section id="library-view" class="content-view" aria-labelledby="view-title">
+        <header class="page-heading"><div><h1 id="view-title">资料库</h1><p id="view-summary">整理并检索已经入库的抖音知识</p></div><span id="result-count" class="result-count" aria-live="polite">正在加载…</span></header>
+        <div id="applied-filters" class="applied-filters hidden" aria-label="已应用筛选"></div>
+        <div id="library-status" class="library-status" aria-live="polite"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div>
+        <div id="library-results" class="library-results hidden"></div>
+        <section id="empty-library" class="empty-state hidden"><svg aria-hidden="true"><use href="/static/icons.svg#file-text"></use></svg><h2>资料库还是空的</h2><p>通过 Agent 或 CLI 保存作品后，文章会自动出现在这里。</p></section>
+        <section id="empty-results" class="empty-state hidden"><svg aria-hidden="true"><use href="/static/icons.svg#search"></use></svg><h2>没有找到匹配文章</h2><p id="empty-results-copy">调整搜索词或清除筛选后再试。</p><button class="secondary-button" id="empty-clear" type="button">清除搜索和筛选</button></section>
+        <section id="library-error" class="empty-state error-state hidden" role="alert"><svg aria-hidden="true"><use href="/static/icons.svg#alert-circle"></use></svg><h2>资料库暂时无法载入</h2><p id="library-error-copy"></p><button class="secondary-button" id="library-retry" type="button"><svg aria-hidden="true"><use href="/static/icons.svg#rotate-ccw"></use></svg>重试</button></section>
+      </section>
+
+      <article id="article-view" class="article-view hidden" aria-live="polite"><nav class="article-breadcrumb" aria-label="文章路径"><button id="back-library" type="button"><svg aria-hidden="true"><use href="/static/icons.svg#chevron-left"></use></svg>资料库</button></nav><div id="article-content"></div></article>
+      <section id="topics-view" class="content-view hidden" aria-labelledby="topics-title"><header class="page-heading"><div><h1 id="topics-title">专题</h1><p>围绕选定来源持续研究与决策</p></div><button class="primary-button" id="topics-create-button" type="button">创建专题</button></header><div id="topics-list" class="topics-list"></div></section>
+      <article id="topic-view" class="topic-view hidden" aria-live="polite"><nav class="article-breadcrumb" aria-label="专题路径"><button id="back-topics" type="button"><svg aria-hidden="true"><use href="/static/icons.svg#chevron-left"></use></svg>专题</button></nav><div id="topic-content"></div></article>
+    </main>
+
+    <aside class="chat-panel" id="chat-panel" aria-label="抖库 AI 对话">
+      <header class="chat-header">
+        <div class="chat-title"><span class="ai-mark" aria-hidden="true"><svg><use href="/static/icons.svg#sparkles"></use></svg></span><div><h2>抖库 AI</h2><span>基于你的资料回答</span></div></div>
+        <div class="chat-header-actions"><button class="icon-button" id="new-session" type="button" aria-label="新建对话" title="新建对话"><svg aria-hidden="true"><use href="/static/icons.svg#plus"></use></svg></button><div class="popover-anchor"><button class="icon-button" id="chat-menu-toggle" type="button" aria-label="打开对话菜单" aria-expanded="false"><svg aria-hidden="true"><use href="/static/icons.svg#more-horizontal"></use></svg></button><div class="chat-menu hidden" id="chat-menu"><a href="/settings/model"><svg aria-hidden="true"><use href="/static/icons.svg#settings"></use></svg>模型设置</a><button id="delete-session" type="button"><svg aria-hidden="true"><use href="/static/icons.svg#trash-2"></use></svg>删除当前对话</button></div></div><button class="icon-button" id="chat-close" type="button" aria-label="收起 AI 对话" title="收起 AI 对话"><svg aria-hidden="true"><use href="/static/icons.svg#panel-right"></use></svg></button></div>
+      </header>
+      <div class="session-row"><label for="session-select">历史对话</label><select id="session-select" aria-label="切换历史对话"></select></div>
+      <div class="chat-context" id="chat-context"><svg aria-hidden="true"><use href="/static/icons.svg#library"></use></svg><span>整个资料库</span></div>
+      <div id="chat-persistent-error" class="chat-persistent-error hidden" role="alert"></div>
+      <div id="chat-messages" class="chat-messages" aria-label="对话消息"></div>
+      <div class="chat-status" aria-live="polite"><a id="model-label" href="/settings/model">模型：正在读取…</a><span id="token-label">用量：—</span></div>
+      <form id="chat-form" class="chat-composer"><label class="sr-only" for="chat-input">向抖库 AI 提问</label><textarea id="chat-input" rows="1" maxlength="8000" placeholder="向知识库提问…"></textarea><button type="submit" id="send-button" aria-label="发送消息"><svg aria-hidden="true"><use href="/static/icons.svg#send"></use></svg><span class="sr-only">发送</span></button><div class="composer-hint">Enter 发送 · Shift + Enter 换行</div></form>
+      <p class="privacy-note">仅文字证据会发送给模型；图片、视频和 Cookie 始终留在本机。</p>
+    </aside>
+  </div>
+
+  <button class="chat-restore-button hidden" id="chat-restore" type="button" aria-label="展开 AI 对话"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg><span>抖库 AI</span></button>
+  <div class="drawer-backdrop hidden" id="drawer-backdrop"></div>
+
+  <dialog id="command-dialog" class="command-dialog" aria-labelledby="command-title"><form method="dialog" class="command-shell"><h2 id="command-title" class="sr-only">搜索知识库</h2><label class="command-search" for="command-input"><svg aria-hidden="true"><use href="/static/icons.svg#search"></use></svg><input id="command-input" type="search" placeholder="搜索文章、博主、标签或灵感" autocomplete="off"><kbd>Esc</kbd></label><div id="command-results" class="command-results" role="listbox" aria-label="文章搜索结果"></div><p class="command-help">↑↓ 选择 · Enter 打开 · Esc 关闭</p></form></dialog>
+
+  <dialog id="inspiration-dialog" class="inspiration-dialog" aria-labelledby="inspiration-title" aria-describedby="inspiration-description">
+    <form method="dialog" id="inspiration-form">
+      <header><div><span class="dialog-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg>写回 Obsidian</span><h2 id="inspiration-title">保存为灵感</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭灵感窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <p id="inspiration-description" class="dialog-description">系统会逐字保存你的内容，AI 不会自动改写。</p>
+      <label for="inspiration-entry">目标文章<select id="inspiration-entry" required></select></label>
+      <label for="inspiration-text">灵感原文<textarea id="inspiration-text" rows="5" maxlength="4000" required></textarea></label>
+      <label for="inspiration-quote">对应原句（可选）<textarea id="inspiration-quote" rows="3" maxlength="4000"></textarea></label>
+      <div class="time-fields"><label for="inspiration-start">开始毫秒（可选）<input id="inspiration-start" type="number" min="0"></label><label for="inspiration-end">结束毫秒（可选）<input id="inspiration-end" type="number" min="0"></label></div>
+      <p id="inspiration-error" class="dialog-error hidden" role="alert"></p>
+      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-inspiration" class="primary-button" value="default" type="submit">确认保存</button></div>
+    </form>
+  </dialog>
+  <dialog id="topic-dialog" class="inspiration-dialog" aria-labelledby="topic-dialog-title">
+    <form method="dialog" id="topic-form">
+      <header><div><span class="dialog-kicker">选定来源研究</span><h2 id="topic-dialog-title">创建专题</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <p class="dialog-description">专题问答只会使用你选择并启用的文章，不会回退到全库。</p>
+      <label for="topic-title-input">专题标题<input id="topic-title-input" maxlength="200" required></label>
+      <label for="topic-goal-input">研究目标<textarea id="topic-goal-input" rows="3" maxlength="4000"></textarea></label>
+      <label for="topic-instructions-input">自定义指令（可选）<textarea id="topic-instructions-input" rows="3" maxlength="8000"></textarea></label>
+      <p id="topic-selection-summary" class="dialog-description"></p>
+      <p id="topic-error" class="dialog-error hidden" role="alert"></p>
+      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-topic" class="primary-button" value="default" type="submit">创建专题</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="screen-reader-status" class="sr-only" role="status" aria-live="polite"></div>
+  <script src="/static/app.js?v={{ web_version }}" defer></script>
+</body>
+</html>

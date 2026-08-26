@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import json
+import webbrowser
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from .config import AppConfig, default_config_path, load_config
+from .config import AppConfig, default_config_path, llm_api_key_required, load_config
+from .localization import (
+    localize_for_user,
+    parse_creator_decision,
+    parse_job_status,
+    parse_retention,
+)
 from .models import (
     AnalysisMode,
     CaptureOptions,
+    CreatorWorkDecision,
     GatewayContext,
     InspirationInput,
-    JobStatus,
-    RetentionPolicy,
     ReviewIssue,
+    SourceKind,
     TranscriptCorrection,
 )
 from .secrets import store_secret
@@ -23,6 +30,7 @@ from .service import DouyinWikiService
 from .setup import (
     LaunchAgentInstaller,
     VaultSetupMode,
+    WebLaunchAgentInstaller,
     obsidian_vault_status,
     validate_vault_target,
     write_config,
@@ -30,7 +38,7 @@ from .setup import (
 from .setup import doctor as run_doctor
 from .worker import Worker
 
-app = typer.Typer(help="本地优先的抖音 AI 知识库")
+app = typer.Typer(help="抖库：本地优先的抖音 AI 知识库")
 jobs_app = typer.Typer(help="任务队列")
 review_app = typer.Typer(help="逐字稿人工校对")
 entry_app = typer.Typer(help="知识条目")
@@ -42,6 +50,9 @@ worker_app = typer.Typer(help="后台 worker")
 service_app = typer.Typer(help="macOS LaunchAgent")
 gateway_app = typer.Typer(help="OpenClaw/Hermes Gateway Agent 交接")
 auth_app = typer.Typer(help="浏览器登录与授权")
+creator_app = typer.Typer(help="抖音博主批量采集与手动同步")
+web_app = typer.Typer(help="抖库本机网页")
+topic_app = typer.Typer(help="选定来源的专题研究")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(review_app, name="review")
 app.add_typer(entry_app, name="entry")
@@ -54,22 +65,69 @@ app.add_typer(worker_app, name="worker")
 app.add_typer(service_app, name="service")
 app.add_typer(gateway_app, name="gateway")
 app.add_typer(auth_app, name="auth")
+app.add_typer(creator_app, name="creator")
+app.add_typer(web_app, name="web")
+app.add_typer(topic_app, name="topic")
 
 
 def _service(config_path: Path | None = None) -> DouyinWikiService:
     service = DouyinWikiService(load_config(config_path))
-    service.database.initialize()
+    service.initialize_runtime()
     return service
 
 
 def _print(value) -> None:
-    if hasattr(value, "model_dump"):
-        value = value.model_dump(mode="json")
-    elif isinstance(value, list):
-        value = [
-            item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in value
-        ]
+    value = localize_for_user(value)
     typer.echo(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _job_status_option(value: str):
+    try:
+        return parse_job_status(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _creator_decision_option(value: str):
+    try:
+        return parse_creator_decision(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _retention_option(value: str):
+    try:
+        return parse_retention(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _parse_number_ranges(value: str | None) -> list[int]:
+    if not value:
+        return []
+    result: set[int] = set()
+    for raw in value.replace("，", ",").split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise typer.BadParameter(f"无效编号范围：{item}") from exc
+            if start < 1 or end < start:
+                raise typer.BadParameter(f"无效编号范围：{item}")
+            result.update(range(start, end + 1))
+        else:
+            try:
+                number = int(item)
+            except ValueError as exc:
+                raise typer.BadParameter(f"无效编号：{item}") from exc
+            if number < 1:
+                raise typer.BadParameter(f"无效编号：{item}")
+            result.add(number)
+    return sorted(result)
 
 
 def _prompt_vault_target() -> tuple[Path, VaultSetupMode]:
@@ -84,7 +142,7 @@ def _prompt_vault_target() -> tuple[Path, VaultSetupMode]:
                 default=str(Path.home() / "Documents" / "Obsidian"),
             )
         )
-        name = typer.prompt("Vault 名称", default="Douyin-Wiki").strip()
+        name = typer.prompt("Vault 名称", default="抖库").strip()
         if not name or Path(name).name != name or name in {".", ".."}:
             raise typer.BadParameter("Vault 名称只能是单个目录名称")
         return parent / name, VaultSetupMode.NEW
@@ -160,29 +218,35 @@ def init_command(
 def configure_model(
     model: Annotated[str, typer.Option(prompt=True, help="模型名称")],
     api_key: Annotated[
-        str,
+        str | None,
         typer.Option(
-            prompt=True,
             hide_input=True,
-            confirmation_prompt=True,
-            help="API key",
+            help="API key；本机 loopback 模型可留空",
         ),
-    ],
+    ] = None,
     base_url: Annotated[str | None, typer.Option(help="OpenAI-compatible base URL")] = None,
     config_path: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     target = config_path or default_config_path()
     config = load_config(target)
+    resolved_base_url = base_url or config.llm.base_url
+    if llm_api_key_required(resolved_base_url) and not api_key:
+        api_key = typer.prompt(
+            "API key",
+            hide_input=True,
+            confirmation_prompt=True,
+        )
     llm = config.llm.model_copy(
         update={
             "enabled": True,
             "model": model,
-            "base_url": base_url or config.llm.base_url,
+            "base_url": resolved_base_url,
         }
     )
     config = config.model_copy(update={"llm": llm, "analysis_mode": AnalysisMode.PROVIDER})
     write_config(config, target, overwrite=True)
-    store_secret(config.llm.api_key_env, api_key)
+    if api_key:
+        store_secret(config.llm.api_key_env, api_key)
     installer = LaunchAgentInstaller(target)
     worker_plist = installer.launch_agents / f"{installer.WORKER_LABEL}.plist"
     restarted = False
@@ -195,7 +259,9 @@ def configure_model(
             "model": config.llm.model,
             "base_url": config.llm.base_url,
             "analysis_mode": config.analysis_mode.value,
-            "secret": f"macOS Keychain:{config.llm.api_key_env}",
+            "secret": (
+                f"macOS Keychain:{config.llm.api_key_env}" if api_key else "本机接口无需密钥"
+            ),
             "worker_restarted": restarted,
         }
     )
@@ -248,7 +314,9 @@ def capture_command(
     quote: Annotated[str | None, typer.Option()] = None,
     start_ms: Annotated[int | None, typer.Option()] = None,
     end_ms: Annotated[int | None, typer.Option()] = None,
-    retention: Annotated[RetentionPolicy, typer.Option()] = RetentionPolicy.TEMPORARY,
+    retention: Annotated[
+        str, typer.Option(help="媒体保留方式：临时保留、永久保留或处理后清理")
+    ] = "临时保留",
     allow_long: Annotated[bool, typer.Option()] = False,
     approve_cloud_analysis: Annotated[bool, typer.Option()] = False,
     approve_ai_analysis: Annotated[bool, typer.Option()] = False,
@@ -268,7 +336,7 @@ def capture_command(
         share_text,
         inspirations,
         CaptureOptions(
-            retention=retention,
+            retention=_retention_option(retention),
             allow_long=allow_long,
             approve_cloud_analysis=approve_ai_analysis or approve_cloud_analysis,
         ),
@@ -285,6 +353,130 @@ def capture_command(
     _print(job)
 
 
+@creator_app.command("add")
+def creator_add(
+    source_text: Annotated[str, typer.Argument(help="博主主页或其任意作品分享文本")],
+    inspiration: Annotated[list[str] | None, typer.Option("--inspiration", "-i")] = None,
+    retention: Annotated[
+        str, typer.Option(help="媒体保留方式：临时保留、永久保留或处理后清理")
+    ] = "临时保留",
+    allow_long: bool = False,
+    gateway: str | None = None,
+    conversation_id: str | None = None,
+    config_path: Path | None = None,
+) -> None:
+    context = GatewayContext(gateway=gateway, conversation_id=conversation_id) if gateway else None
+    _print(
+        _service(config_path).capture_douyin_creator(
+            source_text,
+            [InspirationInput(text=value) for value in (inspiration or [])],
+            CaptureOptions(retention=_retention_option(retention), allow_long=allow_long),
+            context,
+        )
+    )
+
+
+@creator_app.command("inventory")
+def creator_inventory(
+    job_id: str,
+    page: int | None = None,
+    limit: int | None = None,
+    decision: Annotated[
+        str | None, typer.Option(help="按作品状态筛选，例如：待入库、已选入库、未入库、已入库")
+    ] = None,
+    source_kind: SourceKind | None = None,
+    query: str | None = None,
+    config_path: Path | None = None,
+) -> None:
+    _print(
+        _service(config_path).get_creator_inventory(
+            job_id,
+            page=page,
+            limit=limit,
+            decision=_creator_decision_option(decision) if decision else None,
+            source_kind=source_kind,
+            query=query,
+        )
+    )
+
+
+@creator_app.command("select")
+def creator_select(
+    job_id: str,
+    include: Annotated[str | None, typer.Option(help="例如 1-10,15")] = None,
+    exclude: Annotated[str | None, typer.Option(help="例如 11-14")] = None,
+    config_path: Path | None = None,
+) -> None:
+    if not include and not exclude:
+        raise typer.BadParameter("至少提供 --include 或 --exclude")
+    service = _service(config_path)
+    results = []
+    if include:
+        results.append(
+            service.set_creator_work_selection(
+                job_id,
+                CreatorWorkDecision.SELECTED,
+                ordinals=_parse_number_ranges(include),
+            )
+        )
+    if exclude:
+        results.append(
+            service.set_creator_work_selection(
+                job_id,
+                CreatorWorkDecision.SKIPPED,
+                ordinals=_parse_number_ranges(exclude),
+            )
+        )
+    _print(results[-1] if len(results) == 1 else {"updates": results})
+
+
+@creator_app.command("confirm")
+def creator_confirm(
+    job_id: str,
+    accept_partial: bool = False,
+    config_path: Path | None = None,
+) -> None:
+    _print(_service(config_path).confirm_creator_import(job_id, accept_partial=accept_partial))
+
+
+@creator_app.command("import")
+def creator_import(
+    creator_id: str,
+    work_id: Annotated[list[str], typer.Option("--work-id")],
+    gateway: str | None = None,
+    conversation_id: str | None = None,
+    config_path: Path | None = None,
+) -> None:
+    context = GatewayContext(gateway=gateway, conversation_id=conversation_id) if gateway else None
+    _print(_service(config_path).import_creator_works(creator_id, work_id, gateway_context=context))
+
+
+@creator_app.command("show")
+def creator_show(creator_id: str, config_path: Path | None = None) -> None:
+    _print(_service(config_path).get_creator(creator_id))
+
+
+@creator_app.command("list")
+def creator_list(config_path: Path | None = None) -> None:
+    _print(_service(config_path).list_creators())
+
+
+@creator_app.command("works")
+def creator_works(creator_id: str, config_path: Path | None = None) -> None:
+    _print(_service(config_path).list_creator_works(creator_id))
+
+
+@creator_app.command("sync")
+def creator_sync(
+    creator_id: str,
+    gateway: str | None = None,
+    conversation_id: str | None = None,
+    config_path: Path | None = None,
+) -> None:
+    context = GatewayContext(gateway=gateway, conversation_id=conversation_id) if gateway else None
+    _print(_service(config_path).sync_creator(creator_id, gateway_context=context))
+
+
 @auth_app.command("douyin")
 def auth_douyin(
     timeout_seconds: Annotated[
@@ -292,7 +484,7 @@ def auth_douyin(
     ] = 600,
     config_path: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
-    typer.echo("正在打开 Douyin Wiki 专用浏览器，请在窗口中完成抖音登录……")
+    typer.echo("正在打开抖库专用浏览器，请在窗口中完成抖音登录……")
     _print(asyncio.run(_service(config_path).authenticate_douyin(timeout_seconds=timeout_seconds)))
 
 
@@ -322,9 +514,13 @@ def jobs_get(job_id: str, config_path: Path | None = None) -> None:
 
 @jobs_app.command("list")
 def jobs_list(
-    status: JobStatus | None = None, limit: int = 50, config_path: Path | None = None
+    status: Annotated[
+        str | None, typer.Option(help="按中文任务状态筛选，例如：待处理、正在下载、已完成")
+    ] = None,
+    limit: int = 50,
+    config_path: Path | None = None,
 ) -> None:
-    _print(_service(config_path).list_jobs(status, limit))
+    _print(_service(config_path).list_jobs(_job_status_option(status) if status else None, limit))
 
 
 @jobs_app.command("events")
@@ -440,6 +636,93 @@ def search_command(
     _print(_service(config_path).search_knowledge(query, include_stale=include_stale, limit=limit))
 
 
+@topic_app.command("create")
+def topic_create(
+    title: str,
+    entry_id: Annotated[list[str], typer.Option("--entry-id", help="专题来源文章 ID，可重复")],
+    goal: Annotated[str, typer.Option(help="研究目标")] = "",
+    instructions: Annotated[str, typer.Option(help="专题自定义指令")] = "",
+    config_path: Path | None = None,
+) -> None:
+    _print(
+        _service(config_path).create_topic(
+            title,
+            entry_id,
+            goal=goal,
+            instructions=instructions,
+        )
+    )
+
+
+@topic_app.command("list")
+def topic_list(config_path: Path | None = None) -> None:
+    _print(_service(config_path).list_topics())
+
+
+@topic_app.command("show")
+def topic_show(topic_id: str, config_path: Path | None = None) -> None:
+    _print(_service(config_path).get_topic(topic_id))
+
+
+@topic_app.command("sources")
+def topic_sources(
+    topic_id: str,
+    enable: Annotated[list[str] | None, typer.Option("--enable", help="启用文章 ID")] = None,
+    disable: Annotated[list[str] | None, typer.Option("--disable", help="停用文章 ID")] = None,
+    config_path: Path | None = None,
+) -> None:
+    service = _service(config_path)
+    value = service.get_topic(topic_id)
+    enabled_ids = set(enable or [])
+    disabled_ids = set(disable or [])
+    sources = [
+        {
+            "entry_id": source["entry_id"],
+            "enabled": (
+                True
+                if source["entry_id"] in enabled_ids
+                else False
+                if source["entry_id"] in disabled_ids
+                else source["enabled"]
+            ),
+        }
+        for source in value["topic"]["sources"]
+    ]
+    _print(service.set_topic_sources(topic_id, sources))
+
+
+@topic_app.command("search")
+def topic_search(
+    topic_id: str,
+    query: str,
+    include_stale: bool = False,
+    limit: int = 10,
+    config_path: Path | None = None,
+) -> None:
+    _print(
+        _service(config_path).search_topic(
+            topic_id, query, include_stale=include_stale, limit=limit
+        )
+    )
+
+
+@topic_app.command("generate")
+def topic_generate(
+    topic_id: str,
+    kind: Annotated[
+        str,
+        typer.Option(
+            help="成果类型：overview/comparison/evidence_map/consensus/decision_brief/faq"
+        ),
+    ] = "overview",
+    config_path: Path | None = None,
+) -> None:
+    allowed = {"overview", "comparison", "evidence_map", "consensus", "decision_brief", "faq"}
+    if kind not in allowed:
+        raise typer.BadParameter("不支持的成果类型")
+    _print(asyncio.run(_service(config_path).generate_topic_artifact(topic_id, kind)))
+
+
 @entry_app.command("show")
 def entry_show(entry_id: str, documents: bool = False, config_path: Path | None = None) -> None:
     _print(_service(config_path).get_entry(entry_id, include_documents=documents))
@@ -538,7 +821,7 @@ def maintenance_run(apply: bool = False, config_path: Path | None = None) -> Non
 
 @database_app.command("rebuild")
 def database_rebuild(apply: bool = False, config_path: Path | None = None) -> None:
-    """从隐藏机器侧车重建条目、FTS、向量、关系与提醒缓存。"""
+    """从隐藏侧车重建博主、作品、FTS、向量、关系与提醒缓存。"""
     _print(_service(config_path).rebuild_database_from_vault(apply=apply))
 
 
@@ -571,6 +854,52 @@ def service_install(config_path: Path | None = None) -> None:
 def service_uninstall(config_path: Path | None = None) -> None:
     paths = LaunchAgentInstaller(config_path).uninstall()
     _print({"removed": [str(path) for path in paths]})
+
+
+@web_app.command("run")
+def web_run(config_path: Path | None = None) -> None:
+    """在前台运行本机网页服务。"""
+    from .webapp import run_web
+
+    run_web(config_path)
+
+
+@web_app.command("open")
+def web_open(config_path: Path | None = None) -> None:
+    """使用默认浏览器打开抖库网页。"""
+    config = load_config(config_path)
+    address = f"http://{config.web.host}:{config.web.port}"
+    opened = webbrowser.open(address)
+    _print({"status": "已打开" if opened else "请手动打开", "address": address})
+
+
+@web_app.command("install")
+def web_install(config_path: Path | None = None) -> None:
+    """登录 macOS 后自动运行并保持抖库网页存活。"""
+    target = config_path or default_config_path()
+    path = WebLaunchAgentInstaller(target).install()
+    config = load_config(target)
+    _print(
+        {
+            "status": "安装完成",
+            "launch_agent": str(path),
+            "address": f"http://{config.web.host}:{config.web.port}",
+        }
+    )
+
+
+@web_app.command("uninstall")
+def web_uninstall(config_path: Path | None = None) -> None:
+    """移除网页常驻服务；不会删除资料库或聊天记录。"""
+    removed = WebLaunchAgentInstaller(config_path).uninstall()
+    _print({"status": "已移除" if removed else "未安装", "removed": str(removed or "")})
+
+
+@web_app.command("status")
+def web_status(config_path: Path | None = None) -> None:
+    """检查网页服务与本机地址。"""
+    config = load_config(config_path)
+    _print(WebLaunchAgentInstaller(config_path).status(config))
 
 
 def main() -> None:

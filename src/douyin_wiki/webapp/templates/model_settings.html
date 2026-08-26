@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{{ page_title }} · 抖库</title>
+  <script src="/static/theme.js?v={{ web_version }}"></script>
+  <link rel="stylesheet" href="/static/app.css?v={{ web_version }}">
+</head>
+<body>
+  <a class="skip-link" href="#settings-main">跳到主要内容</a>
+  <div class="settings-shell">
+    <aside class="settings-sidebar" aria-label="设置导航">
+      <a class="brand" href="/" aria-label="返回抖库资料库"><span class="brand-mark" aria-hidden="true">抖</span><span class="brand-copy"><strong>抖库</strong><small>个人知识工作台</small></span></a>
+      <nav class="settings-nav" aria-label="设置分类">
+        <a class="active" href="/settings/model"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg><span>模型设置</span></a>
+      </nav>
+      <div class="sidebar-footer">
+        <label class="theme-control"><svg aria-hidden="true"><use href="/static/icons.svg#monitor"></use></svg><span>外观</span><select data-theme-select aria-label="选择页面主题"><option value="system">跟随系统</option><option value="light">亮色</option><option value="dark">暗色</option></select></label>
+        <a class="settings-nav-link" href="/"><svg aria-hidden="true"><use href="/static/icons.svg#chevron-left"></use></svg><span>返回资料库</span></a>
+        <span class="sidebar-version">Web v{{ web_version }} · 仅本机</span>
+      </div>
+    </aside>
+
+    <main class="settings-main" id="settings-main" tabindex="-1">
+      <header class="settings-heading">
+        <span class="page-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg>抖库 AI</span>
+        <h1>模型设置</h1>
+        <p>配置知识库对话使用的 OpenAI-compatible 模型。资料浏览与本地检索不消耗 token。</p>
+      </header>
+
+      <section class="model-status-card" aria-live="polite">
+        <span id="model-status-dot" class="status-indicator" aria-hidden="true"></span>
+        <div><strong id="model-status-title">正在读取配置…</strong><p id="model-status-copy">请稍候</p></div>
+      </section>
+
+      <form id="model-settings-form" class="settings-form">
+        <section class="settings-section" aria-labelledby="interface-title">
+          <header><h2 id="interface-title">模型接口</h2><p>兼容 OpenAI Chat Completions 的服务均可使用。</p></header>
+          <label class="settings-field" for="model-base-url"><span>接口地址</span><input id="model-base-url" type="url" maxlength="2048" required placeholder="https://api.openai.com/v1" list="endpoint-presets" autocomplete="url"><small>云端接口通常以 <code>/v1</code> 结尾；也支持本机 LM Studio、Ollama 等服务。</small></label>
+          <datalist id="endpoint-presets"><option value="https://api.openai.com/v1">OpenAI</option><option value="http://127.0.0.1:1234/v1">LM Studio（本机）</option><option value="http://127.0.0.1:11434/v1">Ollama 兼容接口（本机）</option></datalist>
+          <label class="settings-field" for="model-name"><span>模型名称</span><input id="model-name" type="text" maxlength="256" required placeholder="例如：gpt-5-mini" autocomplete="off" spellcheck="false"><small>填写服务商实际提供的模型 ID。</small></label>
+        </section>
+
+        <section class="settings-section" aria-labelledby="key-title">
+          <header><div><h2 id="key-title">API Key</h2><span id="key-status" class="key-badge">正在检查</span></div><p>云端服务通常需要密钥；本机接口可留空。</p></header>
+          <label class="settings-field" for="model-api-key"><span>密钥</span><div class="secret-input-wrap"><input id="model-api-key" type="password" maxlength="8192" placeholder="留空则保留已保存的密钥" autocomplete="new-password" spellcheck="false"><button id="toggle-key" class="icon-button" type="button" aria-label="显示 API Key"><svg aria-hidden="true"><use id="toggle-key-icon" href="/static/icons.svg#eye"></use></svg></button></div><small>密钥保存在 macOS Keychain，不会写入 Vault、Markdown、SQLite、配置文件或 Git。</small></label>
+        </section>
+
+        <div class="settings-callout">
+          <svg aria-hidden="true"><use href="/static/icons.svg#library"></use></svg>
+          <div><strong>清晰的数据边界</strong><p>AI 对话只发送受长度限制的文字证据，不会发送原视频、原图或 Cookie。当前采集分析方式：<span id="analysis-mode-label">正在读取…</span>。</p></div>
+        </div>
+
+        <div id="settings-message" class="settings-message" role="status" aria-live="polite"></div>
+        <div class="settings-actions"><button id="save-model-settings" type="submit" class="primary-button">保存配置</button><button id="test-model-settings" type="button" class="secondary-button">测试连接</button><span>保存不消耗 token；测试连接会产生少量 API token。</span></div>
+      </form>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/model-settings.js?v={{ web_version }}" defer></script>
+</body>
+</html>

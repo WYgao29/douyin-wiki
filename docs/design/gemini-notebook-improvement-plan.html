@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="抖库参考 Gemini Notebook 的下一阶段改进方案">
+  <title>抖库 × Gemini Notebook：下一阶段改进方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --text: #172033;
+      --muted: #667085;
+      --line: #e2e8f0;
+      --brand: #2855d9;
+      --brand-soft: #edf2ff;
+      --green: #127a5a;
+      --green-soft: #e8f7f1;
+      --amber: #a15c00;
+      --amber-soft: #fff5df;
+      --red: #b42318;
+      --red-soft: #fff0ee;
+      --purple: #6941c6;
+      --purple-soft: #f2edff;
+      --shadow: 0 18px 50px rgb(23 32 51 / 8%);
+      --radius-lg: 24px;
+      --radius-md: 16px;
+      --radius-sm: 10px;
+      --content: 1120px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-padding-top: 88px;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% -4%, rgb(40 85 217 / 10%), transparent 29rem),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.7;
+    }
+
+    a { color: var(--brand); }
+    a:hover { text-decoration-thickness: 2px; }
+
+    .skip-link {
+      position: absolute;
+      top: -48px;
+      left: 16px;
+      z-index: 100;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--text);
+      color: white;
+    }
+
+    .skip-link:focus { top: 12px; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid rgb(226 232 240 / 86%);
+      background: rgb(244 246 248 / 88%);
+      backdrop-filter: blur(18px);
+    }
+
+    .topbar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: min(calc(100% - 40px), var(--content));
+      min-height: 64px;
+      margin: 0 auto;
+      gap: 24px;
+    }
+
+    .brand {
+      color: var(--text);
+      font-weight: 750;
+      letter-spacing: -.02em;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .topnav {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+
+    .topnav::-webkit-scrollbar { display: none; }
+
+    .topnav a {
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .topnav a:hover { color: var(--text); }
+
+    .shell {
+      width: min(calc(100% - 40px), var(--content));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 80px 0 56px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 18px;
+      padding: 5px 10px;
+      border: 1px solid #cdd9ff;
+      border-radius: 999px;
+      background: var(--brand-soft);
+      color: var(--brand);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .03em;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      max-width: 900px;
+      margin-bottom: 22px;
+      font-size: clamp(38px, 6vw, 72px);
+      line-height: 1.08;
+      letter-spacing: -.055em;
+    }
+
+    h1 span { color: var(--brand); }
+
+    .hero-copy {
+      max-width: 780px;
+      margin-bottom: 32px;
+      color: var(--muted);
+      font-size: clamp(18px, 2vw, 22px);
+    }
+
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .meta-chip,
+    .priority,
+    .status {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1;
+    }
+
+    .meta-chip {
+      padding: 8px 11px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .decision {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(250px, .7fr);
+      gap: 20px;
+      align-items: stretch;
+      margin-bottom: 72px;
+    }
+
+    .decision-main,
+    .decision-side,
+    .feature-card,
+    .source-card,
+    .metric,
+    .roadmap-step {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+
+    .decision-main {
+      padding: clamp(26px, 4vw, 42px);
+      box-shadow: var(--shadow);
+    }
+
+    .decision-main h2 {
+      margin-bottom: 12px;
+      font-size: clamp(26px, 3vw, 36px);
+      line-height: 1.25;
+      letter-spacing: -.035em;
+    }
+
+    .decision-main p { margin-bottom: 0; color: var(--muted); }
+
+    .decision-side {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 26px;
+      background: var(--text);
+      color: white;
+    }
+
+    .decision-side strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 22px;
+      line-height: 1.35;
+    }
+
+    .decision-side span { color: #cbd5e1; }
+
+    section { margin-bottom: 88px; }
+
+    .section-heading {
+      display: grid;
+      grid-template-columns: minmax(180px, .65fr) minmax(0, 1.35fr);
+      gap: 32px;
+      align-items: end;
+      margin-bottom: 28px;
+    }
+
+    .section-heading h2 {
+      margin-bottom: 0;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.15;
+      letter-spacing: -.04em;
+    }
+
+    .section-heading p {
+      margin-bottom: 3px;
+      color: var(--muted);
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .feature-card { padding: 22px; }
+
+    .feature-number {
+      display: grid;
+      width: 36px;
+      height: 36px;
+      margin-bottom: 34px;
+      place-items: center;
+      border-radius: 10px;
+      background: var(--brand-soft);
+      color: var(--brand);
+      font-weight: 800;
+    }
+
+    .feature-card h3 {
+      margin-bottom: 10px;
+      font-size: 18px;
+    }
+
+    .feature-card ul,
+    .source-card ul,
+    .checks {
+      margin: 0;
+      padding-left: 19px;
+      color: var(--muted);
+    }
+
+    .feature-card li + li,
+    .source-card li + li,
+    .checks li + li { margin-top: 7px; }
+
+    .current-state {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+
+    .metric { padding: 22px; }
+
+    .metric strong {
+      display: block;
+      margin-bottom: 2px;
+      color: var(--brand);
+      font-size: 32px;
+      line-height: 1.2;
+      letter-spacing: -.04em;
+    }
+
+    .metric span { color: var(--muted); }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(7, auto);
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 22px;
+      border-radius: var(--radius-md);
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      overflow-x: auto;
+    }
+
+    .pipeline-node {
+      min-width: 110px;
+      padding: 12px 14px;
+      border-radius: var(--radius-sm);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      text-align: center;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .pipeline-node.missing {
+      border-color: #cdd9ff;
+      background: var(--brand-soft);
+      color: var(--brand);
+    }
+
+    .pipeline-arrow { color: #98a2b3; font-weight: 800; }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      background: var(--surface-soft);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    td:first-child { font-weight: 700; }
+
+    .priority,
+    .status { padding: 6px 9px; white-space: nowrap; }
+    .p0 { background: var(--red-soft); color: var(--red); }
+    .p1 { background: var(--amber-soft); color: var(--amber); }
+    .p2 { background: var(--green-soft); color: var(--green); }
+    .p3 { background: var(--purple-soft); color: var(--purple); }
+    .fit-high { background: var(--green-soft); color: var(--green); }
+    .fit-medium { background: var(--amber-soft); color: var(--amber); }
+    .fit-low { background: #eef1f5; color: #475467; }
+
+    .pilot-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .source-card {
+      position: relative;
+      padding: 24px;
+      overflow: hidden;
+    }
+
+    .source-card::before {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 4px;
+      background: var(--brand);
+      content: "";
+    }
+
+    .source-card h3 {
+      margin-bottom: 10px;
+      font-size: 20px;
+      line-height: 1.45;
+    }
+
+    .source-card p { color: var(--muted); }
+
+    .source-type {
+      display: inline-block;
+      margin-bottom: 16px;
+      color: var(--brand);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .06em;
+    }
+
+    .negative-control {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      margin-top: 16px;
+      padding: 18px 20px;
+      border-radius: var(--radius-md);
+      background: var(--amber-soft);
+      color: #744400;
+    }
+
+    .negative-control strong { white-space: nowrap; }
+    .negative-control p { margin: 0; }
+
+    .roadmap {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .roadmap-step { padding: 25px; }
+    .roadmap-step:first-child { border-color: #b9c8fa; box-shadow: var(--shadow); }
+
+    .roadmap-step .priority { margin-bottom: 28px; }
+
+    .roadmap-step h3 {
+      margin-bottom: 10px;
+      font-size: 21px;
+    }
+
+    .roadmap-step p { color: var(--muted); }
+
+    .roadmap-step ol {
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    .roadmap-step li + li { margin-top: 8px; }
+
+    .acceptance {
+      display: grid;
+      grid-template-columns: minmax(0, .75fr) minmax(0, 1.25fr);
+      gap: 22px;
+      padding: clamp(26px, 4vw, 40px);
+      border-radius: var(--radius-lg);
+      background: var(--text);
+      color: white;
+    }
+
+    .acceptance h2 {
+      margin-bottom: 10px;
+      font-size: clamp(28px, 4vw, 40px);
+      letter-spacing: -.035em;
+    }
+
+    .acceptance p { color: #cbd5e1; }
+    .acceptance .checks { color: #e2e8f0; }
+
+    .sources {
+      padding: 28px 0 44px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .sources h2 {
+      margin-bottom: 12px;
+      color: var(--text);
+      font-size: 18px;
+    }
+
+    .sources ul {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 28px;
+      margin: 0 0 24px;
+      padding-left: 20px;
+    }
+
+    .sources p { margin-bottom: 0; font-size: 13px; }
+
+    @media (max-width: 900px) {
+      .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pilot-grid, .roadmap { grid-template-columns: 1fr; }
+      .source-card::before { width: 4px; height: 100%; }
+    }
+
+    @media (max-width: 700px) {
+      .topbar-inner, .shell { width: min(calc(100% - 28px), var(--content)); }
+      .topbar-inner { align-items: flex-start; flex-direction: column; gap: 4px; padding: 12px 0; }
+      .topnav { width: 100%; gap: 16px; }
+      .hero { padding-top: 52px; }
+      .decision, .section-heading, .acceptance { grid-template-columns: 1fr; }
+      .current-state { grid-template-columns: 1fr; }
+      .sources ul { grid-template-columns: 1fr; }
+      section { margin-bottom: 68px; }
+    }
+
+    @media (max-width: 520px) {
+      .feature-grid { grid-template-columns: 1fr; }
+      .feature-number { margin-bottom: 20px; }
+      .negative-control { flex-direction: column; }
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #0f1420;
+        --surface: #171e2c;
+        --surface-soft: #131a27;
+        --text: #f3f6fb;
+        --muted: #a6b0c2;
+        --line: #2b3547;
+        --brand: #8aa8ff;
+        --brand-soft: #1d2a52;
+        --green: #69d6ae;
+        --green-soft: #153a31;
+        --amber: #ffbd63;
+        --amber-soft: #422e12;
+        --red: #ff9389;
+        --red-soft: #492421;
+        --purple: #c3adff;
+        --purple-soft: #312653;
+        --shadow: 0 18px 50px rgb(0 0 0 / 22%);
+      }
+
+      .topbar { background: rgb(15 20 32 / 88%); }
+      .eyebrow { border-color: #384c88; }
+      .pipeline-node.missing { border-color: #384c88; }
+      .roadmap-step:first-child { border-color: #536aa8; }
+      .acceptance, .decision-side { background: #090d16; }
+      .fit-low { background: #273142; color: #cbd5e1; }
+      .negative-control { color: #ffd28f; }
+    }
+
+    @media print {
+      :root { --bg: white; --surface: white; --surface-soft: #f8fafc; --text: #111827; --muted: #4b5563; --line: #d1d5db; }
+      body { background: white; font-size: 10.5pt; }
+      .topbar { display: none; }
+      .hero { padding-top: 24px; }
+      section { break-inside: avoid; margin-bottom: 36px; }
+      .feature-card, .source-card, .roadmap-step, .decision-main { box-shadow: none; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top">抖库 · 产品研究</a>
+      <nav class="topnav" aria-label="页面导航">
+        <a href="#features">功能盘点</a>
+        <a href="#fit">适配判断</a>
+        <a href="#pilot">试验专题</a>
+        <a href="#roadmap">改进路线</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="shell" id="top">
+    <header class="hero">
+      <p class="eyebrow">只读调研方案 · 2026-08-23</p>
+      <h1>抖库 × <span>Gemini Notebook</span><br>下一阶段改进方案</h1>
+      <p class="hero-copy">
+        从“保存与检索抖音资料”进一步走向“选择可信来源、形成专题、持续对话并生成可追溯成果”。
+      </p>
+      <div class="hero-meta" aria-label="报告摘要">
+        <span class="meta-chip">4 篇现有文章</span>
+        <span class="meta-chip">267 个检索片段</span>
+        <span class="meta-chip">本地优先</span>
+        <span class="meta-chip">未执行任何改动</span>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="decision" aria-labelledby="decision-title">
+        <div class="decision-main">
+          <h2 id="decision-title">下一步应先建立“选源专题”，再扩展 Studio 生成能力。</h2>
+          <p>
+            抖库已经具备采集、转录、OCR、知识原子、混合检索和证据引用。当前最重要的产品缺口，是让用户把若干文章组成一个有明确边界的研究空间，并确保问答与成果严格限定在这些来源内。
+          </p>
+        </div>
+        <aside class="decision-side" aria-label="首要目标">
+          <strong>第一目标</strong>
+          <span>选择文章 → 创建专题 → 严格问答 → 生成简报</span>
+        </aside>
+      </section>
+
+      <section id="features" aria-labelledby="features-title">
+        <div class="section-heading">
+          <h2 id="features-title">Gemini Notebook 功能地图</h2>
+          <p>截至 2026 年 8 月，NotebookLM 已更名为 Gemini Notebook，产品能力可以归纳为四层。</p>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature-card">
+            <span class="feature-number">1</span>
+            <h3>来源与专题</h3>
+            <ul>
+              <li>每个 Notebook 是独立来源集合</li>
+              <li>来源勾选、排除、摘要与分类</li>
+              <li>文档、网页、视频、音频、图片等输入</li>
+              <li>Fast Research 与 Deep Research</li>
+            </ul>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">2</span>
+            <h3>来源化对话</h3>
+            <ul>
+              <li>回答限定在选中来源</li>
+              <li>原文引用与上下文定位</li>
+              <li>回答风格、长度和自定义指令</li>
+              <li>对话回答保存为笔记</li>
+            </ul>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">3</span>
+            <h3>Studio 成果</h3>
+            <ul>
+              <li>FAQ、学习指南、简报、自定义报告</li>
+              <li>数据表、思维导图、闪卡和测验</li>
+              <li>信息图与演示文稿</li>
+              <li>音频概览与视频概览</li>
+            </ul>
+          </article>
+
+          <article class="feature-card">
+            <span class="feature-number">4</span>
+            <h3>分享与研究增强</h3>
+            <ul>
+              <li>查看者、编辑者与公开分享</li>
+              <li>复制 Notebook 和分享生成物</li>
+              <li>代码执行、图表和文件生成</li>
+              <li>跨 Gemini 产品同步</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section aria-labelledby="foundation-title">
+        <div class="section-heading">
+          <h2 id="foundation-title">抖库已经具备的基础</h2>
+          <p>技术底座已经越过“普通全文搜索”阶段，适合直接向专题化研究升级。</p>
+        </div>
+
+        <div class="current-state">
+          <article class="metric">
+            <strong>结构化</strong>
+            <span>摘要、要点、行动、知识原子、主张和关联</span>
+          </article>
+          <article class="metric">
+            <strong>可追溯</strong>
+            <span>原作品链接、视频时间戳、图文图片编号</span>
+          </article>
+          <article class="metric">
+            <strong>本地化</strong>
+            <span>Obsidian Markdown、SQLite FTS5、本地 Embedding</span>
+          </article>
+        </div>
+
+        <div class="pipeline" aria-label="能力链路">
+          <span class="pipeline-node">抖音采集</span>
+          <span class="pipeline-arrow" aria-hidden="true">→</span>
+          <span class="pipeline-node">ASR / OCR</span>
+          <span class="pipeline-arrow" aria-hidden="true">→</span>
+          <span class="pipeline-node">知识原子</span>
+          <span class="pipeline-arrow" aria-hidden="true">→</span>
+          <span class="pipeline-node missing">选源专题</span>
+          <span class="pipeline-arrow" aria-hidden="true">→</span>
+          <span class="pipeline-node missing">专题成果</span>
+        </div>
+      </section>
+
+      <section id="fit" aria-labelledby="fit-title">
+        <div class="section-heading">
+          <h2 id="fit-title">功能适配与优先级</h2>
+          <p>优先级依据当前数据形态、用户价值、证据可靠性和实现复杂度综合判断。</p>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Gemini Notebook 能力</th>
+                <th scope="col">适合程度</th>
+                <th scope="col">优先级</th>
+                <th scope="col">判断</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>多篇文章组成独立专题</td>
+                <td><span class="status fit-high">极高</span></td>
+                <td><span class="priority p0">P0</span></td>
+                <td>下一阶段的核心产品对象</td>
+              </tr>
+              <tr>
+                <td>严格选源问答与精确引用</td>
+                <td><span class="status fit-high">极高</span></td>
+                <td><span class="priority p0">P0</span></td>
+                <td>已有检索和证据结构，主要补来源边界与定位</td>
+              </tr>
+              <tr>
+                <td>专题摘要、FAQ、简报、对比表</td>
+                <td><span class="status fit-high">极高</span></td>
+                <td><span class="priority p1">P1</span></td>
+                <td>知识原子可以直接支撑稳定的结构化生成</td>
+              </tr>
+              <tr>
+                <td>保存回答为笔记、笔记转来源</td>
+                <td><span class="status fit-high">高</span></td>
+                <td><span class="priority p1">P1</span></td>
+                <td>让一次性问答变成可复用知识成果</td>
+              </tr>
+              <tr>
+                <td>思维导图</td>
+                <td><span class="status fit-high">高</span></td>
+                <td><span class="priority p2">P2</span></td>
+                <td>可利用现有实体、概念和语义关系</td>
+              </tr>
+              <tr>
+                <td>音频概览</td>
+                <td><span class="status fit-high">高</span></td>
+                <td><span class="priority p2">P2</span></td>
+                <td>适合通勤回顾，但需要额外生成成本和质量控制</td>
+              </tr>
+              <tr>
+                <td>闪卡、测验</td>
+                <td><span class="status fit-medium">中</span></td>
+                <td><span class="priority p2">P2</span></td>
+                <td>对学习型专题有价值，可作为可选产物</td>
+              </tr>
+              <tr>
+                <td>信息图、演示文稿</td>
+                <td><span class="status fit-medium">中高</span></td>
+                <td><span class="priority p3">P2 / P3</span></td>
+                <td>便于分享，需要确保图中文字和事实可追溯</td>
+              </tr>
+              <tr>
+                <td>Deep Research 与外部核验</td>
+                <td><span class="status fit-medium">中高</span></td>
+                <td><span class="priority p3">P3</span></td>
+                <td>适合投资、政策和时效性观点，需明确区分库内外来源</td>
+              </tr>
+              <tr>
+                <td>视频概览、代码执行、公开协作</td>
+                <td><span class="status fit-low">低</span></td>
+                <td><span class="priority p3">暂缓</span></td>
+                <td>与当前内容规模和本地优先定位匹配度较低</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="pilot" aria-labelledby="pilot-title">
+        <div class="section-heading">
+          <h2 id="pilot-title">建议的首个试验专题</h2>
+          <p>“AI 产业观察”同时覆盖产业解释、产品实测与投资叙事，适合验证跨来源综合和证据分级。</p>
+        </div>
+
+        <div class="pilot-grid">
+          <article class="source-card">
+            <span class="source-type">来源 01 · 产业解释</span>
+            <h3>为什么大模型竞争集中于中美：一套产业链解释</h3>
+            <p>用于提取产业结构、数据、云计算、能源、政策与人才之间的因果框架。</p>
+            <ul>
+              <li>宏观叙事</li>
+              <li>多因素关联</li>
+              <li>适合生成概念地图</li>
+            </ul>
+          </article>
+
+          <article class="source-card">
+            <span class="source-type">来源 02 · 产品实测</span>
+            <h3>DeepSeek 多模态实测：人物识别与视觉编程不及预期</h3>
+            <p>用于区分测试观察、作者评价和由有限样例延伸出的模型判断。</p>
+            <ul>
+              <li>具体测试过程</li>
+              <li>竞品对照</li>
+              <li>适合验证引用定位</li>
+            </ul>
+          </article>
+
+          <article class="source-card">
+            <span class="source-type">来源 03 · 投资叙事</span>
+            <h3>黄仁勋供应链信号与 AI 投资叙事</h3>
+            <p>用于检验系统能否保留“未经核验”的警告，并避免将投资观点表述为事实。</p>
+            <ul>
+              <li>强时效性</li>
+              <li>证据不完整</li>
+              <li>适合测试可信度分层</li>
+            </ul>
+          </article>
+        </div>
+
+        <aside class="negative-control">
+          <strong>负面对照</strong>
+          <p>不选择《三种冠军手冲方案》。当用户询问聪明杯冲煮方法时，专题必须明确回答“当前选定来源没有相关信息”，不能泄漏全库内容。</p>
+        </aside>
+      </section>
+
+      <section id="roadmap" aria-labelledby="roadmap-title">
+        <div class="section-heading">
+          <h2 id="roadmap-title">推荐的改进顺序</h2>
+          <p>每一阶段都形成可独立验证的闭环，后续生成能力共享统一的专题和成果模型。</p>
+        </div>
+
+        <div class="roadmap">
+          <article class="roadmap-step">
+            <span class="priority p0">阶段一 · 核心闭环</span>
+            <h3>选源专题</h3>
+            <p>建立最小可用的专题对象和严格来源边界。</p>
+            <ol>
+              <li>在资料库中多选文章</li>
+              <li>保存标题、目标、来源和自定义指令</li>
+              <li>问答检索只允许专题内文章</li>
+              <li>引用跳到视频时间或图片位置</li>
+              <li>生成一份专题简报</li>
+            </ol>
+          </article>
+
+          <article class="roadmap-step">
+            <span class="priority p1">阶段二 · Studio Lite</span>
+            <h3>可复用成果</h3>
+            <p>把问答升级为可以保存、刷新和追溯的专题成果。</p>
+            <ol>
+              <li>专题总览与关键问题</li>
+              <li>跨来源对比表</li>
+              <li>共识、分歧与证据不足</li>
+              <li>FAQ、简报和自定义报告</li>
+              <li>回答保存为笔记</li>
+            </ol>
+          </article>
+
+          <article class="roadmap-step">
+            <span class="priority p2">阶段三 · 媒体与研究</span>
+            <h3>按价值逐项验证</h3>
+            <p>在来源可靠性稳定后扩展更高成本的生成能力。</p>
+            <ol>
+              <li>思维导图</li>
+              <li>音频概览</li>
+              <li>闪卡和测验</li>
+              <li>信息图与演示文稿</li>
+              <li>外部核验与 Deep Research</li>
+            </ol>
+          </article>
+        </div>
+      </section>
+
+      <section class="acceptance" aria-labelledby="acceptance-title">
+        <div>
+          <h2 id="acceptance-title">首阶段完成标准</h2>
+          <p>先验证来源边界和证据质量，再决定是否进入媒体生成。</p>
+        </div>
+        <ul class="checks">
+          <li>专题问答不会检索或引用未选中的文章。</li>
+          <li>每条重要结论都能回到文章片段、视频时间戳或图片编号。</li>
+          <li>回答明确区分作品原话、测试观察、作者观点、AI 推断与未核验主张。</li>
+          <li>来源增删后，专题成果能够识别版本变化并选择性重新生成。</li>
+          <li>用“聪明杯怎么冲”测试时，系统应明确提示专题内无依据。</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="sources">
+      <h2>官方资料</h2>
+      <ul>
+        <li><a href="https://blog.google/innovation-and-ai/products/gemini-notebook/notebooklm-gemini-notebook/">NotebookLM 更名为 Gemini Notebook</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16206563?hl=en">Notebook 与 Studio 功能</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16215270?co=GENIE.Platform%3DDesktop&amp;hl=en">来源管理与研究</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16179559?hl=en">来源化对话与高级能力</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16212820?hl=en">音频概览</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16454555?hl=en">视频概览</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16212283?hl=en">思维导图</a></li>
+        <li><a href="https://support.google.com/gemininotebook/answer/16757456?hl=en-AU">演示文稿</a></li>
+      </ul>
+      <p>本页为方案评估文档。生成过程中未修改抖库功能代码，也未创建或迁移任何知识库专题。</p>
+    </footer>
+  </div>
+</body>
+</html>

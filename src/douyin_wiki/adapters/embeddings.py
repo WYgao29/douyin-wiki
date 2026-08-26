@@ -21,6 +21,7 @@ class EmbeddingService:
         self._model = None
         self._load_attempted = False
         self.provider_name = "char-ngram-fallback"
+        self.last_error: str | None = None
 
     def _load_model(self):
         if self._model is not None:
@@ -33,15 +34,24 @@ class EmbeddingService:
 
             self._model = SentenceTransformer(self.settings.model)
             self.provider_name = f"sentence-transformers:{self.settings.model}"
-        except (ImportError, OSError, RuntimeError):
+        except Exception as exc:  # Optional acceleration must never disable local search.
             self._model = None
+            self.provider_name = "char-ngram-fallback"
+            self.last_error = f"{type(exc).__name__}: {exc}"
         return self._model
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         model = self._load_model()
         if model is not None:
-            values = model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False)
-            return np.asarray(values, dtype=np.float32).tolist()
+            try:
+                values = model.encode(
+                    list(texts), normalize_embeddings=True, show_progress_bar=False
+                )
+                return np.asarray(values, dtype=np.float32).tolist()
+            except Exception as exc:  # Keep deterministic retrieval available on model failure.
+                self._model = None
+                self.provider_name = "char-ngram-fallback"
+                self.last_error = f"{type(exc).__name__}: {exc}"
         return [self._hashed_embedding(text) for text in texts]
 
     def signature(self) -> str:

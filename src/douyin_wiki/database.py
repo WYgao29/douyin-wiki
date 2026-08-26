@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,14 +12,29 @@ from typing import Any
 from .errors import EntryNotFoundError, JobStateError
 from .models import (
     CaptureRequest,
+    ChatMessage,
+    ChatSession,
+    Citation,
+    CreatorInventoryItem,
+    CreatorInventoryWork,
+    CreatorProfile,
+    CreatorRecord,
+    CreatorWorkAvailability,
+    CreatorWorkDecision,
+    CreatorWorkRecord,
     EntryRecord,
     InspirationInput,
     JobEvent,
     JobRecord,
     JobStatus,
     ReminderCandidate,
+    ResearchTopic,
     RetentionPolicy,
     ReviewIssue,
+    SourceKind,
+    SourceRevision,
+    TopicArtifact,
+    TopicSource,
 )
 from .time_utils import iso_now, parse_datetime, utc_now
 
@@ -79,6 +94,51 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 CREATE INDEX IF NOT EXISTS idx_entries_video_id ON entries(video_id);
 CREATE INDEX IF NOT EXISTS idx_entries_expiry ON entries(retention, media_status, media_expires_at);
+
+CREATE TABLE IF NOT EXISTS research_topics (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    goal TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL DEFAULT '',
+    source_revision TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_topics_updated
+ON research_topics(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS topic_sources (
+    topic_id TEXT NOT NULL REFERENCES research_topics(id) ON DELETE CASCADE,
+    entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    source_revision TEXT NOT NULL,
+    PRIMARY KEY(topic_id, entry_id),
+    UNIQUE(topic_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_topic_sources_scope
+ON topic_sources(topic_id, enabled, position);
+
+CREATE TABLE IF NOT EXISTS topic_artifacts (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES research_topics(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content_markdown TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    source_revisions_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'current' CHECK(status IN ('current', 'needs_update')),
+    model TEXT,
+    prompt_version TEXT NOT NULL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_tokens INTEGER,
+    user_authored INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_topic_artifacts_topic
+ON topic_artifacts(topic_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS purposes (
     id TEXT PRIMARY KEY,
@@ -155,7 +215,88 @@ CREATE TABLE IF NOT EXISTS index_metadata (
     updated_at TEXT NOT NULL
 );
 
-PRAGMA user_version=5;
+CREATE TABLE IF NOT EXISTS creators (
+    id TEXT PRIMARY KEY,
+    sec_uid TEXT NOT NULL UNIQUE,
+    canonical_url TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    nickname TEXT NOT NULL,
+    folder_path TEXT NOT NULL UNIQUE,
+    uid TEXT,
+    unique_id TEXT,
+    signature TEXT NOT NULL DEFAULT '',
+    avatar_path TEXT,
+    inspirations_json TEXT NOT NULL DEFAULT '[]',
+    reported_work_count INTEGER,
+    last_synced_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS creator_works (
+    creator_id TEXT NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+    work_id TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    original_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    published_at TEXT,
+    duration_seconds REAL,
+    thumbnail_path TEXT,
+    is_pinned INTEGER NOT NULL DEFAULT 0,
+    decision TEXT NOT NULL DEFAULT 'pending',
+    availability TEXT NOT NULL DEFAULT 'available',
+    missing_sync_count INTEGER NOT NULL DEFAULT 0,
+    entry_id TEXT REFERENCES entries(id) ON DELETE SET NULL,
+    last_job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(creator_id, work_id)
+);
+CREATE INDEX IF NOT EXISTS idx_creator_works_decision
+ON creator_works(creator_id, decision, availability);
+
+CREATE TABLE IF NOT EXISTS creator_run_items (
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    creator_id TEXT NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+    work_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    is_new INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(job_id, work_id),
+    UNIQUE(job_id, ordinal),
+    FOREIGN KEY(creator_id, work_id) REFERENCES creator_works(creator_id, work_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_creator_run_items_job ON creator_run_items(job_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS web_chat_sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('library', 'entry', 'topic')),
+    context_entry_id TEXT,
+    context_topic_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_web_chat_sessions_updated
+ON web_chat_sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS web_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES web_chat_sessions(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    citations_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_tokens INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_web_chat_messages_session
+ON web_chat_messages(session_id, id);
+
+PRAGMA user_version=8;
 """
 
 
@@ -181,6 +322,7 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate_chat_sessions_for_topics(conn)
             chunk_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
             }
@@ -199,7 +341,69 @@ class Database:
             if "superseded_at" not in event_columns:
                 conn.execute("ALTER TABLE job_events ADD COLUMN superseded_at TEXT")
             self._retire_undeliverable_events_conn(conn)
-            conn.execute("PRAGMA user_version=5")
+            conn.execute("PRAGMA user_version=8")
+
+    @staticmethod
+    def _migrate_chat_sessions_for_topics(conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='web_chat_sessions'"
+        ).fetchone()
+        columns = {
+            item["name"]
+            for item in conn.execute("PRAGMA table_info(web_chat_sessions)").fetchall()
+        }
+        table_sql = str(row["sql"] or "") if row else ""
+        if (
+            row
+            and "'topic'" in table_sql
+            and "context_topic_id" in columns
+            and "REFERENCES research_topics" not in table_sql
+        ):
+            return
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.executescript(
+                """
+                ALTER TABLE web_chat_messages RENAME TO web_chat_messages_legacy;
+                ALTER TABLE web_chat_sessions RENAME TO web_chat_sessions_legacy;
+                CREATE TABLE web_chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    scope TEXT NOT NULL CHECK(scope IN ('library', 'entry', 'topic')),
+                    context_entry_id TEXT,
+                    context_topic_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO web_chat_sessions
+                    (id, title, scope, context_entry_id, context_topic_id, created_at, updated_at)
+                SELECT id, title, scope, context_entry_id, NULL, created_at, updated_at
+                FROM web_chat_sessions_legacy;
+                CREATE TABLE web_chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES web_chat_sessions(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
+                    content TEXT NOT NULL,
+                    citations_json TEXT NOT NULL DEFAULT '[]',
+                    model TEXT,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO web_chat_messages
+                SELECT * FROM web_chat_messages_legacy;
+                DROP TABLE web_chat_messages_legacy;
+                DROP TABLE web_chat_sessions_legacy;
+                CREATE INDEX idx_web_chat_sessions_updated
+                ON web_chat_sessions(updated_at DESC);
+                CREATE INDEX idx_web_chat_messages_session
+                ON web_chat_messages(session_id, id);
+                """
+            )
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     def _retire_undeliverable_events_conn(self, conn: sqlite3.Connection) -> None:
         """Hide legacy route-less events and obsolete events from the delivery queue."""
@@ -224,7 +428,13 @@ class Database:
                 [(now, event_id) for event_id in retire],
             )
 
-    def create_job(self, request: CaptureRequest) -> JobRecord:
+    def create_job(
+        self,
+        request: CaptureRequest,
+        *,
+        kind: str = "capture",
+        artifacts: dict[str, Any] | None = None,
+    ) -> JobRecord:
         job_id = uuid.uuid4().hex
         now = iso_now()
         with self.connect() as conn:
@@ -232,8 +442,16 @@ class Database:
                 """INSERT INTO jobs
                    (id, kind, status, progress, request_json, artifacts_json, result_json,
                     created_at, updated_at)
-                   VALUES (?, 'capture', ?, 0, ?, '{}', '{}', ?, ?)""",
-                (job_id, JobStatus.QUEUED.value, request.model_dump_json(), now, now),
+                   VALUES (?, ?, ?, 0, ?, ?, '{}', ?, ?)""",
+                (
+                    job_id,
+                    kind,
+                    JobStatus.QUEUED.value,
+                    request.model_dump_json(),
+                    json.dumps(artifacts or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
             )
         return self.get_job(job_id)
 
@@ -351,6 +569,8 @@ class Database:
         recoverable = (
             JobStatus.QUEUED.value,
             JobStatus.RESOLVING.value,
+            JobStatus.INVENTORYING.value,
+            JobStatus.DISPATCHING.value,
             JobStatus.DOWNLOADING.value,
             JobStatus.EXTRACTING.value,
             JobStatus.TRANSCRIBING.value,
@@ -426,13 +646,16 @@ class Database:
                     JobStatus.AWAITING_AGENT_ANALYSIS,
                     JobStatus.NEEDS_AUTH,
                     JobStatus.NEEDS_REVIEW,
+                    JobStatus.NEEDS_SELECTION,
                     JobStatus.WAITING_CONFIRMATION,
                     JobStatus.COMPLETED,
                     JobStatus.COMPLETED_WITH_WARNINGS,
                     JobStatus.FAILED,
                 }
             ):
-                event_result = result if result is not None else current.result
+                event_result = dict(result if result is not None else current.result)
+                if creator_context := current.artifacts.get("creator_context"):
+                    event_result["creator_context"] = creator_context
                 event_time = iso_now()
                 conn.execute(
                     """UPDATE job_events SET superseded_at=?
@@ -457,10 +680,11 @@ class Database:
             JobStatus.AWAITING_AGENT_ANALYSIS,
             JobStatus.NEEDS_AUTH,
             JobStatus.NEEDS_REVIEW,
+            JobStatus.NEEDS_SELECTION,
             JobStatus.WAITING_CONFIRMATION,
             JobStatus.FAILED,
         }:
-            raise JobStateError(f"job {job_id} cannot be requeued from {job.status}")
+            raise JobStateError(f"任务 {job_id} 当前状态不允许重新排队")
         return self.update_job(
             job_id,
             status=JobStatus.QUEUED,
@@ -550,6 +774,9 @@ class Database:
         job = self.get_job(job_id)
         if job.request.gateway_context is None:
             return None
+        event_result = dict(result)
+        if creator_context := job.artifacts.get("creator_context"):
+            event_result["creator_context"] = creator_context
         with self.connect() as conn:
             event_time = iso_now()
             conn.execute(
@@ -560,7 +787,7 @@ class Database:
             cursor = conn.execute(
                 """INSERT INTO job_events(job_id, status, result_json, created_at)
                    VALUES (?, ?, ?, ?)""",
-                (job_id, status.value, json.dumps(result, ensure_ascii=False), event_time),
+                (job_id, status.value, json.dumps(event_result, ensure_ascii=False), event_time),
             )
             event_id = cursor.lastrowid
         if event_id is None:  # pragma: no cover - SQLite always provides this value
@@ -571,6 +798,533 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM entries WHERE video_id=?", (video_id,)).fetchone()
         return self._entry_from_row(row) if row else None
+
+    def upsert_creator(
+        self,
+        profile: CreatorProfile,
+        *,
+        creator_id: str,
+        folder_path: str,
+        inspirations: list[InspirationInput] | None = None,
+    ) -> CreatorRecord:
+        now = iso_now()
+        existing = self.find_creator_by_sec_uid(profile.sec_uid)
+        merged_inspirations = list(existing.inspirations) if existing else []
+        seen = {item.model_dump_json() for item in merged_inspirations}
+        for inspiration in inspirations or []:
+            if inspiration.model_dump_json() not in seen:
+                merged_inspirations.append(inspiration)
+                seen.add(inspiration.model_dump_json())
+        created_at = existing.created_at.isoformat() if existing else now
+        stable_folder = existing.folder_path if existing else folder_path
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO creators
+                   (id, sec_uid, canonical_url, original_url, nickname, folder_path, uid,
+                    unique_id, signature, avatar_path, inspirations_json, reported_work_count,
+                    last_synced_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(sec_uid) DO UPDATE SET
+                     canonical_url=excluded.canonical_url,
+                     nickname=excluded.nickname,
+                     uid=COALESCE(excluded.uid, creators.uid),
+                     unique_id=COALESCE(excluded.unique_id, creators.unique_id),
+                     signature=excluded.signature,
+                     avatar_path=COALESCE(excluded.avatar_path, creators.avatar_path),
+                     inspirations_json=excluded.inspirations_json,
+                     reported_work_count=excluded.reported_work_count,
+                     updated_at=excluded.updated_at""",
+                (
+                    existing.id if existing else creator_id,
+                    profile.sec_uid,
+                    profile.canonical_url,
+                    existing.original_url if existing else profile.original_url,
+                    profile.nickname,
+                    stable_folder,
+                    profile.uid,
+                    profile.unique_id,
+                    profile.signature,
+                    profile.avatar_path,
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in merged_inspirations],
+                        ensure_ascii=False,
+                    ),
+                    profile.reported_work_count,
+                    (
+                        existing.last_synced_at.isoformat()
+                        if existing and existing.last_synced_at
+                        else None
+                    ),
+                    created_at,
+                    now,
+                ),
+            )
+        return self.find_creator_by_sec_uid(profile.sec_uid)  # type: ignore[return-value]
+
+    def get_creator(self, creator_id: str) -> CreatorRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM creators WHERE id=?", (creator_id,)).fetchone()
+        if row is None:
+            raise JobStateError(f"creator not found: {creator_id}")
+        return self._creator_from_row(row)
+
+    def find_creator_by_sec_uid(self, sec_uid: str) -> CreatorRecord | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM creators WHERE sec_uid=?", (sec_uid,)).fetchone()
+        return self._creator_from_row(row) if row else None
+
+    def find_creator_for_work(self, work_id: str) -> CreatorRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT c.* FROM creators c JOIN creator_works w ON w.creator_id=c.id
+                   WHERE w.work_id=? LIMIT 1""",
+                (work_id,),
+            ).fetchone()
+        return self._creator_from_row(row) if row else None
+
+    def list_creators(self) -> list[CreatorRecord]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM creators ORDER BY updated_at DESC").fetchall()
+        return [self._creator_from_row(row) for row in rows]
+
+    def has_unfinished_creator_jobs(self) -> bool:
+        terminal = (
+            JobStatus.COMPLETED.value,
+            JobStatus.COMPLETED_WITH_WARNINGS.value,
+            JobStatus.FAILED.value,
+        )
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM jobs
+                   WHERE kind='creator_import' AND status NOT IN (?, ?, ?) LIMIT 1""",
+                terminal,
+            ).fetchone()
+        return row is not None
+
+    def record_creator_inventory(
+        self,
+        job_id: str,
+        creator_id: str,
+        works: list[CreatorInventoryWork],
+        *,
+        complete: bool,
+        sync: bool,
+    ) -> dict[str, Any]:
+        now = iso_now()
+        seen_ids = {work.work_id for work in works}
+        new_ids: list[str] = []
+        changed_ids: list[str] = []
+        missing_ids: list[str] = []
+        with self.connect() as conn:
+            existing_rows = {
+                row["work_id"]: row
+                for row in conn.execute(
+                    "SELECT * FROM creator_works WHERE creator_id=?", (creator_id,)
+                ).fetchall()
+            }
+            conn.execute("DELETE FROM creator_run_items WHERE job_id=?", (job_id,))
+            ordinal = 0
+            for work in works:
+                previous = existing_rows.get(work.work_id)
+                entry_row = conn.execute(
+                    "SELECT id FROM entries WHERE video_id=?", (work.work_id,)
+                ).fetchone()
+                entry_id = (
+                    entry_row["id"] if entry_row else (previous["entry_id"] if previous else None)
+                )
+                if entry_id:
+                    decision = CreatorWorkDecision.IMPORTED.value
+                elif previous:
+                    decision = previous["decision"]
+                else:
+                    decision = CreatorWorkDecision.PENDING.value
+                    new_ids.append(work.work_id)
+                if previous and any(
+                    (
+                        previous["title"] != work.title,
+                        previous["source_kind"] != work.source_kind.value,
+                        previous["canonical_url"] != work.canonical_url,
+                    )
+                ):
+                    changed_ids.append(work.work_id)
+                conn.execute(
+                    """INSERT INTO creator_works
+                       (creator_id, work_id, source_kind, canonical_url, original_url, title,
+                        published_at, duration_seconds, thumbnail_path, is_pinned, decision,
+                        availability, missing_sync_count, entry_id, last_job_id,
+                        first_seen_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 0, ?, ?, ?, ?)
+                       ON CONFLICT(creator_id, work_id) DO UPDATE SET
+                         source_kind=excluded.source_kind,
+                         canonical_url=excluded.canonical_url,
+                         title=excluded.title,
+                         published_at=COALESCE(excluded.published_at, creator_works.published_at),
+                         duration_seconds=COALESCE(
+                           excluded.duration_seconds, creator_works.duration_seconds),
+                         thumbnail_path=COALESCE(
+                           excluded.thumbnail_path, creator_works.thumbnail_path),
+                         is_pinned=excluded.is_pinned,
+                         decision=excluded.decision,
+                         availability='available', missing_sync_count=0,
+                         entry_id=COALESCE(excluded.entry_id, creator_works.entry_id),
+                         last_seen_at=excluded.last_seen_at""",
+                    (
+                        creator_id,
+                        work.work_id,
+                        work.source_kind.value,
+                        work.canonical_url,
+                        work.original_url,
+                        work.title,
+                        work.published_at.isoformat() if work.published_at else None,
+                        work.duration_seconds,
+                        work.thumbnail_path,
+                        int(work.is_pinned),
+                        decision,
+                        entry_id,
+                        previous["last_job_id"] if previous else None,
+                        previous["first_seen_at"] if previous else now,
+                        now,
+                    ),
+                )
+                include = not sync or previous is None
+                if include:
+                    ordinal += 1
+                    conn.execute(
+                        """INSERT INTO creator_run_items
+                           (job_id, creator_id, work_id, ordinal, is_new)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (job_id, creator_id, work.work_id, ordinal, int(previous is None)),
+                    )
+            if complete:
+                for work_id, previous in existing_rows.items():
+                    if work_id in seen_ids:
+                        continue
+                    missing_count = int(previous["missing_sync_count"] or 0) + 1
+                    availability = (
+                        CreatorWorkAvailability.SOURCE_UNAVAILABLE.value
+                        if missing_count >= 2
+                        else CreatorWorkAvailability.POSSIBLY_UNAVAILABLE.value
+                    )
+                    conn.execute(
+                        """UPDATE creator_works SET missing_sync_count=?, availability=?
+                           WHERE creator_id=? AND work_id=?""",
+                        (missing_count, availability, creator_id, work_id),
+                    )
+                    missing_ids.append(work_id)
+            conn.execute(
+                "UPDATE creators SET last_synced_at=?, updated_at=? WHERE id=?",
+                (now, now, creator_id),
+            )
+        return {
+            "new_work_ids": new_ids,
+            "changed_work_ids": changed_ids,
+            "missing_work_ids": missing_ids,
+            "inventory_count": len(works),
+            "selection_count": ordinal,
+        }
+
+    def list_creator_works(self, creator_id: str) -> list[CreatorWorkRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM creator_works WHERE creator_id=?
+                   ORDER BY is_pinned DESC, published_at DESC, first_seen_at DESC""",
+                (creator_id,),
+            ).fetchall()
+        return [self._creator_work_from_row(row) for row in rows]
+
+    def get_creator_work(self, creator_id: str, work_id: str) -> CreatorWorkRecord:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM creator_works WHERE creator_id=? AND work_id=?",
+                (creator_id, work_id),
+            ).fetchone()
+        if row is None:
+            raise JobStateError(f"creator work not found: {creator_id}/{work_id}")
+        return self._creator_work_from_row(row)
+
+    def register_creator_work(
+        self, creator_id: str, work: CreatorInventoryWork
+    ) -> CreatorWorkRecord:
+        """Remember a work found through direct capture without creating a selection run."""
+        now = iso_now()
+        with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM creator_works WHERE creator_id=? AND work_id=?",
+                (creator_id, work.work_id),
+            ).fetchone()
+            entry = conn.execute(
+                "SELECT id FROM entries WHERE video_id=?", (work.work_id,)
+            ).fetchone()
+            decision = (
+                CreatorWorkDecision.IMPORTED.value
+                if entry
+                else (previous["decision"] if previous else CreatorWorkDecision.PENDING.value)
+            )
+            conn.execute(
+                """INSERT INTO creator_works
+                   (creator_id, work_id, source_kind, canonical_url, original_url, title,
+                    published_at, duration_seconds, thumbnail_path, is_pinned, decision,
+                    availability, missing_sync_count, entry_id, last_job_id,
+                    first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 0, ?, NULL, ?, ?)
+                   ON CONFLICT(creator_id, work_id) DO UPDATE SET
+                     source_kind=excluded.source_kind,
+                     canonical_url=excluded.canonical_url,
+                     original_url=excluded.original_url,
+                     title=excluded.title,
+                     published_at=COALESCE(excluded.published_at, creator_works.published_at),
+                     duration_seconds=COALESCE(
+                       excluded.duration_seconds, creator_works.duration_seconds),
+                     thumbnail_path=COALESCE(
+                       excluded.thumbnail_path, creator_works.thumbnail_path),
+                     availability='available', missing_sync_count=0,
+                     entry_id=COALESCE(excluded.entry_id, creator_works.entry_id),
+                     last_seen_at=excluded.last_seen_at""",
+                (
+                    creator_id,
+                    work.work_id,
+                    work.source_kind.value,
+                    work.canonical_url,
+                    work.original_url,
+                    work.title,
+                    work.published_at.isoformat() if work.published_at else None,
+                    work.duration_seconds,
+                    work.thumbnail_path,
+                    int(work.is_pinned),
+                    decision,
+                    entry["id"] if entry else None,
+                    previous["first_seen_at"] if previous else now,
+                    now,
+                ),
+            )
+        return self.get_creator_work(creator_id, work.work_id)
+
+    def list_creator_inventory(
+        self,
+        job_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 10,
+        decision: CreatorWorkDecision | None = None,
+        source_kind: SourceKind | None = None,
+        query: str | None = None,
+    ) -> tuple[list[CreatorInventoryItem], int]:
+        clauses = ["r.job_id=?"]
+        params: list[Any] = [job_id]
+        if decision:
+            clauses.append("w.decision=?")
+            params.append(decision.value)
+        if source_kind:
+            clauses.append("w.source_kind=?")
+            params.append(source_kind.value)
+        if query:
+            clauses.append("w.title LIKE ?")
+            params.append(f"%{query}%")
+        where = " AND ".join(clauses)
+        with self.connect() as conn:
+            total = conn.execute(
+                f"""SELECT COUNT(*) AS count FROM creator_run_items r
+                    JOIN creator_works w ON w.creator_id=r.creator_id AND w.work_id=r.work_id
+                    WHERE {where}""",
+                params,
+            ).fetchone()["count"]
+            rows = conn.execute(
+                f"""SELECT r.job_id, r.ordinal, r.is_new, w.*
+                    FROM creator_run_items r
+                    JOIN creator_works w ON w.creator_id=r.creator_id AND w.work_id=r.work_id
+                    WHERE {where} ORDER BY r.ordinal LIMIT ? OFFSET ?""",
+                (*params, limit, offset),
+            ).fetchall()
+        return [
+            CreatorInventoryItem(
+                job_id=row["job_id"],
+                ordinal=row["ordinal"],
+                is_new=bool(row["is_new"]),
+                work=self._creator_work_from_row(row),
+            )
+            for row in rows
+        ], int(total)
+
+    def set_creator_run_selection(
+        self,
+        job_id: str,
+        decision: CreatorWorkDecision,
+        *,
+        ordinals: list[int] | None = None,
+        work_ids: list[str] | None = None,
+    ) -> int:
+        if decision not in {CreatorWorkDecision.SELECTED, CreatorWorkDecision.SKIPPED}:
+            raise JobStateError("作品只能标记为“已选入库”或“未入库”")
+        clauses = ["job_id=?"]
+        params: list[Any] = [job_id]
+        if ordinals:
+            placeholders = ",".join("?" for _ in ordinals)
+            clauses.append(f"ordinal IN ({placeholders})")
+            params.extend(ordinals)
+        if work_ids:
+            placeholders = ",".join("?" for _ in work_ids)
+            clauses.append(f"work_id IN ({placeholders})")
+            params.extend(work_ids)
+        if not ordinals and not work_ids:
+            clauses.append("1=1")
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT creator_id, work_id FROM creator_run_items WHERE {' AND '.join(clauses)}",
+                params,
+            ).fetchall()
+            for row in rows:
+                current = conn.execute(
+                    """SELECT decision FROM creator_works
+                       WHERE creator_id=? AND work_id=?""",
+                    (row["creator_id"], row["work_id"]),
+                ).fetchone()
+                if current and current["decision"] != CreatorWorkDecision.IMPORTED.value:
+                    conn.execute(
+                        """UPDATE creator_works SET decision=?
+                           WHERE creator_id=? AND work_id=?""",
+                        (decision.value, row["creator_id"], row["work_id"]),
+                    )
+        return len(rows)
+
+    def create_creator_run_items(self, job_id: str, creator_id: str, work_ids: list[str]) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM creator_run_items WHERE job_id=?", (job_id,))
+            for ordinal, work_id in enumerate(work_ids, start=1):
+                exists = conn.execute(
+                    """SELECT 1 FROM creator_works
+                       WHERE creator_id=? AND work_id=?""",
+                    (creator_id, work_id),
+                ).fetchone()
+                if exists is None:
+                    raise JobStateError(f"creator work not found: {creator_id}/{work_id}")
+                conn.execute(
+                    """INSERT INTO creator_run_items
+                       (job_id, creator_id, work_id, ordinal, is_new)
+                       VALUES (?, ?, ?, ?, 0)""",
+                    (job_id, creator_id, work_id, ordinal),
+                )
+
+    def creator_inventory_summary(self, job_id: str) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT w.decision, COUNT(*) AS count FROM creator_run_items r
+                   JOIN creator_works w ON w.creator_id=r.creator_id AND w.work_id=r.work_id
+                   WHERE r.job_id=? GROUP BY w.decision""",
+                (job_id,),
+            ).fetchall()
+        values = {item.value: 0 for item in CreatorWorkDecision}
+        values.update({row["decision"]: int(row["count"]) for row in rows})
+        values["total"] = sum(int(row["count"]) for row in rows)
+        return values
+
+    def attach_creator_child_job(self, creator_id: str, work_id: str, job_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE creator_works SET last_job_id=?
+                   WHERE creator_id=? AND work_id=?""",
+                (job_id, creator_id, work_id),
+            )
+
+    def mark_creator_work_imported(self, creator_id: str, work_id: str, entry_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE creator_works
+                   SET decision='imported', entry_id=?, availability='available'
+                   WHERE creator_id=? AND work_id=?""",
+                (entry_id, creator_id, work_id),
+            )
+
+    def restore_creator_bundle(
+        self, creator: CreatorRecord, works: list[CreatorWorkRecord]
+    ) -> None:
+        """Restore the rebuildable creator projection from a tracked sidecar."""
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO creators
+                   (id, sec_uid, canonical_url, original_url, nickname, folder_path, uid,
+                    unique_id, signature, avatar_path, inspirations_json, reported_work_count,
+                    last_synced_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     sec_uid=excluded.sec_uid, canonical_url=excluded.canonical_url,
+                     original_url=excluded.original_url, nickname=excluded.nickname,
+                     folder_path=excluded.folder_path, uid=excluded.uid,
+                     unique_id=excluded.unique_id, signature=excluded.signature,
+                     avatar_path=excluded.avatar_path,
+                     inspirations_json=excluded.inspirations_json,
+                     reported_work_count=excluded.reported_work_count,
+                     last_synced_at=excluded.last_synced_at,
+                     created_at=excluded.created_at, updated_at=excluded.updated_at""",
+                (
+                    creator.id,
+                    creator.sec_uid,
+                    creator.canonical_url,
+                    creator.original_url,
+                    creator.nickname,
+                    creator.folder_path,
+                    creator.uid,
+                    creator.unique_id,
+                    creator.signature,
+                    creator.avatar_path,
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in creator.inspirations],
+                        ensure_ascii=False,
+                    ),
+                    creator.reported_work_count,
+                    creator.last_synced_at.isoformat() if creator.last_synced_at else None,
+                    creator.created_at.isoformat(),
+                    creator.updated_at.isoformat(),
+                ),
+            )
+            for work in works:
+                entry_id = work.entry_id
+                if (
+                    entry_id
+                    and not conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone()
+                ):
+                    entry_id = None
+                conn.execute(
+                    """INSERT INTO creator_works
+                       (creator_id, work_id, source_kind, canonical_url, original_url, title,
+                        published_at, duration_seconds, thumbnail_path, is_pinned, decision,
+                        availability, missing_sync_count, entry_id, last_job_id,
+                        first_seen_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                       ON CONFLICT(creator_id, work_id) DO UPDATE SET
+                         source_kind=excluded.source_kind,
+                         canonical_url=excluded.canonical_url,
+                         original_url=excluded.original_url,
+                         title=excluded.title,
+                         published_at=excluded.published_at,
+                         duration_seconds=excluded.duration_seconds,
+                         thumbnail_path=excluded.thumbnail_path,
+                         is_pinned=excluded.is_pinned,
+                         decision=excluded.decision,
+                         availability=excluded.availability,
+                         missing_sync_count=excluded.missing_sync_count,
+                         entry_id=excluded.entry_id,
+                         last_job_id=NULL,
+                         first_seen_at=excluded.first_seen_at,
+                         last_seen_at=excluded.last_seen_at""",
+                    (
+                        creator.id,
+                        work.work_id,
+                        work.source_kind.value,
+                        work.canonical_url,
+                        work.original_url,
+                        work.title,
+                        work.published_at.isoformat() if work.published_at else None,
+                        work.duration_seconds,
+                        work.thumbnail_path,
+                        int(work.is_pinned),
+                        work.decision.value,
+                        work.availability.value,
+                        work.missing_sync_count,
+                        entry_id,
+                        work.first_seen_at.isoformat(),
+                        work.last_seen_at.isoformat(),
+                    ),
+                )
 
     def get_entry(self, entry_id: str) -> EntryRecord:
         with self.connect() as conn:
@@ -739,10 +1493,13 @@ class Database:
             )
         return self.get_entry(entry.id)
 
-    def clear_knowledge_cache(self) -> None:
+    def clear_knowledge_cache(self, *, include_creators: bool = False) -> None:
         """Remove only rebuildable knowledge projections; keep jobs and maintenance history."""
         with self.connect() as conn:
             conn.execute("DELETE FROM chunks_fts")
+            conn.execute("DELETE FROM research_topics")
+            if include_creators:
+                conn.execute("DELETE FROM creators")
             conn.execute("DELETE FROM entries")
             conn.execute("DELETE FROM index_metadata")
 
@@ -1103,12 +1860,27 @@ class Database:
                     ),
                 )
 
-    def fetch_chunks(self, *, include_stale: bool = False) -> list[dict[str, Any]]:
+    def fetch_chunks(
+        self,
+        *,
+        include_stale: bool = False,
+        entry_ids: Collection[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if entry_ids is not None and not entry_ids:
+            return []
         query = "SELECT * FROM chunks"
+        clauses: list[str] = []
+        values: list[Any] = []
         if not include_stale:
-            query += " WHERE stale=0"
+            clauses.append("stale=0")
+        if entry_ids is not None:
+            placeholders = ",".join("?" for _ in entry_ids)
+            clauses.append(f"entry_id IN ({placeholders})")
+            values.extend(entry_ids)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         with self.connect() as conn:
-            rows = conn.execute(query).fetchall()
+            rows = conn.execute(query, values).fetchall()
         return [dict(row) for row in rows]
 
     def entry_chunk_count(self, entry_id: str) -> int:
@@ -1119,25 +1891,45 @@ class Database:
         return int(row["count"])
 
     def fts_search(
-        self, query: str, *, include_stale: bool = False, limit: int = 50
+        self,
+        query: str,
+        *,
+        include_stale: bool = False,
+        limit: int = 50,
+        entry_ids: Collection[str] | None = None,
     ) -> list[dict[str, Any]]:
-        stale_clause = "" if include_stale else "AND c.stale=0"
+        if entry_ids is not None and not entry_ids:
+            return []
+        conditions = [] if include_stale else ["c.stale=0"]
+        filter_values: list[Any] = []
+        if entry_ids is not None:
+            placeholders = ",".join("?" for _ in entry_ids)
+            conditions.append(f"c.entry_id IN ({placeholders})")
+            filter_values.extend(entry_ids)
+        filter_clause = "" if not conditions else "AND " + " AND ".join(conditions)
         with self.connect() as conn:
             try:
                 rows = conn.execute(
                     f"""SELECT c.*, bm25(chunks_fts, 0, 0, 1.0, 1.6, 0.8) AS rank
                         FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.chunk_id
-                        WHERE chunks_fts MATCH ? {stale_clause}
+                        WHERE chunks_fts MATCH ? {filter_clause}
                         ORDER BY rank LIMIT ?""",
-                    (query, limit),
+                    (query, *filter_values, limit),
                 ).fetchall()
             except sqlite3.OperationalError:
                 escaped = query.replace("%", "\\%").replace("_", "\\_")
+                like_conditions = [
+                    "(c.text LIKE ? ESCAPE '\\' OR c.purposes_text LIKE ? ESCAPE '\\')"
+                ]
+                if not include_stale:
+                    like_conditions.append("c.stale=0")
+                if entry_ids is not None:
+                    placeholders = ",".join("?" for _ in entry_ids)
+                    like_conditions.append(f"c.entry_id IN ({placeholders})")
                 rows = conn.execute(
                     f"""SELECT c.*, 0 AS rank FROM chunks c
-                        WHERE (c.text LIKE ? ESCAPE '\\' OR c.purposes_text LIKE ? ESCAPE '\\')
-                        {stale_clause} LIMIT ?""",
-                    (f"%{escaped}%", f"%{escaped}%", limit),
+                        WHERE {' AND '.join(like_conditions)} LIMIT ?""",
+                    (f"%{escaped}%", f"%{escaped}%", *filter_values, limit),
                 ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1170,6 +1962,351 @@ class Database:
                 (entry_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def create_topic(
+        self,
+        *,
+        topic_id: str,
+        title: str,
+        goal: str = "",
+        instructions: str = "",
+        source_revision: str,
+    ) -> ResearchTopic:
+        now = iso_now()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO research_topics
+                   (id, title, goal, instructions, source_revision, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (topic_id, title, goal, instructions, source_revision, now, now),
+            )
+        return self.get_topic(topic_id)
+
+    def get_topic(self, topic_id: str) -> ResearchTopic:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM research_topics WHERE id=?", (topic_id,)
+            ).fetchone()
+            sources = conn.execute(
+                """SELECT s.*, e.title
+                   FROM topic_sources s JOIN entries e ON e.id=s.entry_id
+                   WHERE s.topic_id=? ORDER BY s.position""",
+                (topic_id,),
+            ).fetchall()
+        if row is None:
+            raise KeyError(f"专题不存在：{topic_id}")
+        return self._topic_from_rows(row, sources)
+
+    def list_topics(self) -> list[ResearchTopic]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_topics ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self.get_topic(row["id"]) for row in rows]
+
+    def set_topic_sources(
+        self,
+        topic_id: str,
+        sources: list[tuple[str, bool, str]],
+        *,
+        source_revision: str,
+    ) -> ResearchTopic:
+        self.get_topic(topic_id)
+        if len({entry_id for entry_id, _, _ in sources}) != len(sources):
+            raise ValueError("专题来源不能重复")
+        with self.connect() as conn:
+            for entry_id, _, _ in sources:
+                if conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone() is None:
+                    raise EntryNotFoundError(f"entry not found: {entry_id}")
+            conn.execute("DELETE FROM topic_sources WHERE topic_id=?", (topic_id,))
+            conn.executemany(
+                """INSERT INTO topic_sources
+                   (topic_id, entry_id, position, enabled, source_revision)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (topic_id, entry_id, position, int(enabled), revision)
+                    for position, (entry_id, enabled, revision) in enumerate(sources, start=1)
+                ],
+            )
+            now = iso_now()
+            conn.execute(
+                """UPDATE research_topics SET source_revision=?, updated_at=? WHERE id=?""",
+                (source_revision, now, topic_id),
+            )
+            conn.execute(
+                """UPDATE topic_artifacts SET status='needs_update', updated_at=?
+                   WHERE topic_id=? AND user_authored=0 AND source_revision<>?""",
+                (now, topic_id, source_revision),
+            )
+        return self.get_topic(topic_id)
+
+    def update_topic_revision(
+        self,
+        topic_id: str,
+        *,
+        source_revision: str,
+        source_versions: dict[str, str],
+    ) -> ResearchTopic:
+        now = iso_now()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE research_topics SET source_revision=?, updated_at=? WHERE id=?",
+                (source_revision, now, topic_id),
+            )
+            conn.executemany(
+                """UPDATE topic_sources SET source_revision=?
+                   WHERE topic_id=? AND entry_id=?""",
+                [(revision, topic_id, entry_id) for entry_id, revision in source_versions.items()],
+            )
+            conn.execute(
+                """UPDATE topic_artifacts SET status='needs_update', updated_at=?
+                   WHERE topic_id=? AND user_authored=0 AND source_revision<>?""",
+                (now, topic_id, source_revision),
+            )
+        return self.get_topic(topic_id)
+
+    def enabled_topic_entry_ids(self, topic_id: str) -> list[str]:
+        self.get_topic(topic_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT entry_id FROM topic_sources
+                   WHERE topic_id=? AND enabled=1 ORDER BY position""",
+                (topic_id,),
+            ).fetchall()
+        return [row["entry_id"] for row in rows]
+
+    def save_topic_artifact(self, artifact: TopicArtifact) -> TopicArtifact:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO topic_artifacts
+                   (id, topic_id, kind, title, content_markdown, source_revision,
+                    source_revisions_json, status, model, prompt_version, prompt_tokens,
+                    completion_tokens, total_tokens, user_authored, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                    title=excluded.title, content_markdown=excluded.content_markdown,
+                    source_revision=excluded.source_revision,
+                    source_revisions_json=excluded.source_revisions_json,
+                    status=excluded.status, model=excluded.model,
+                    prompt_version=excluded.prompt_version,
+                    prompt_tokens=excluded.prompt_tokens,
+                    completion_tokens=excluded.completion_tokens,
+                    total_tokens=excluded.total_tokens, updated_at=excluded.updated_at""",
+                (
+                    artifact.id,
+                    artifact.topic_id,
+                    artifact.kind,
+                    artifact.title,
+                    artifact.content_markdown,
+                    artifact.source_revision,
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in artifact.source_revisions],
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    artifact.status,
+                    artifact.model,
+                    artifact.prompt_version,
+                    artifact.prompt_tokens,
+                    artifact.completion_tokens,
+                    artifact.total_tokens,
+                    int(artifact.user_authored),
+                    artifact.created_at.isoformat(),
+                    artifact.updated_at.isoformat(),
+                ),
+            )
+        return self.get_topic_artifact(artifact.id)
+
+    def restore_topic_bundle(
+        self, topic: ResearchTopic, artifacts: list[TopicArtifact]
+    ) -> ResearchTopic:
+        """Restore a topic projection after its entry rows have been rebuilt."""
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO research_topics
+                   (id, title, goal, instructions, source_revision, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET title=excluded.title, goal=excluded.goal,
+                   instructions=excluded.instructions, source_revision=excluded.source_revision,
+                   created_at=excluded.created_at, updated_at=excluded.updated_at""",
+                (
+                    topic.id,
+                    topic.title,
+                    topic.goal,
+                    topic.instructions,
+                    topic.source_revision,
+                    topic.created_at.isoformat(),
+                    topic.updated_at.isoformat(),
+                ),
+            )
+            conn.execute("DELETE FROM topic_sources WHERE topic_id=?", (topic.id,))
+            valid_sources = [
+                source
+                for source in topic.sources
+                if conn.execute(
+                    "SELECT 1 FROM entries WHERE id=?", (source.entry_id,)
+                ).fetchone()
+            ]
+            conn.executemany(
+                """INSERT INTO topic_sources
+                   (topic_id, entry_id, position, enabled, source_revision)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (
+                        topic.id,
+                        source.entry_id,
+                        position,
+                        int(source.enabled),
+                        source.source_revision.isoformat(),
+                    )
+                    for position, source in enumerate(valid_sources, start=1)
+                ],
+            )
+        for artifact in artifacts:
+            self.save_topic_artifact(artifact)
+        return self.get_topic(topic.id)
+
+    def get_topic_artifact(self, artifact_id: str) -> TopicArtifact:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM topic_artifacts WHERE id=?", (artifact_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"专题成果不存在：{artifact_id}")
+        return self._topic_artifact_from_row(row)
+
+    def list_topic_artifacts(self, topic_id: str) -> list[TopicArtifact]:
+        self.get_topic(topic_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM topic_artifacts WHERE topic_id=?
+                   ORDER BY created_at DESC""",
+                (topic_id,),
+            ).fetchall()
+        return [self._topic_artifact_from_row(row) for row in rows]
+
+    def create_chat_session(
+        self,
+        *,
+        title: str = "新对话",
+        scope: str = "library",
+        context_entry_id: str | None = None,
+        context_topic_id: str | None = None,
+    ) -> ChatSession:
+        session_id = uuid.uuid4().hex
+        now = iso_now()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO web_chat_sessions
+                   (id, title, scope, context_entry_id, context_topic_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, title, scope, context_entry_id, context_topic_id, now, now),
+            )
+        return self.get_chat_session(session_id)
+
+    def get_chat_session(self, session_id: str) -> ChatSession:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM web_chat_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        if not row:
+            raise KeyError(f"对话不存在：{session_id}")
+        return self._chat_session_from_row(row)
+
+    def list_chat_sessions(self) -> list[ChatSession]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM web_chat_sessions ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self._chat_session_from_row(row) for row in rows]
+
+    def update_chat_session(
+        self,
+        session_id: str,
+        *,
+        title: str | None = None,
+        scope: str | None = None,
+        context_entry_id: str | None = None,
+        context_topic_id: str | None = None,
+        update_context: bool = False,
+    ) -> ChatSession:
+        current = self.get_chat_session(session_id)
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE web_chat_sessions
+                   SET title=?, scope=?, context_entry_id=?, context_topic_id=?, updated_at=?
+                   WHERE id=?""",
+                (
+                    title if title is not None else current.title,
+                    scope if scope is not None else current.scope,
+                    context_entry_id if update_context else current.context_entry_id,
+                    context_topic_id if update_context else current.context_topic_id,
+                    iso_now(),
+                    session_id,
+                ),
+            )
+        return self.get_chat_session(session_id)
+
+    def delete_chat_session(self, session_id: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM web_chat_sessions WHERE id=?", (session_id,))
+        return cursor.rowcount > 0
+
+    def add_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        citations: list[Citation] | None = None,
+        model: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+    ) -> ChatMessage:
+        now = iso_now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO web_chat_messages
+                   (session_id, role, content, citations_json, model,
+                    prompt_tokens, completion_tokens, total_tokens, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    role,
+                    content,
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in (citations or [])],
+                        ensure_ascii=False,
+                    ),
+                    model,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    now,
+                ),
+            )
+            message_id = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE web_chat_sessions SET updated_at=? WHERE id=?",
+                (now, session_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM web_chat_messages WHERE id=?", (message_id,)
+            ).fetchone()
+        return self._chat_message_from_row(row)
+
+    def list_chat_messages(self, session_id: str, *, limit: int = 200) -> list[ChatMessage]:
+        self.get_chat_session(session_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM (
+                       SELECT * FROM web_chat_messages WHERE session_id=?
+                       ORDER BY id DESC LIMIT ?
+                   ) ORDER BY id""",
+                (session_id, limit),
+            ).fetchall()
+        return [self._chat_message_from_row(row) for row in rows]
 
     def entries_with_expired_media(self, now: datetime | None = None) -> list[EntryRecord]:
         timestamp = (now or utc_now()).isoformat()
@@ -1288,4 +2425,124 @@ class Database:
             tags=json.loads(row["tags_json"]),
             created_at=parse_datetime(row["created_at"]),
             updated_at=parse_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _creator_from_row(row: sqlite3.Row) -> CreatorRecord:
+        return CreatorRecord(
+            id=row["id"],
+            sec_uid=row["sec_uid"],
+            canonical_url=row["canonical_url"],
+            original_url=row["original_url"],
+            nickname=row["nickname"],
+            folder_path=row["folder_path"],
+            uid=row["uid"],
+            unique_id=row["unique_id"],
+            signature=row["signature"],
+            avatar_path=row["avatar_path"],
+            inspirations=[
+                InspirationInput.model_validate(item)
+                for item in json.loads(row["inspirations_json"])
+            ],
+            reported_work_count=row["reported_work_count"],
+            last_synced_at=parse_datetime(row["last_synced_at"]),
+            created_at=parse_datetime(row["created_at"]),
+            updated_at=parse_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _creator_work_from_row(row: sqlite3.Row) -> CreatorWorkRecord:
+        return CreatorWorkRecord(
+            creator_id=row["creator_id"],
+            work_id=row["work_id"],
+            source_kind=SourceKind(row["source_kind"]),
+            canonical_url=row["canonical_url"],
+            original_url=row["original_url"],
+            title=row["title"],
+            published_at=parse_datetime(row["published_at"]),
+            duration_seconds=row["duration_seconds"],
+            thumbnail_path=row["thumbnail_path"],
+            is_pinned=bool(row["is_pinned"]),
+            decision=CreatorWorkDecision(row["decision"]),
+            availability=CreatorWorkAvailability(row["availability"]),
+            missing_sync_count=int(row["missing_sync_count"] or 0),
+            entry_id=row["entry_id"],
+            last_job_id=row["last_job_id"],
+            first_seen_at=parse_datetime(row["first_seen_at"]),
+            last_seen_at=parse_datetime(row["last_seen_at"]),
+        )
+
+    @staticmethod
+    def _topic_from_rows(
+        row: sqlite3.Row, source_rows: Iterable[sqlite3.Row]
+    ) -> ResearchTopic:
+        return ResearchTopic(
+            id=row["id"],
+            title=row["title"],
+            goal=row["goal"],
+            instructions=row["instructions"],
+            sources=[
+                TopicSource(
+                    entry_id=source["entry_id"],
+                    position=source["position"],
+                    enabled=bool(source["enabled"]),
+                    source_revision=parse_datetime(source["source_revision"]),
+                    title=source["title"],
+                )
+                for source in source_rows
+            ],
+            source_revision=row["source_revision"],
+            created_at=parse_datetime(row["created_at"]),
+            updated_at=parse_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _topic_artifact_from_row(row: sqlite3.Row) -> TopicArtifact:
+        return TopicArtifact(
+            id=row["id"],
+            topic_id=row["topic_id"],
+            kind=row["kind"],
+            title=row["title"],
+            content_markdown=row["content_markdown"],
+            source_revision=row["source_revision"],
+            source_revisions=[
+                SourceRevision.model_validate(item)
+                for item in json.loads(row["source_revisions_json"])
+            ],
+            status=row["status"],
+            model=row["model"],
+            prompt_version=row["prompt_version"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            total_tokens=row["total_tokens"],
+            user_authored=bool(row["user_authored"]),
+            created_at=parse_datetime(row["created_at"]),
+            updated_at=parse_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _chat_session_from_row(row: sqlite3.Row) -> ChatSession:
+        return ChatSession(
+            id=row["id"],
+            title=row["title"],
+            scope=row["scope"],
+            context_entry_id=row["context_entry_id"],
+            context_topic_id=row["context_topic_id"],
+            created_at=parse_datetime(row["created_at"]),
+            updated_at=parse_datetime(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _chat_message_from_row(row: sqlite3.Row) -> ChatMessage:
+        return ChatMessage(
+            id=row["id"],
+            session_id=row["session_id"],
+            role=row["role"],
+            content=row["content"],
+            citations=[Citation.model_validate(item) for item in json.loads(row["citations_json"])],
+            model=row["model"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            total_tokens=row["total_tokens"],
+            created_at=parse_datetime(row["created_at"]),
         )

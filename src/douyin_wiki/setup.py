@@ -5,13 +5,21 @@ import json
 import os
 import plistlib
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig, default_config_path, render_default_config
+from .config import (
+    AppConfig,
+    default_config_path,
+    llm_api_key_required,
+    llm_is_configured,
+    render_default_config,
+)
 from .models import AnalysisMode
 from .secrets import get_secret
 
@@ -87,7 +95,24 @@ def write_config(config: AppConfig, path: Path | None = None, *, overwrite: bool
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not overwrite:
         return target
-    target.write_text(render_default_config(config), encoding="utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(render_default_config(config))
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        temporary_path.replace(target)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     return target
 
 
@@ -109,6 +134,42 @@ def doctor(config: AppConfig) -> dict[str, Any]:
         "ok": playwright_available,
         "message": None if playwright_available else "未安装 Playwright；请运行 uv sync",
     }
+    web_dependencies = ("fastapi", "uvicorn", "jinja2", "markdown_it", "nh3", "watchfiles")
+    missing_web = [name for name in web_dependencies if importlib.util.find_spec(name) is None]
+    checks["web_dependencies"] = {
+        "ok": not missing_web,
+        "required": config.web.enabled,
+        "missing": missing_web,
+        "message": None if not missing_web else "缺少 Web 依赖；请运行 uv sync",
+    }
+    port_available = False
+    already_running = False
+    try:
+        with socket.create_connection((config.web.host, config.web.port), timeout=0.15):
+            already_running = True
+    except OSError:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((config.web.host, config.web.port))
+                port_available = True
+        except OSError:
+            port_available = False
+    web_plist = Path.home() / "Library" / "LaunchAgents" / "com.local.douyin-wiki.web.plist"
+    checks["web"] = {
+        "ok": bool(config.web.enabled and (port_available or already_running)),
+        "enabled": config.web.enabled,
+        "address": f"http://{config.web.host}:{config.web.port}",
+        "port_available": port_available,
+        "running": already_running,
+        "launch_agent_installed": web_plist.exists(),
+        "message": (
+            "Web 服务正在运行"
+            if already_running
+            else "端口可用，可运行 douyin-wiki web run"
+            if port_available
+            else "Web 端口已被其他程序占用"
+        ),
+    }
     browser_name = config.media.browser.lower()
     app_names = {
         "chrome": "Google Chrome.app",
@@ -125,9 +186,9 @@ def doctor(config: AppConfig) -> dict[str, Any]:
         "required": False,
         "path": str(profile),
         "message": (
-            "专用浏览器目录存在；这不代表登录仍有效，请运行 douyin-wiki auth status"
+            "图文与博主清点专用浏览器目录存在；这不代表登录仍有效，请运行 douyin-wiki auth status"
             if profile.exists()
-            else "首次保存图文前可运行 douyin-wiki auth douyin"
+            else "首次保存图文或清点博主前可运行 douyin-wiki auth douyin"
         ),
     }
     checks["vault"] = {"ok": config.vault_path.exists(), "path": str(config.vault_path)}
@@ -138,13 +199,15 @@ def doctor(config: AppConfig) -> dict[str, Any]:
     }
     api_key = get_secret(config.llm.api_key_env)
     backend_llm_required = config.analysis_mode == AnalysisMode.PROVIDER
-    backend_llm_configured = bool(config.llm.model and api_key)
+    api_key_required = llm_api_key_required(config.llm.base_url)
+    backend_llm_configured = llm_is_configured(config.llm, api_key)
     checks["llm"] = {
         "ok": backend_llm_configured or not backend_llm_required,
         "required": backend_llm_required,
         "model": config.llm.model,
         "base_url": config.llm.base_url,
         "api_key_env": config.llm.api_key_env,
+        "api_key_required": api_key_required,
         "message": (
             None
             if backend_llm_configured
@@ -154,6 +217,19 @@ def doctor(config: AppConfig) -> dict[str, Any]:
                 else "当前模式不需要后台模型"
                 if config.analysis_mode == AnalysisMode.LOCAL
                 else "provider 模式需要配置模型与 API key"
+            )
+        ),
+    }
+    checks["web_llm"] = {
+        "ok": backend_llm_configured or not config.web.enabled,
+        "required": config.web.enabled,
+        "model": config.llm.model or "未配置",
+        "message": (
+            None
+            if backend_llm_configured
+            else (
+                "文章浏览可正常使用；AI 对话请打开网页“模型设置”，"
+                "或运行 douyin-wiki configure-model"
             )
         ),
     }
@@ -207,6 +283,8 @@ def doctor(config: AppConfig) -> dict[str, Any]:
             "obsidian_vault",
             "database",
             "llm",
+            "web_dependencies",
+            "web",
         }
     )
     return checks
@@ -289,3 +367,80 @@ class LaunchAgentInstaller:
                 path.unlink()
                 removed.append(path)
         return removed
+
+
+class WebLaunchAgentInstaller:
+    LABEL = "com.local.douyin-wiki.web"
+
+    def __init__(self, config_path: Path | None = None) -> None:
+        self.config_path = config_path or default_config_path()
+        self.launch_agents = Path.home() / "Library" / "LaunchAgents"
+        self.logs = Path.home() / "Library" / "Logs" / "douyin-wiki"
+
+    @property
+    def path(self) -> Path:
+        return self.launch_agents / f"{self.LABEL}.plist"
+
+    def install(self) -> Path:
+        self.launch_agents.mkdir(parents=True, exist_ok=True)
+        self.logs.mkdir(parents=True, exist_ok=True)
+        executable_dirs = [
+            str(Path(sys.executable).parent),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        inherited_path = os.environ.get("PATH", "").split(os.pathsep)
+        launch_path = os.pathsep.join(dict.fromkeys([*executable_dirs, *inherited_path]))
+        payload = {
+            "Label": self.LABEL,
+            "ProgramArguments": [
+                sys.executable,
+                "-m",
+                "douyin_wiki",
+                "web",
+                "run",
+                "--config-path",
+                str(self.config_path),
+            ],
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ThrottleInterval": 10,
+            "EnvironmentVariables": {
+                "DOUYIN_WIKI_CONFIG": str(self.config_path),
+                "PATH": launch_path,
+            },
+            "StandardOutPath": str(self.logs / "web.log"),
+            "StandardErrorPath": str(self.logs / "web-error.log"),
+        }
+        with self.path.open("wb") as handle:
+            plistlib.dump(payload, handle)
+        subprocess.run(["launchctl", "unload", str(self.path)], capture_output=True, check=False)
+        subprocess.run(["launchctl", "load", str(self.path)], capture_output=True, check=False)
+        return self.path
+
+    def uninstall(self) -> Path | None:
+        if not self.path.exists():
+            return None
+        subprocess.run(["launchctl", "unload", str(self.path)], capture_output=True, check=False)
+        self.path.unlink()
+        return self.path
+
+    def status(self, config: AppConfig) -> dict[str, Any]:
+        running = False
+        try:
+            with socket.create_connection((config.web.host, config.web.port), timeout=0.2):
+                running = True
+        except OSError:
+            pass
+        return {
+            "installed": self.path.exists(),
+            "running": running,
+            "address": f"http://{config.web.host}:{config.web.port}",
+            "launch_agent": str(self.path),
+            "log": str(self.logs / "web.log"),
+            "error_log": str(self.logs / "web-error.log"),
+        }

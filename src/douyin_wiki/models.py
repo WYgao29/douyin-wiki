@@ -25,9 +25,26 @@ class SourceKind(StrEnum):
     IMAGE_NOTE = "image_note"
 
 
+class CreatorWorkDecision(StrEnum):
+    PENDING = "pending"
+    SELECTED = "selected"
+    SKIPPED = "skipped"
+    IMPORTED = "imported"
+
+
+class CreatorWorkAvailability(StrEnum):
+    AVAILABLE = "available"
+    POSSIBLY_UNAVAILABLE = "possibly_unavailable"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RESOLVING = "resolving"
+    INVENTORYING = "inventorying"
+    NEEDS_SELECTION = "needs_selection"
+    DISPATCHING = "dispatching"
+    MONITORING = "monitoring"
     DOWNLOADING = "downloading"
     EXTRACTING = "extracting"
     TRANSCRIBING = "transcribing"
@@ -56,7 +73,7 @@ AuthState = Literal[
 class AuthCheckResult(BaseModel):
     """Non-secret authentication health returned to CLI and MCP callers."""
 
-    scope: Literal["video", "image_note"]
+    scope: Literal["video", "image_note", "creator"]
     state: AuthState
     ok: bool
     server_verified: bool = False
@@ -103,6 +120,85 @@ class CaptureRequest(BaseModel):
     )
     options: CaptureOptions = Field(default_factory=CaptureOptions)
     gateway_context: GatewayContext | None = None
+
+
+class CreatorProfile(BaseModel):
+    sec_uid: str = Field(min_length=8, max_length=256)
+    canonical_url: str
+    original_url: str
+    nickname: str = "抖音博主"
+    uid: str | None = None
+    unique_id: str | None = None
+    signature: str = ""
+    avatar_url: str | None = None
+    avatar_path: str | None = None
+    reported_work_count: int | None = Field(default=None, ge=0)
+
+
+class CreatorInventoryWork(BaseModel):
+    work_id: str
+    source_kind: SourceKind = SourceKind.VIDEO
+    canonical_url: str
+    original_url: str
+    title: str = "抖音作品"
+    published_at: datetime | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    thumbnail_url: str | None = None
+    thumbnail_path: str | None = None
+    is_pinned: bool = False
+
+
+class CreatorInventoryResult(BaseModel):
+    profile: CreatorProfile
+    works: list[CreatorInventoryWork] = Field(default_factory=list)
+    complete: bool = True
+    reported_count: int | None = Field(default=None, ge=0)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class CreatorRecord(BaseModel):
+    id: str
+    sec_uid: str
+    canonical_url: str
+    original_url: str
+    nickname: str
+    folder_path: str
+    uid: str | None = None
+    unique_id: str | None = None
+    signature: str = ""
+    avatar_path: str | None = None
+    inspirations: list[InspirationInput] = Field(default_factory=list)
+    reported_work_count: int | None = None
+    last_synced_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CreatorWorkRecord(BaseModel):
+    creator_id: str
+    work_id: str
+    source_kind: SourceKind
+    canonical_url: str
+    original_url: str
+    title: str
+    published_at: datetime | None = None
+    duration_seconds: float | None = None
+    thumbnail_path: str | None = None
+    is_pinned: bool = False
+    decision: CreatorWorkDecision = CreatorWorkDecision.PENDING
+    availability: CreatorWorkAvailability = CreatorWorkAvailability.AVAILABLE
+    missing_sync_count: int = 0
+    entry_id: str | None = None
+    last_job_id: str | None = None
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+
+class CreatorInventoryItem(BaseModel):
+    job_id: str
+    ordinal: int = Field(ge=1)
+    is_new: bool = True
+    work: CreatorWorkRecord
 
 
 class TranscriptSegment(BaseModel):
@@ -461,6 +557,10 @@ class VideoMetadata(BaseModel):
     post_text: str | None = None
     music_metadata: dict[str, Any] | None = None
     live_photo: bool = False
+    creator_sec_uid: str | None = None
+    creator_uid: str | None = None
+    creator_unique_id: str | None = None
+    creator_url: str | None = None
 
 
 class Evidence(BaseModel):
@@ -478,6 +578,133 @@ class Evidence(BaseModel):
     confidence: float = Field(ge=0, le=1)
     score: float = 0
     title: str = ""
+
+
+class LibraryItem(BaseModel):
+    entry_id: str
+    work_id: str
+    title: str
+    author: str = "未知作者"
+    cover_path: str | None = None
+    cover_url: str | None = None
+    summary: str = ""
+    content_type: str = "other"
+    tags: list[str] = Field(default_factory=list)
+    inspirations: list[InspirationInput] = Field(default_factory=list)
+    published_at: datetime | None = None
+    captured_at: datetime | None = None
+    status: str = "已入库"
+    source_kind: SourceKind = SourceKind.VIDEO
+    source_path: str
+    original_url: str = ""
+    creator_id: str | None = None
+    body_markdown: str = ""
+
+
+class Citation(BaseModel):
+    entry_id: str
+    article_title: str
+    snippet: str
+    timestamp_ms: int | None = None
+    image_index: int | None = Field(default=None, ge=1)
+    original_url: str = ""
+
+
+class SourceRevision(BaseModel):
+    entry_id: str
+    updated_at: datetime
+    enabled: bool = True
+
+
+class TopicSource(BaseModel):
+    entry_id: str
+    position: int = Field(ge=1)
+    enabled: bool = True
+    source_revision: datetime
+    title: str = ""
+
+
+TopicArtifactKind = Literal[
+    "overview",
+    "comparison",
+    "evidence_map",
+    "consensus",
+    "decision_brief",
+    "faq",
+    "note",
+]
+
+
+class TopicArtifact(BaseModel):
+    id: str
+    topic_id: str
+    kind: TopicArtifactKind
+    title: str
+    content_markdown: str
+    source_revision: str
+    source_revisions: list[SourceRevision] = Field(default_factory=list)
+    status: Literal["current", "needs_update"] = "current"
+    model: str | None = None
+    prompt_version: str = "topic-research-v1"
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    user_authored: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class ResearchTopic(BaseModel):
+    id: str
+    title: str
+    goal: str = ""
+    instructions: str = ""
+    sources: list[TopicSource] = Field(default_factory=list)
+    source_revision: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatSession(BaseModel):
+    id: str
+    title: str
+    scope: Literal["library", "entry", "topic"] = "library"
+    context_entry_id: str | None = None
+    context_topic_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatMessage(BaseModel):
+    id: int | None = None
+    session_id: str
+    role: Literal["user", "assistant", "system"]
+    content: str
+    citations: list[Citation] = Field(default_factory=list)
+    model: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    created_at: datetime
+
+
+class InspirationDraft(BaseModel):
+    entry_id: str
+    text: str = Field(min_length=1, max_length=4000)
+    quote: str | None = Field(default=None, max_length=4000)
+    start_ms: int | None = Field(default=None, ge=0)
+    end_ms: int | None = Field(default=None, ge=0)
+    confirmed: bool = False
+
+    @model_validator(mode="after")
+    def validate_range(self) -> InspirationDraft:
+        InspirationInput(
+            text=self.text,
+            quote=self.quote,
+            start_ms=self.start_ms,
+            end_ms=self.end_ms,
+        )
+        return self
 
 
 class JobRecord(BaseModel):

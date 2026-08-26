@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import tomllib
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .models import AnalysisMode
 
@@ -55,14 +57,27 @@ class WorkerSettings(BaseModel):
     heartbeat_seconds: int = 30
 
 
+class WebSettings(BaseModel):
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = Field(default=8765, ge=1024, le=65535)
+
+    @model_validator(mode="after")
+    def local_only(self) -> WebSettings:
+        if self.host != "127.0.0.1":
+            raise ValueError("Web 服务只允许绑定 127.0.0.1")
+        return self
+
+
 class AppConfig(BaseModel):
-    vault_path: Path = Path.home() / "Documents" / "Obsidian" / "Douyin-Wiki"
+    vault_path: Path = Path.home() / "Documents" / "Obsidian" / "抖库"
     timezone: str = "Asia/Shanghai"
     analysis_mode: AnalysisMode = AnalysisMode.GATEWAY
     llm: LLMSettings = Field(default_factory=LLMSettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
+    web: WebSettings = Field(default_factory=WebSettings)
 
     @property
     def state_dir(self) -> Path:
@@ -78,8 +93,31 @@ class AppConfig(BaseModel):
 
     @property
     def browser_profile_dir(self) -> Path:
-        """Persistent profile used only by Douyin Wiki's browser automation."""
+        """Persistent profile used only by 抖库 browser automation."""
         return Path.home() / "Library" / "Application Support" / "douyin-wiki" / "browser-profile"
+
+
+def llm_api_key_required(base_url: str) -> bool:
+    """Return whether an OpenAI-compatible endpoint should require an API key.
+
+    Loopback endpoints are intentionally allowed without a key so local LM Studio and
+    Ollama-compatible servers work without storing or transmitting a dummy credential.
+    """
+    hostname = (urlsplit(base_url).hostname or "").lower()
+    if hostname == "localhost":
+        return False
+    try:
+        return not ip_address(hostname).is_loopback
+    except ValueError:
+        return True
+
+
+def llm_is_configured(settings: LLMSettings, api_key: str) -> bool:
+    return bool(
+        settings.enabled
+        and settings.model
+        and (api_key or not llm_api_key_required(settings.base_url))
+    )
 
 
 def _merge_dict(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
@@ -101,39 +139,48 @@ def load_config(path: Path | None = None) -> AppConfig:
     return AppConfig.model_validate(data)
 
 
+def _toml_string(value: object) -> str:
+    """Encode a value as a TOML basic string using JSON-compatible escaping."""
+    import json
+
+    return json.dumps(str(value), ensure_ascii=False)
+
+
 def render_default_config(config: AppConfig | None = None) -> str:
     cfg = config or AppConfig()
     profile = (
-        f'\nbrowser_profile = "{cfg.media.browser_profile}"' if cfg.media.browser_profile else ""
+        f"\nbrowser_profile = {_toml_string(cfg.media.browser_profile)}"
+        if cfg.media.browser_profile
+        else ""
     )
-    return f'''vault_path = "{cfg.vault_path}"
-timezone = "{cfg.timezone}"
-analysis_mode = "{cfg.analysis_mode.value}"
+    return f"""vault_path = {_toml_string(cfg.vault_path)}
+timezone = {_toml_string(cfg.timezone)}
+analysis_mode = {_toml_string(cfg.analysis_mode.value)}
 
 [llm]
 enabled = {str(cfg.llm.enabled).lower()}
-base_url = "{cfg.llm.base_url}"
-model = "{cfg.llm.model}"
-api_key_env = "{cfg.llm.api_key_env}"
+base_url = {_toml_string(cfg.llm.base_url)}
+model = {_toml_string(cfg.llm.model)}
+api_key_env = {_toml_string(cfg.llm.api_key_env)}
 timeout_seconds = {cfg.llm.timeout_seconds}
 max_retries = {cfg.llm.max_retries}
 
 [embeddings]
-provider = "{cfg.embeddings.provider}"
-model = "{cfg.embeddings.model}"
+provider = {_toml_string(cfg.embeddings.provider)}
+model = {_toml_string(cfg.embeddings.model)}
 fallback_dimensions = {cfg.embeddings.fallback_dimensions}
 
 [media]
-browser = "{cfg.media.browser}"{profile}
+browser = {_toml_string(cfg.media.browser)}{profile}
 retention_days = {cfg.media.retention_days}
 cloud_confirmation_minutes = {cfg.media.cloud_confirmation_minutes}
 max_duration_minutes = {cfg.media.max_duration_minutes}
 frame_interval_seconds = {cfg.media.frame_interval_seconds}
 scene_threshold = {cfg.media.scene_threshold}
 max_frames = {cfg.media.max_frames}
-whisper_provider = "{cfg.media.whisper_provider}"
-whisper_model = "{cfg.media.whisper_model}"
-whisper_cli_model = "{cfg.media.whisper_cli_model}"
+whisper_provider = {_toml_string(cfg.media.whisper_provider)}
+whisper_model = {_toml_string(cfg.media.whisper_model)}
+whisper_cli_model = {_toml_string(cfg.media.whisper_cli_model)}
 
 [worker]
 poll_seconds = {cfg.worker.poll_seconds}
@@ -142,4 +189,9 @@ media_concurrency = {cfg.worker.media_concurrency}
 analysis_concurrency = {cfg.worker.analysis_concurrency}
 lease_seconds = {cfg.worker.lease_seconds}
 heartbeat_seconds = {cfg.worker.heartbeat_seconds}
-'''
+
+[web]
+enabled = {str(cfg.web.enabled).lower()}
+host = {_toml_string(cfg.web.host)}
+port = {cfg.web.port}
+"""

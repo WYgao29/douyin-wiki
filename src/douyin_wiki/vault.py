@@ -14,26 +14,48 @@ from urllib.parse import quote
 
 import yaml
 
+from .localization import (
+    label_entry_status,
+    label_media_status,
+    label_retention,
+    parse_entry_status,
+    parse_media_status,
+    parse_retention,
+)
 from .models import (
     AnalysisResult,
+    CreatorRecord,
+    CreatorWorkDecision,
+    CreatorWorkRecord,
     EntryRecord,
     InspirationInput,
+    ResearchTopic,
     RetentionPolicy,
     SourceKind,
+    TopicArtifact,
 )
-from .time_utils import parse_datetime, utc_now
+from .time_utils import (
+    beijing_date,
+    beijing_iso,
+    format_beijing,
+    parse_datetime,
+    user_times_to_beijing,
+    utc_now,
+)
 
-VAULT_AGENTS = """# Douyin Wiki 维护规则
+VAULT_AGENTS = """# 抖库维护规则
 
-这个 Vault 是由 AI 维护、供 AI 检索的个人抖音知识库。
+这个 Vault 由抖库与 AI 维护，供 AI 检索个人收藏的抖音知识。
 
 - `raw/` 是不可变来源；不得覆盖或删除原始分享文本、ASR、校正版逐字稿和 OCR。
 - `wiki/sources/` 是每条作品的主资料页。
+- `creators/` 中每个博主拥有独立、自包含的资料目录。
+- `topics/` 保存用户选定来源的研究专题、成果和用户专题笔记。
 - `wiki/concepts/`、`wiki/entities/`、`wiki/syntheses/` 保存跨资料知识。
 - 用户填写的“灵感”必须逐字保留，AI 不得代写或改写。
 - 知识页区分作品原话、作品正文、OCR、AI 推断和用户灵感。
 - 回答问题时返回原作品链接；视频引用提供时间戳，图文引用提供图片编号。
-- 过期内容标记为 stale，不静默删除 Markdown。
+- 过期内容标记为“已过期”，不静默删除 Markdown。
 - `log.md` 只追加，不改写历史记录。
 """
 
@@ -95,6 +117,8 @@ class VaultWriter:
             "wiki/entities",
             "wiki/syntheses",
             "wiki/questions",
+            "creators",
+            "topics",
             ".douyin-wiki/work",
         ]
         for relative in directories:
@@ -102,13 +126,22 @@ class VaultWriter:
 
         defaults = {
             "AGENTS.md": VAULT_AGENTS,
-            "index.md": "---\ntype: index\nupdated: null\n---\n\n# 抖音知识库\n\n暂无内容。\n",
+            "index.md": "---\ntype: index\nupdated: null\n---\n\n# 抖库\n\n暂无内容。\n",
             "log.md": "---\ntype: log\n---\n\n# 维护日志\n",
             ".gitignore": (
                 ".DS_Store\n.obsidian/\n.douyin-wiki/\nraw/assets/**/original.*\n"
                 "raw/assets/**/cover.*\nraw/assets/**/audio.wav\n"
+                "raw/assets/**/original.info.json\n"
                 "raw/assets/**/frames/\nraw/covers/\n"
                 "raw/images/\n"
+                "creators/**/raw/assets/**/original.*\n"
+                "creators/**/raw/assets/**/original.info.json\n"
+                "creators/**/raw/assets/**/cover.*\n"
+                "creators/**/raw/assets/**/audio.wav\n"
+                "creators/**/raw/assets/**/frames/\n"
+                "creators/**/raw/covers/\n"
+                "creators/**/raw/images/\n"
+                "creators/**/raw/avatar.*\n"
             ),
         }
         changed: list[Path] = []
@@ -121,9 +154,18 @@ class VaultWriter:
         gitignore_content = gitignore.read_text(encoding="utf-8")
         required_ignores = [
             ".obsidian/",
+            "raw/assets/**/original.info.json",
             "raw/assets/**/cover.*",
             "raw/covers/",
             "raw/images/",
+            "creators/**/raw/assets/**/original.*",
+            "creators/**/raw/assets/**/original.info.json",
+            "creators/**/raw/assets/**/cover.*",
+            "creators/**/raw/assets/**/audio.wav",
+            "creators/**/raw/assets/**/frames/",
+            "creators/**/raw/covers/",
+            "creators/**/raw/images/",
+            "creators/**/raw/avatar.*",
         ]
         missing_ignores = [
             rule for rule in required_ignores if rule not in gitignore_content.splitlines()
@@ -135,13 +177,165 @@ class VaultWriter:
                 changed.append(gitignore)
         if initialize_git:
             self._ensure_git()
-            self.commit(changed, "chore: initialize Douyin Wiki vault")
+            self.commit(changed, "chore: initialize 抖库 vault")
         return changed
+
+    def migrate_branding(self) -> list[Path]:
+        """Update only exact, system-generated legacy brand strings in existing Vaults."""
+        replacements = {
+            "# Douyin Wiki 维护规则": "# 抖库维护规则",
+            "这个 Vault 是由 AI 维护、供 AI 检索的个人抖音知识库。": (
+                "这个 Vault 由抖库与 AI 维护，供 AI 检索个人收藏的抖音知识。"
+            ),
+            "# 抖音知识库": "# 抖库",
+            "此文件由 Douyin Wiki 管理": "此文件由抖库管理",
+        }
+        candidates = [self.vault_path / "index.md", self.vault_path / "AGENTS.md"]
+        candidates.extend((self.vault_path / "wiki" / ".data" / "sources").glob("*.md"))
+        candidates.extend((self.vault_path / "creators").glob("*/.data/sources/*.md"))
+        changed: list[Path] = []
+        for path in candidates:
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8")
+            updated = content
+            for old, new in replacements.items():
+                updated = updated.replace(old, new)
+            if updated == content:
+                continue
+            self._atomic_write(path, updated)
+            changed.append(path)
+        return changed
+
+    def migrate_visible_status_labels(self) -> list[Path]:
+        """Translate system-owned frontmatter statuses without touching hidden machine data."""
+        replacements = {
+            "status": {
+                "active": label_entry_status("active"),
+                "stale": label_entry_status("stale"),
+                "raw": label_entry_status("raw"),
+            },
+            "media_status": {
+                "present": label_media_status("present"),
+                "removed": label_media_status("removed"),
+            },
+            "media_retention": {item.value: label_retention(item) for item in RetentionPolicy},
+        }
+        candidates: list[Path] = []
+        for pattern in (
+            "raw/*.md",
+            "wiki/sources/*.md",
+            "wiki/concepts/*.md",
+            "wiki/entities/*.md",
+            "wiki/syntheses/*.md",
+            "wiki/questions/*.md",
+            "creators/*/sources/*.md",
+            "creators/*/raw/records/*.md",
+            "creators/*/concepts/*.md",
+            "creators/*/entities/*.md",
+            "creators/*/syntheses/*.md",
+        ):
+            candidates.extend(self.vault_path.glob(pattern))
+        changed: list[Path] = []
+        for path in candidates:
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8")
+            if not content.startswith("---\n"):
+                continue
+            boundary = content.find("\n---\n", 4)
+            if boundary < 0:
+                continue
+            header, body = content[:boundary], content[boundary:]
+            updated = header
+            for field, values in replacements.items():
+                for code, label in values.items():
+                    updated = re.sub(
+                        rf"(?m)^({re.escape(field)}:\s*)['\"]?{re.escape(code)}['\"]?\s*$",
+                        rf"\g<1>{label}",
+                        updated,
+                    )
+            if updated == header:
+                continue
+            self._atomic_write(path, updated + body)
+            changed.append(path)
+        return changed
+
+    def migrate_visible_times_to_beijing(self) -> list[Path]:
+        """Convert system-owned visible timestamps without touching user inspiration text."""
+        candidates = [self.vault_path / "index.md", self.vault_path / "log.md"]
+        for pattern in (
+            "raw/*.md",
+            "wiki/sources/*.md",
+            "wiki/concepts/*.md",
+            "wiki/entities/*.md",
+            "wiki/syntheses/*.md",
+            "wiki/questions/*.md",
+            "creators/*/index.md",
+            "creators/*/log.md",
+            "creators/*/sources/*.md",
+            "creators/*/raw/records/*.md",
+            "creators/*/concepts/*.md",
+            "creators/*/entities/*.md",
+            "creators/*/syntheses/*.md",
+        ):
+            candidates.extend(self.vault_path.glob(pattern))
+        timestamp = (
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
+        )
+        changed: list[Path] = []
+        for path in dict.fromkeys(candidates):
+            if not path.is_file():
+                continue
+            original = path.read_text(encoding="utf-8")
+            match = re.match(
+                r"^---\s*\n(?P<frontmatter>.*?)\n---\s*\n(?P<body>.*)$", original, re.S
+            )
+            if not match:
+                continue
+            frontmatter = yaml.safe_load(match.group("frontmatter")) or {}
+            localized_frontmatter = user_times_to_beijing(frontmatter)
+            body = match.group("body")
+            body = re.sub(
+                rf"(?m)^(- 最近同步：)({timestamp})$",
+                lambda item: item.group(1) + format_beijing(item.group(2)),
+                body,
+            )
+            body = re.sub(
+                rf"(?m)^(## )({timestamp})( · .+)$",
+                lambda item: item.group(1) + format_beijing(item.group(2)) + item.group(3),
+                body,
+            )
+            body = re.sub(
+                rf"(?m)^(- 提醒候选：.*? — )({timestamp})$",
+                lambda item: item.group(1) + format_beijing(item.group(2)),
+                body,
+            )
+            updated = self._frontmatter(localized_frontmatter) + body
+            if updated == original:
+                continue
+            self._atomic_write(path, updated)
+            changed.append(path)
+        return changed
+
+    def creator_index_needs_refresh(self, folder_path: str) -> bool:
+        index = self.vault_path / folder_path / "index.md"
+        if not index.is_file():
+            return True
+        frontmatter, _ = self._parse_document(index)
+        return frontmatter.get("creator_view_version") != 2
 
     def write_entry(self, entry: EntryRecord, data: dict[str, Any]) -> WrittenEntry:
         raw_path = self.vault_path / entry.raw_path
         source_path = self.vault_path / entry.source_path
-        machine_path = self.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+        creator_folder = str(data.get("creator", {}).get("folder_path") or "")
+        machine_relative = (
+            Path(creator_folder) / ".data" / "sources" / f"{entry.video_id}.md"
+            if creator_folder
+            else Path("wiki") / ".data" / "sources" / f"{entry.video_id}.md"
+        )
+        machine_path = self.vault_path / machine_relative
         changed: list[Path] = []
         # Render every document before replacing any path. Keep the previous bytes
         # so a later filesystem failure can restore the complete visible pair.
@@ -168,12 +362,15 @@ class VaultWriter:
             raise
 
         analysis = AnalysisResult.model_validate(data["analysis"])
+        knowledge_root = (
+            self.vault_path / creator_folder if creator_folder else self.vault_path / "wiki"
+        )
         for concept in analysis.concepts:
-            path = self.vault_path / "wiki" / "concepts" / f"{safe_filename(concept)}.md"
+            path = knowledge_root / "concepts" / f"{safe_filename(concept)}.md"
             if self._ensure_link_page(path, "concept", concept, entry):
                 changed.append(path)
         for entity in analysis.entities:
-            path = self.vault_path / "wiki" / "entities" / f"{safe_filename(entity.name)}.md"
+            path = knowledge_root / "entities" / f"{safe_filename(entity.name)}.md"
             if self._ensure_link_page(path, "entity", entity.name, entry, entity.description):
                 changed.append(path)
         return WrittenEntry(
@@ -210,6 +407,158 @@ class VaultWriter:
                 changed.append(path)
         return changed
 
+    def write_creator(
+        self,
+        creator: CreatorRecord,
+        works: list[CreatorWorkRecord],
+        entries: list[EntryRecord],
+        *,
+        action: str,
+        append_log: bool = True,
+    ) -> list[Path]:
+        root = self.vault_path / creator.folder_path
+        for relative in (
+            "sources",
+            "raw/records",
+            "raw/assets",
+            "raw/images",
+            "raw/covers",
+            "concepts",
+            "entities",
+            "syntheses",
+            ".data/sources",
+        ):
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        entries_by_id = {entry.id: entry for entry in entries}
+        counts = {item.value: 0 for item in CreatorWorkDecision}
+        for work in works:
+            counts[work.decision.value] += 1
+        pending_import_count = (
+            counts[CreatorWorkDecision.PENDING.value] + counts[CreatorWorkDecision.SELECTED.value]
+        )
+        frontmatter = {
+            "type": "douyin-creator",
+            "creator_view_version": 2,
+            "creator_id": creator.id,
+            "sec_uid": creator.sec_uid,
+            "nickname": creator.nickname,
+            "douyin_id": creator.unique_id,
+            "canonical_url": creator.canonical_url,
+            "last_synced_at": creator.last_synced_at,
+            "reported_work_count": creator.reported_work_count,
+            "work_count": len(works),
+            "pending_import_count": pending_import_count,
+            "imported_count": counts[CreatorWorkDecision.IMPORTED.value],
+            "not_imported_count": counts[CreatorWorkDecision.SKIPPED.value],
+            "updated": creator.updated_at,
+        }
+        lines = [self._frontmatter(frontmatter), f"# {creator.nickname}"]
+        avatar = creator.avatar_path
+        if avatar:
+            relative_avatar = os.path.relpath(avatar, start=creator.folder_path)
+            lines.extend(["", f"![博主头像]({encode_markdown_path(relative_avatar)})"])
+        lines.extend(
+            [
+                "",
+                "## 博主信息",
+                "",
+                f"- [打开抖音主页]({creator.canonical_url})",
+                f"- 抖音号：{creator.unique_id or '未提供'}",
+                f"- 简介：{creator.signature or '未提供'}",
+                "- 最近同步："
+                + (
+                    format_beijing(creator.last_synced_at) if creator.last_synced_at else "尚未同步"
+                ),
+                "",
+                "## 灵感",
+                "",
+                *self._inspiration_lines(creator.inspirations),
+            ]
+        )
+
+        def work_line(work: CreatorWorkRecord) -> str:
+            date = beijing_date(work.published_at) if work.published_at else "日期未知"
+            kind = "图文" if work.source_kind == SourceKind.IMAGE_NOTE else "视频"
+            state = {
+                CreatorWorkDecision.PENDING: "等待决定",
+                CreatorWorkDecision.SELECTED: "入库处理中",
+                CreatorWorkDecision.SKIPPED: "未入库",
+                CreatorWorkDecision.IMPORTED: "已入库",
+            }[work.decision]
+            entry = entries_by_id.get(work.entry_id or "")
+            if entry:
+                target = Path(entry.source_path).with_suffix("")
+                link = f"[[{target}|{work.title}]]"
+            else:
+                link = f"[{work.title}]({work.original_url})"
+            return f"- {date} · {kind} · {state} · {link}"
+
+        groups = (
+            (
+                "待入库",
+                [
+                    work
+                    for work in works
+                    if work.decision in {CreatorWorkDecision.PENDING, CreatorWorkDecision.SELECTED}
+                ],
+                "暂无待入库作品。",
+            ),
+            (
+                "已入库",
+                [work for work in works if work.decision == CreatorWorkDecision.IMPORTED],
+                "暂无已入库作品。",
+            ),
+            (
+                "未入库",
+                [work for work in works if work.decision == CreatorWorkDecision.SKIPPED],
+                "暂无未入库作品。",
+            ),
+        )
+        for heading, group, empty_text in groups:
+            lines.extend(["", f"## {heading}（{len(group)}）", ""])
+            lines.extend(work_line(work) for work in group)
+            if not group:
+                lines.append(empty_text)
+
+        index_path = root / "index.md"
+        self._atomic_write(index_path, "\n".join(lines).rstrip() + "\n")
+        payload = {
+            "creator": creator.model_dump(mode="json"),
+            "works": [work.model_dump(mode="json") for work in works],
+        }
+        machine = (
+            self._frontmatter(
+                {
+                    "type": "creator-machine-data",
+                    "creator_id": creator.id,
+                    "updated": creator.updated_at,
+                }
+            )
+            + f"# Machine Data · {creator.id}\n\n"
+            + "```yaml\n"
+            + yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).rstrip()
+            + "\n```\n"
+        )
+        machine_path = root / ".data" / "creator.md"
+        self._atomic_write(machine_path, machine)
+        log_path = root / "log.md"
+        changed = [index_path, machine_path]
+        if not log_path.exists():
+            self._atomic_write(log_path, "---\ntype: creator-log\n---\n\n# 操作日志\n")
+            changed.append(log_path)
+        if append_log:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"\n## {format_beijing(utc_now())} · {action}\n\n"
+                    f"- 作品：{len(works)}\n"
+                    f"- 已入库：{counts[CreatorWorkDecision.IMPORTED.value]}\n"
+                    f"- 未入库：{counts[CreatorWorkDecision.SKIPPED.value]}\n"
+                    f"- 待入库：{pending_import_count}\n"
+                )
+            if log_path not in changed:
+                changed.append(log_path)
+        return changed
+
     def remove_external_validation_labels(self) -> list[Path]:
         path = self.vault_path / "AGENTS.md"
         if not path.exists():
@@ -230,13 +579,25 @@ class VaultWriter:
         return path
 
     def rebuild_index(self, entries: list[EntryRecord]) -> Path:
-        now = utc_now().date().isoformat()
-        lines = ["---", "type: index", f"updated: {now}", "---", "", "# 抖音知识库", ""]
-        if not entries:
+        now = beijing_date()
+        lines = ["---", "type: index", f"updated: {now}", "---", "", "# 抖库", ""]
+        creator_indexes = sorted((self.vault_path / "creators").glob("*/index.md"))
+        legacy_entries = [
+            entry for entry in entries if Path(entry.source_path).parts[:1] != ("creators",)
+        ]
+        if not legacy_entries and not creator_indexes:
             lines.append("暂无内容。")
-        else:
+        if creator_indexes:
+            lines.extend(["## 博主资料", ""])
+            for creator_index in creator_indexes:
+                relative = creator_index.relative_to(self.vault_path).with_suffix("")
+                frontmatter, _ = self._parse_document(creator_index)
+                title = str(frontmatter.get("nickname") or creator_index.parent.name)
+                lines.append(f"- [[{relative}|{title}]]")
+            lines.append("")
+        if legacy_entries:
             lines.extend(["## 作品资料", ""])
-            for entry in sorted(entries, key=lambda item: item.created_at, reverse=True):
+            for entry in sorted(legacy_entries, key=lambda item: item.created_at, reverse=True):
                 source_no_suffix = str(Path(entry.source_path).with_suffix(""))
                 status = "（已过期）" if entry.status == "stale" else ""
                 lines.append(
@@ -250,7 +611,7 @@ class VaultWriter:
         path = self.vault_path / "log.md"
         relative_paths = [str(item.relative_to(self.vault_path)) for item in paths]
         block = (
-            f"\n## [{utc_now().date().isoformat()}] {action} | {title}\n\n"
+            f"\n## [{beijing_date()}] {action} | {title}\n\n"
             f"- 摘要：{summary}\n"
             f"- 修改文件：{', '.join(relative_paths)}\n"
             "- 开放问题：无\n"
@@ -260,12 +621,12 @@ class VaultWriter:
         return path
 
     def write_maintenance_report(self, report: dict[str, Any]) -> Path:
-        date = utc_now().date().isoformat()
+        date = beijing_date()
         path = self.vault_path / "wiki" / "syntheses" / f"维护报告 {date}.md"
         content = [
             "---",
             "type: synthesis",
-            "status: active",
+            f"status: {label_entry_status('active')}",
             f"created: {date}",
             f"updated: {date}",
             "tags: [维护报告]",
@@ -284,6 +645,122 @@ class VaultWriter:
         ]
         content.extend(f"- `{item}`" for item in report.get("orphan_pages", []))
         self._atomic_write(path, "\n".join(content).rstrip() + "\n")
+        return path
+
+    def write_topic(
+        self,
+        topic: ResearchTopic,
+        artifacts: list[TopicArtifact],
+        entries: dict[str, EntryRecord],
+    ) -> list[Path]:
+        topic_dir = self.vault_path / "topics" / topic.id
+        index_path = topic_dir / "index.md"
+        machine_path = topic_dir / ".data" / "topic.md"
+        changed: list[Path] = []
+        source_lines: list[str] = []
+        for source in topic.sources:
+            entry = entries.get(source.entry_id)
+            if entry is None:
+                continue
+            target = Path(entry.source_path).with_suffix("").as_posix()
+            state = "启用" if source.enabled else "停用"
+            source_lines.append(
+                f"{source.position}. [[{target}|{entry.title}]] · {state}"
+            )
+        artifact_lines = [
+            f"- [[topics/{topic.id}/artifacts/{artifact.id}|{artifact.title}]]"
+            f" · {'需要更新' if artifact.status == 'needs_update' else '当前版本'}"
+            for artifact in artifacts
+        ]
+        index = self._frontmatter(
+            {
+                "type": "research_topic",
+                "topic_id": topic.id,
+                "title": topic.title,
+                "source_revision": topic.source_revision,
+                "created_at": topic.created_at,
+                "updated_at": topic.updated_at,
+            }
+        )
+        index += (
+            f"\n# {topic.title}\n\n"
+            f"## 研究目标\n\n{topic.goal or '未填写。'}\n\n"
+            f"## 自定义指令\n\n{topic.instructions or '无。'}\n\n"
+            "## 来源\n\n"
+            + ("\n".join(source_lines) if source_lines else "暂无来源。")
+            + "\n\n## 研究成果\n\n"
+            + ("\n".join(artifact_lines) if artifact_lines else "尚未生成成果。")
+            + "\n"
+        )
+        self._atomic_write(index_path, index)
+        changed.append(index_path)
+
+        machine = self._frontmatter(
+            {
+                "type": "research_topic_data",
+                **topic.model_dump(mode="json"),
+                "artifacts": [
+                    artifact.model_dump(mode="json", exclude={"content_markdown"})
+                    for artifact in artifacts
+                ],
+            }
+        )
+        machine += "\n# 专题机器数据\n\n此文件由抖库管理。\n"
+        self._atomic_write(machine_path, machine)
+        changed.append(machine_path)
+
+        for artifact in artifacts:
+            artifact_path = topic_dir / "artifacts" / f"{artifact.id}.md"
+            artifact_document = self._frontmatter(
+                {
+                    "type": "topic_note" if artifact.user_authored else "topic_artifact",
+                    "topic_id": topic.id,
+                    "artifact_id": artifact.id,
+                    "artifact_kind": artifact.kind,
+                    "title": artifact.title,
+                    "status": (
+                        "需要更新" if artifact.status == "needs_update" else "当前版本"
+                    ),
+                    "source_revision": artifact.source_revision,
+                    "source_revisions": [
+                        item.model_dump(mode="json") for item in artifact.source_revisions
+                    ],
+                    "model": artifact.model,
+                    "prompt_version": artifact.prompt_version,
+                    "token_usage": {
+                        "prompt": artifact.prompt_tokens,
+                        "completion": artifact.completion_tokens,
+                        "total": artifact.total_tokens,
+                    },
+                    "user_authored": artifact.user_authored,
+                    "created_at": artifact.created_at,
+                    "updated_at": artifact.updated_at,
+                }
+            )
+            artifact_document += f"\n# {artifact.title}\n\n{artifact.content_markdown.rstrip()}\n"
+            self._atomic_write(artifact_path, artifact_document)
+            changed.append(artifact_path)
+        return changed
+
+    def write_topics_index(self, topics: list[ResearchTopic]) -> Path:
+        path = self.vault_path / "topics" / "index.md"
+        lines = [
+            "---",
+            "type: research_topics_index",
+            f"updated_at: {beijing_iso(utc_now())}",
+            "---",
+            "",
+            "# 专题",
+            "",
+        ]
+        if topics:
+            lines.extend(
+                f"- [[topics/{topic.id}/index|{topic.title}]] · {len(topic.sources)} 个来源"
+                for topic in topics
+            )
+        else:
+            lines.append("暂无专题。")
+        self._atomic_write(path, "\n".join(lines).rstrip() + "\n")
         return path
 
     def commit(self, paths: list[Path], message: str) -> bool:
@@ -323,8 +800,9 @@ class VaultWriter:
     def load_entries(self) -> list[tuple[EntryRecord, dict[str, Any]]]:
         """Rehydrate the rebuildable knowledge cache from tracked Markdown files."""
         results: list[tuple[EntryRecord, dict[str, Any]]] = []
-        machine_dir = self.vault_path / "wiki" / ".data" / "sources"
-        for machine_path in sorted(machine_dir.glob("*.md")):
+        machine_paths = list((self.vault_path / "wiki" / ".data" / "sources").glob("*.md"))
+        machine_paths.extend((self.vault_path / "creators").glob("*/.data/sources/*.md"))
+        for machine_path in sorted(machine_paths):
             machine_frontmatter, machine_body = self._parse_document(machine_path)
             payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
             if not payload_match:
@@ -348,8 +826,8 @@ class VaultWriter:
                 InspirationInput.model_validate(item)
                 for item in source_frontmatter.get("inspirations", [])
             ]
-            retention = RetentionPolicy(
-                source_frontmatter.get("media_retention", RetentionPolicy.TEMPORARY.value)
+            retention = parse_retention(
+                str(source_frontmatter.get("media_retention", RetentionPolicy.TEMPORARY.value))
             )
             entry = EntryRecord(
                 id=f"dy-{source_frontmatter['video_id']}",
@@ -359,8 +837,10 @@ class VaultWriter:
                 canonical_url=str(source_frontmatter.get("canonical_url") or ""),
                 raw_path=str(source_frontmatter.get("source_path") or ""),
                 source_path=str(source_page),
-                status=str(source_frontmatter.get("status") or "active"),
-                media_status=str(source_frontmatter.get("media_status") or "present"),
+                status=parse_entry_status(str(source_frontmatter.get("status") or "active")),
+                media_status=parse_media_status(
+                    str(source_frontmatter.get("media_status") or "present")
+                ),
                 retention=retention,
                 media_expires_at=parse_datetime(source_frontmatter.get("media_expires_at")),
                 summary=analysis.one_liner,
@@ -377,6 +857,7 @@ class VaultWriter:
                 "ocr": payload.get("ocr", []),
                 "review_issues": payload.get("review_issues", []),
                 "relations": payload.get("relations", []),
+                "creator": payload.get("creator", {}),
                 "analysis": analysis.model_dump(mode="json"),
                 "provider": provenance.get("provider"),
                 "model": provenance.get("model"),
@@ -390,6 +871,64 @@ class VaultWriter:
             results.append((entry, data))
         return results
 
+    def load_creators(self) -> list[tuple[CreatorRecord, list[CreatorWorkRecord]]]:
+        """Load creator decisions from the tracked hidden creator sidecars."""
+        results: list[tuple[CreatorRecord, list[CreatorWorkRecord]]] = []
+        machine_paths = sorted((self.vault_path / "creators").glob("*/.data/creator.md"))
+        for machine_path in machine_paths:
+            _, machine_body = self._parse_document(machine_path)
+            payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
+            if not payload_match:
+                continue
+            payload = yaml.safe_load(payload_match.group("payload")) or {}
+            if not isinstance(payload, dict) or not isinstance(payload.get("creator"), dict):
+                continue
+            try:
+                creator = CreatorRecord.model_validate(payload["creator"])
+                works = [
+                    CreatorWorkRecord.model_validate(item)
+                    for item in payload.get("works", [])
+                    if isinstance(item, dict)
+                ]
+            except (TypeError, ValueError):
+                continue
+            results.append((creator, works))
+        return results
+
+    def load_topics(self) -> list[tuple[ResearchTopic, list[TopicArtifact]]]:
+        """Load research topics and versioned artifacts from tracked Markdown."""
+        results: list[tuple[ResearchTopic, list[TopicArtifact]]] = []
+        machine_paths = sorted((self.vault_path / "topics").glob("*/.data/topic.md"))
+        for machine_path in machine_paths:
+            frontmatter, _ = self._parse_document(machine_path)
+            try:
+                topic = ResearchTopic.model_validate(frontmatter)
+            except (TypeError, ValueError):
+                continue
+            artifacts: list[TopicArtifact] = []
+            for metadata in frontmatter.get("artifacts", []):
+                if not isinstance(metadata, dict) or not metadata.get("id"):
+                    continue
+                artifact_path = (
+                    machine_path.parent.parent
+                    / "artifacts"
+                    / f"{metadata['id']}.md"
+                )
+                if not artifact_path.is_file():
+                    continue
+                _, body = self._parse_document(artifact_path)
+                content = re.sub(r"^\s*#\s+.*?\n+", "", body, count=1).rstrip()
+                try:
+                    artifacts.append(
+                        TopicArtifact.model_validate(
+                            {**metadata, "content_markdown": content}
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+            results.append((topic, artifacts))
+        return results
+
     def _ensure_git(self) -> None:
         if not (self.vault_path / ".git").exists():
             subprocess.run(
@@ -398,9 +937,7 @@ class VaultWriter:
                 capture_output=True,
                 check=False,
             )
-        subprocess.run(
-            ["git", "config", "user.name", "Douyin Wiki"], cwd=self.vault_path, check=False
-        )
+        subprocess.run(["git", "config", "user.name", "抖库"], cwd=self.vault_path, check=False)
         subprocess.run(
             ["git", "config", "user.email", "douyin-wiki@local"],
             cwd=self.vault_path,
@@ -413,16 +950,16 @@ class VaultWriter:
             return self._render_raw_image_note(entry, data)
         frontmatter = {
             "type": "raw-video",
-            "status": "raw",
+            "status": label_entry_status("raw"),
             "video_id": entry.video_id,
             "title": entry.title,
             "author": metadata.get("author"),
             "published_at": metadata.get("published_at"),
-            "captured_at": entry.created_at.isoformat(),
+            "captured_at": beijing_iso(entry.created_at),
             "original_url": entry.original_url,
             "canonical_url": entry.canonical_url,
-            "media_retention": entry.retention.value,
-            "media_expires_at": entry.media_expires_at.isoformat()
+            "media_retention": label_retention(entry.retention),
+            "media_expires_at": beijing_iso(entry.media_expires_at)
             if entry.media_expires_at
             else None,
             "model_provider": data.get("provider"),
@@ -455,12 +992,12 @@ class VaultWriter:
         frontmatter = {
             "type": "raw-image-note",
             "source_kind": SourceKind.IMAGE_NOTE.value,
-            "status": "raw",
+            "status": label_entry_status("raw"),
             "video_id": entry.video_id,
             "title": entry.title,
             "author": metadata.get("author"),
             "published_at": metadata.get("published_at"),
-            "captured_at": entry.created_at.isoformat(),
+            "captured_at": beijing_iso(entry.created_at),
             "original_url": entry.original_url,
             "canonical_url": entry.canonical_url,
             "image_paths": metadata.get("image_paths", []),
@@ -501,22 +1038,28 @@ class VaultWriter:
         source_kind = metadata.get("source_kind", SourceKind.VIDEO.value)
         is_image_note = source_kind == SourceKind.IMAGE_NOTE.value
         cover_path = data.get("cover_path")
+        creator_folder = str(data.get("creator", {}).get("folder_path") or "")
+        machine_data_path = (
+            str(Path(creator_folder) / ".data" / "sources" / f"{entry.video_id}.md")
+            if creator_folder
+            else f"wiki/.data/sources/{entry.video_id}.md"
+        )
         frontmatter = {
             "type": "source",
-            "status": entry.status,
+            "status": label_entry_status(entry.status),
             "video_id": entry.video_id,
             "source_kind": source_kind,
             "author": metadata.get("author"),
             "published_at": metadata.get("published_at"),
-            "captured_at": entry.created_at.isoformat(),
-            "created": entry.created_at.date().isoformat(),
-            "updated": entry.updated_at.date().isoformat(),
+            "captured_at": beijing_iso(entry.created_at),
+            "created": beijing_date(entry.created_at),
+            "updated": beijing_date(entry.updated_at),
             "source_path": entry.raw_path,
             "source_url": entry.original_url,
             "canonical_url": entry.canonical_url,
-            "media_status": entry.media_status,
-            "media_retention": entry.retention.value,
-            "media_expires_at": entry.media_expires_at.isoformat()
+            "media_status": label_media_status(entry.media_status),
+            "media_retention": label_retention(entry.retention),
+            "media_expires_at": beijing_iso(entry.media_expires_at)
             if entry.media_expires_at
             else None,
             "inspirations": [
@@ -532,7 +1075,8 @@ class VaultWriter:
             "analysis_version": 2,
             "content_type": analysis.content_type,
             "facets": analysis.facets,
-            "machine_data_path": f"wiki/.data/sources/{entry.video_id}.md",
+            "machine_data_path": machine_data_path,
+            "creator_id": data.get("creator", {}).get("id"),
         }
         lines = [self._frontmatter(frontmatter), f"# {entry.title}"]
         if cover_path:
@@ -547,6 +1091,7 @@ class VaultWriter:
                     f"![{alt}]({encode_markdown_path(Path(relative_cover).as_posix())})",
                 ]
             )
+        raw_relative = os.path.relpath(entry.raw_path, start=Path(entry.source_path).parent)
         lines.extend(
             [
                 "",
@@ -567,7 +1112,9 @@ class VaultWriter:
             lines.extend(["", "## 核心收获", ""])
             lines.extend(f"- {value}" for value in analysis.takeaways[:5])
 
-        card_lines = self._content_card_lines(analysis.content_card.model_dump(mode="json"))
+        card_lines = self._content_card_lines(
+            user_times_to_beijing(analysis.content_card.model_dump(mode="json"))
+        )
         if card_lines:
             card_heading = f"## 内容卡片 · {self._content_type_label(analysis.content_type)}"
             lines.extend(["", card_heading, ""])
@@ -607,14 +1154,14 @@ class VaultWriter:
             lines.extend(["", "## 下一步", ""])
             lines.extend(f"- {value}" for value in analysis.actions[:3])
             for reminder in analysis.reminders[:3]:
-                due = reminder.due_at.isoformat() if reminder.due_at else "时间待澄清"
+                due = format_beijing(reminder.due_at) if reminder.due_at else "时间待澄清"
                 lines.append(f"- 提醒候选：{reminder.title} — {due}")
         lines.extend(
             [
                 "",
                 "## 来源",
                 "",
-                f"- [原始采集记录]({encode_markdown_path(f'../../{entry.raw_path}')})",
+                f"- [原始采集记录]({encode_markdown_path(raw_relative)})",
                 f"- [打开原作品]({entry.original_url})",
             ]
         )
@@ -630,6 +1177,7 @@ class VaultWriter:
             "ocr": data.get("ocr", []),
             "review_issues": data.get("review_issues", []),
             "relations": data.get("relations", []),
+            "creator": data.get("creator", {}),
             "model_provenance": {
                 "provider": data.get("provider"),
                 "model": data.get("model"),
@@ -649,14 +1197,14 @@ class VaultWriter:
             "content_type": analysis.content_type,
             "facets": analysis.facets,
             "source_page": entry.source_path,
-            "updated": entry.updated_at.isoformat(),
+            "updated": beijing_iso(entry.updated_at),
         }
         serialized = yaml.safe_dump(
             payload, allow_unicode=True, sort_keys=False, default_flow_style=False
         ).rstrip()
         return (
             f"{self._frontmatter(frontmatter)}# Machine Data · {entry.video_id}\n\n"
-            "此文件由 Douyin Wiki 管理，供 Agent 和索引器读取。\n\n"
+            "此文件由抖库管理，供 Agent 和索引器读取。\n\n"
             f"```yaml\n{serialized}\n```\n"
         )
 
@@ -752,9 +1300,9 @@ class VaultWriter:
                 return False
             self._atomic_write(path, content.rstrip() + f"\n- {source_link}\n")
             return True
-        today = utc_now().date().isoformat()
+        today = beijing_date()
         content = (
-            f"---\ntype: {page_type}\nstatus: active\ncreated: {today}\n"
+            f"---\ntype: {page_type}\nstatus: {label_entry_status('active')}\ncreated: {today}\n"
             f"updated: {today}\ntags: []\n---\n\n"
             f"# {title}\n\n{description}\n\n## 来源\n\n- {source_link}\n"
         )
@@ -790,7 +1338,10 @@ class VaultWriter:
     @staticmethod
     def _frontmatter(data: dict[str, Any]) -> str:
         dumped = yaml.safe_dump(
-            data, allow_unicode=True, sort_keys=False, default_flow_style=False
+            user_times_to_beijing(data),
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
         ).strip()
         return f"---\n{dumped}\n---\n"
 

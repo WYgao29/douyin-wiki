@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shutil
+import uuid
+from contextlib import suppress
 from datetime import timedelta
 from importlib.resources import files
 from pathlib import Path
@@ -11,6 +14,7 @@ from typing import Any
 
 from send2trash import send2trash
 
+from .adapters.creator import DouyinCreatorAdapter, creator_id_for
 from .adapters.embeddings import EmbeddingService
 from .adapters.image_note import PlaywrightImageNoteDownloader
 from .adapters.llm import (
@@ -45,6 +49,9 @@ from .models import (
     AuthCheckResult,
     CaptureOptions,
     CaptureRequest,
+    CreatorInventoryResult,
+    CreatorInventoryWork,
+    CreatorWorkDecision,
     EntryRecord,
     GatewayContext,
     InspirationInput,
@@ -53,16 +60,20 @@ from .models import (
     JobStatus,
     OCRObservation,
     ReminderCandidate,
+    ResearchTopic,
     RetentionPolicy,
     ReviewIssue,
     SourceKind,
+    SourceRevision,
+    TopicArtifact,
+    TopicArtifactKind,
     TranscriptCorrection,
     TranscriptSegment,
     VideoMetadata,
 )
 from .review import apply_review_resolutions, detect_review_issues
 from .search import KnowledgeIndexer, KnowledgeSearch
-from .time_utils import utc_now
+from .time_utils import beijing_date, utc_now
 from .vault import VaultWriter, safe_filename
 
 
@@ -74,6 +85,7 @@ class DouyinWikiService:
         resolver: DouyinShareResolver | None = None,
         downloader: YtDlpDownloader | None = None,
         image_note_downloader: PlaywrightImageNoteDownloader | None = None,
+        creator_adapter: DouyinCreatorAdapter | None = None,
         media: FFmpegMediaProcessor | None = None,
         transcriber: WhisperTranscriber | None = None,
         ocr: VisionOCR | None = None,
@@ -88,6 +100,9 @@ class DouyinWikiService:
         self.downloader = downloader or YtDlpDownloader(config.media)
         self.image_note_downloader = image_note_downloader or PlaywrightImageNoteDownloader(
             config.media, config.browser_profile_dir
+        )
+        self.creator_adapter = creator_adapter or DouyinCreatorAdapter(
+            config.media, config.browser_profile_dir, self.resolver
         )
         self.media = media or FFmpegMediaProcessor()
         self.transcriber = transcriber or WhisperTranscriber(config.media)
@@ -114,7 +129,49 @@ class DouyinWikiService:
 
     def initialize(self, *, initialize_git: bool = True) -> None:
         self.vault.initialize(initialize_git=initialize_git)
+        branding = self.vault.migrate_branding()
+        statuses = self.vault.migrate_visible_status_labels()
+        times = self.vault.migrate_visible_times_to_beijing()
         self.database.initialize()
+        creator_views = self._migrate_creator_views()
+        if initialize_git:
+            self.vault.commit(
+                [*branding, *statuses, *times, *creator_views],
+                "chore: localize 抖库 vault",
+            )
+
+    def initialize_runtime(self) -> None:
+        """Ensure older Vaults receive safe, additive layout migrations on every entrypoint."""
+        with self.vault.locked():
+            changed = self.vault.initialize(initialize_git=False)
+            branding = self.vault.migrate_branding()
+            statuses = self.vault.migrate_visible_status_labels()
+            times = self.vault.migrate_visible_times_to_beijing()
+        self.database.initialize()
+        with self.vault.locked():
+            creator_views = self._migrate_creator_views()
+            self.vault.commit(
+                [*changed, *branding, *statuses, *times, *creator_views],
+                "chore: update 抖库 vault layout",
+            )
+
+    def _migrate_creator_views(self) -> list[Path]:
+        entries = self.database.list_entries()
+        changed: list[Path] = []
+        for creator in self.database.list_creators():
+            if not self.vault.creator_index_needs_refresh(creator.folder_path):
+                continue
+            works = self.database.list_creator_works(creator.id)
+            changed.extend(
+                self.vault.write_creator(
+                    creator,
+                    works,
+                    entries,
+                    action="资料页升级",
+                    append_log=False,
+                )
+            )
+        return changed
 
     async def authenticate_douyin(self, *, timeout_seconds: int = 600) -> dict[str, Any]:
         await self.image_note_downloader.authenticate(timeout_seconds=timeout_seconds)
@@ -145,10 +202,16 @@ class DouyinWikiService:
             if hasattr(self.image_note_downloader, "check_auth")
             else unsupported("image_note", str(self.config.browser_profile_dir))
         )
-        video, image_note = await asyncio.gather(video_task, image_task)
+        creator_task = (
+            self.creator_adapter.check_auth()
+            if hasattr(self.creator_adapter, "check_auth")
+            else unsupported("creator", str(self.config.browser_profile_dir))
+        )
+        video, image_note, creator = await asyncio.gather(video_task, image_task, creator_task)
         return {
             "video": video.model_dump(mode="json"),
             "image_note": image_note.model_dump(mode="json"),
+            "creator": creator.model_dump(mode="json"),
             "cookie_values_exposed": False,
         }
 
@@ -167,8 +230,227 @@ class DouyinWikiService:
         )
         return self.database.create_job(request)
 
+    def capture_douyin_creator(
+        self,
+        source_text: str,
+        inspirations: list[InspirationInput] | None = None,
+        options: CaptureOptions | None = None,
+        gateway_context: GatewayContext | None = None,
+    ) -> JobRecord:
+        request = CaptureRequest(
+            share_text=source_text,
+            inspirations=inspirations or [],
+            options=options or CaptureOptions(),
+            gateway_context=gateway_context,
+        )
+        return self.database.create_job(
+            request,
+            kind="creator_import",
+            artifacts={"creator_action": "initial"},
+        )
+
+    def sync_creator(
+        self,
+        creator_id: str,
+        *,
+        gateway_context: GatewayContext | None = None,
+    ) -> JobRecord:
+        creator = self.database.get_creator(creator_id)
+        request = CaptureRequest(
+            share_text=creator.canonical_url,
+            inspirations=creator.inspirations,
+            gateway_context=gateway_context,
+        )
+        return self.database.create_job(
+            request,
+            kind="creator_import",
+            artifacts={"creator_action": "sync", "creator_id": creator.id},
+        )
+
+    def get_creator_inventory(
+        self,
+        job_id: str,
+        *,
+        page: int | None = None,
+        limit: int | None = None,
+        decision: CreatorWorkDecision | None = None,
+        source_kind: SourceKind | None = None,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        job = self.database.get_job(job_id)
+        if job.kind != "creator_import":
+            raise JobStateError("该任务不是博主清点任务")
+        paginated = page is not None or limit is not None
+        effective_page = max(1, page or 1)
+        effective_limit = max(1, min(1000, limit or 10)) if paginated else 100_000
+        items, total = self.database.list_creator_inventory(
+            job_id,
+            offset=(effective_page - 1) * effective_limit if paginated else 0,
+            limit=effective_limit,
+            decision=decision,
+            source_kind=source_kind,
+            query=query,
+        )
+        return {
+            "job_id": job_id,
+            "creator_id": job.artifacts.get("creator_id"),
+            "status": job.status.value,
+            "display_mode": "paginated" if paginated else "all",
+            "page": effective_page,
+            "limit": effective_limit if paginated else total,
+            "total": total,
+            "has_more": effective_page * effective_limit < total if paginated else False,
+            "partial": bool(job.artifacts.get("inventory_partial")),
+            "summary": self.database.creator_inventory_summary(job_id),
+            "items": [item.model_dump(mode="json") for item in items],
+        }
+
+    def set_creator_work_selection(
+        self,
+        job_id: str,
+        decision: CreatorWorkDecision,
+        *,
+        ordinals: list[int] | None = None,
+        work_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        job = self.database.get_job(job_id)
+        if job.kind != "creator_import" or job.status != JobStatus.NEEDS_SELECTION:
+            raise JobStateError("只有处于“待选择作品”状态的博主任务可以修改选择")
+        changed = self.database.set_creator_run_selection(
+            job_id, decision, ordinals=ordinals, work_ids=work_ids
+        )
+        summary = self.database.creator_inventory_summary(job_id)
+        self.database.update_job(job_id, result={**job.result, "selection": summary})
+        self._refresh_creator_documents(str(job.artifacts["creator_id"]), action="selection")
+        return {"job_id": job_id, "changed": changed, "selection": summary}
+
+    def confirm_creator_import(self, job_id: str, *, accept_partial: bool = False) -> JobRecord:
+        job = self.database.get_job(job_id)
+        if job.kind != "creator_import" or job.status != JobStatus.NEEDS_SELECTION:
+            raise JobStateError("只有处于“待选择作品”状态的博主任务可以确认")
+        if job.artifacts.get("inventory_partial") and not accept_partial:
+            raise JobStateError("清单不完整；如仍要处理已发现作品，请设置 accept_partial=true")
+        summary = self.database.creator_inventory_summary(job_id)
+        if summary.get(CreatorWorkDecision.PENDING.value, 0):
+            raise JobStateError("仍有未决定作品；请先选择或跳过全部作品")
+        creator_id = str(job.artifacts["creator_id"])
+        creator = self.database.get_creator(creator_id)
+        selected, _ = self.database.list_creator_inventory(
+            job_id, limit=5000, decision=CreatorWorkDecision.SELECTED
+        )
+        self.database.update_job(job_id, status=JobStatus.DISPATCHING, progress=0.55)
+        child_ids: list[str] = []
+        for item in selected:
+            work = item.work
+            if work.entry_id:
+                self.database.mark_creator_work_imported(creator_id, work.work_id, work.entry_id)
+                continue
+            if work.last_job_id:
+                with suppress(JobStateError):
+                    existing_job = self.database.get_job(work.last_job_id)
+                    if existing_job.status not in {
+                        JobStatus.FAILED,
+                        JobStatus.COMPLETED,
+                        JobStatus.COMPLETED_WITH_WARNINGS,
+                    }:
+                        child_ids.append(existing_job.id)
+                        continue
+            child_request = CaptureRequest(
+                share_text=work.canonical_url,
+                inspirations=[],
+                options=job.request.options,
+                gateway_context=job.request.gateway_context,
+            )
+            child = self.database.create_job(
+                child_request,
+                artifacts={
+                    "creator_context": {
+                        "id": creator.id,
+                        "folder_path": creator.folder_path,
+                        "parent_job_id": job.id,
+                        "work_id": work.work_id,
+                        "batch_silent": True,
+                    }
+                },
+            )
+            self.database.attach_creator_child_job(creator_id, work.work_id, child.id)
+            child_ids.append(child.id)
+        result = {
+            **job.result,
+            "selection": self.database.creator_inventory_summary(job_id),
+            "child_job_ids": child_ids,
+            "queued_count": len(child_ids),
+            "accept_partial": accept_partial,
+        }
+        status = JobStatus.MONITORING if child_ids else JobStatus.COMPLETED
+        updated = self.database.update_job(
+            job_id,
+            status=status,
+            progress=0.65 if child_ids else 1,
+            result=result,
+            unlock=True,
+        )
+        self._refresh_creator_documents(creator_id, action="confirm-import")
+        return updated
+
+    def import_creator_works(
+        self,
+        creator_id: str,
+        work_ids: list[str],
+        *,
+        gateway_context: GatewayContext | None = None,
+    ) -> JobRecord:
+        creator = self.database.get_creator(creator_id)
+        request = CaptureRequest(
+            share_text=creator.canonical_url,
+            inspirations=creator.inspirations,
+            gateway_context=gateway_context,
+        )
+        job = self.database.create_job(
+            request,
+            kind="creator_import",
+            artifacts={
+                "creator_action": "manual-import",
+                "creator_id": creator_id,
+                "inventory_partial": False,
+            },
+        )
+        self.database.create_creator_run_items(job.id, creator_id, work_ids)
+        self.database.set_creator_run_selection(
+            job.id, CreatorWorkDecision.SELECTED, work_ids=work_ids
+        )
+        self.database.update_job(
+            job.id,
+            status=JobStatus.NEEDS_SELECTION,
+            progress=0.5,
+            result={"selection": self.database.creator_inventory_summary(job.id)},
+            unlock=True,
+        )
+        return self.confirm_creator_import(job.id)
+
+    def get_creator(self, creator_id: str) -> dict[str, Any]:
+        creator = self.database.get_creator(creator_id)
+        works = self.database.list_creator_works(creator_id)
+        counts = {item.value: 0 for item in CreatorWorkDecision}
+        for work in works:
+            counts[work.decision.value] += 1
+        return {
+            **creator.model_dump(mode="json"),
+            "counts": counts,
+            "work_count": len(works),
+        }
+
+    def list_creators(self) -> list[dict[str, Any]]:
+        return [self.get_creator(creator.id) for creator in self.database.list_creators()]
+
+    def list_creator_works(self, creator_id: str) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json") for item in self.database.list_creator_works(creator_id)
+        ]
+
     def get_job(self, job_id: str) -> JobRecord:
         job = self.database.get_job(job_id)
+        self._apply_live_creator_selection(job)
         if job.status == JobStatus.NEEDS_REVIEW:
             job.result["review_issues"] = [
                 issue.model_dump(mode="json")
@@ -177,7 +459,18 @@ class DouyinWikiService:
         return job
 
     def list_jobs(self, status: JobStatus | None = None, limit: int = 50) -> list[JobRecord]:
-        return self.database.list_jobs(status, limit)
+        jobs = self.database.list_jobs(status, limit)
+        for job in jobs:
+            self._apply_live_creator_selection(job)
+        return jobs
+
+    def _apply_live_creator_selection(self, job: JobRecord) -> None:
+        """Expose current creator decisions instead of the dispatch-time snapshot."""
+        if job.kind != "creator_import" or not job.artifacts.get("creator_id"):
+            return
+        summary = self.database.creator_inventory_summary(job.id)
+        if summary.get("total", 0):
+            job.result["selection"] = summary
 
     def list_job_events(
         self,
@@ -201,7 +494,7 @@ class DouyinWikiService:
             JobStatus.AWAITING_AGENT_ANALYSIS,
             JobStatus.NEEDS_REVIEW,
         }:
-            raise JobStateError("只有 awaiting_agent_analysis 或 needs_review 任务可读取分析上下文")
+            raise JobStateError("只有处于“待 AI 处理”或“需要人工复核”状态的任务可读取分析上下文")
         artifacts = job.artifacts
         transcript = artifacts.get("transcript_corrected") or artifacts.get("transcript_raw", [])
         metadata = artifacts.get("metadata", {})
@@ -264,7 +557,7 @@ class DouyinWikiService:
     ) -> JobRecord:
         job = self.database.get_job(job_id)
         if job.status != JobStatus.AWAITING_AGENT_ANALYSIS:
-            raise JobStateError("只有 awaiting_agent_analysis 任务可提交逐字稿校正")
+            raise JobStateError("只有处于“待 AI 处理”状态的任务可提交逐字稿校正")
         raw = [
             TranscriptSegment.model_validate(item)
             for item in job.artifacts.get("transcript_raw", [])
@@ -318,7 +611,7 @@ class DouyinWikiService:
     ) -> JobRecord:
         job = self.database.get_job(job_id)
         if job.status != JobStatus.AWAITING_AGENT_ANALYSIS:
-            raise JobStateError("只有 awaiting_agent_analysis 任务可提交分析")
+            raise JobStateError("只有处于“待 AI 处理”状态的任务可提交分析")
         source_kind = job.artifacts.get("metadata", {}).get("source_kind", "video")
         if (
             source_kind != SourceKind.IMAGE_NOTE.value
@@ -348,7 +641,7 @@ class DouyinWikiService:
     def approve_job(self, job_id: str) -> JobRecord:
         job = self.database.get_job(job_id)
         if job.status != JobStatus.WAITING_CONFIRMATION:
-            raise JobStateError("只有 waiting_confirmation 任务可以批准")
+            raise JobStateError("只有处于“等待用户确认”状态的任务可以批准")
         return self.database.requeue_job(
             job_id,
             artifacts={"ai_analysis_approved": True, "cloud_analysis_approved": True},
@@ -358,7 +651,7 @@ class DouyinWikiService:
         """Retry a failed job from its last persisted stage checkpoint."""
         job = self.database.get_job(job_id)
         if job.status not in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}:
-            raise JobStateError("只有 failed 或 needs_auth 任务可以重试")
+            raise JobStateError("只有“失败”或“需要登录授权”的任务可以重试")
         return self.database.requeue_job(job_id)
 
     def resolve_review(
@@ -370,7 +663,7 @@ class DouyinWikiService:
     ) -> JobRecord:
         job = self.database.get_job(job_id)
         if job.status != JobStatus.NEEDS_REVIEW:
-            raise JobStateError("只有 needs_review 任务可以提交校对")
+            raise JobStateError("只有处于“需要人工复核”状态的任务可以提交校对")
         issues = self.database.get_review_issues(job_id, open_only=True)
         if not accept_uncertain and set(resolutions or {}) != {issue.id for issue in issues}:
             raise JobStateError("必须解决全部疑点，或明确 accept_uncertain=true")
@@ -498,15 +791,324 @@ class DouyinWikiService:
             queued.append(job.id)
         return {"queued_job_ids": queued, "skipped_entry_ids": skipped, "force": force}
 
-    def search_knowledge(self, query: str, *, include_stale: bool = False, limit: int = 10):
+    def search_knowledge(
+        self,
+        query: str,
+        *,
+        include_stale: bool = False,
+        limit: int = 10,
+        entry_ids: list[str] | None = None,
+    ):
         self.indexer.ensure_embedding_compatibility()
-        return self.searcher.search(query, include_stale=include_stale, limit=limit)
+        return self.searcher.search(
+            query,
+            include_stale=include_stale,
+            limit=limit,
+            entry_ids=entry_ids,
+        )
+
+    @staticmethod
+    def _topic_revision(
+        entries: list[tuple[EntryRecord, bool]],
+    ) -> tuple[str, list[SourceRevision]]:
+        revisions = [
+            SourceRevision(
+                entry_id=entry.id,
+                updated_at=entry.updated_at,
+                enabled=enabled,
+            )
+            for entry, enabled in entries
+        ]
+        payload = [item.model_dump(mode="json") for item in revisions]
+        digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode()
+        ).hexdigest()
+        return digest, revisions
+
+    def _refresh_topic(self, topic_id: str) -> ResearchTopic:
+        topic = self.database.get_topic(topic_id)
+        entries = [
+            (self.database.get_entry(source.entry_id), source.enabled)
+            for source in topic.sources
+        ]
+        revision, _ = self._topic_revision(entries)
+        if revision != topic.source_revision:
+            topic = self.database.update_topic_revision(
+                topic_id,
+                source_revision=revision,
+                source_versions={
+                    entry.id: entry.updated_at.isoformat() for entry, _ in entries
+                },
+            )
+            self._persist_topic(topic)
+        return topic
+
+    def _persist_topic(self, topic: ResearchTopic) -> list[Path]:
+        artifacts = self.database.list_topic_artifacts(topic.id)
+        entries = {
+            source.entry_id: self.database.get_entry(source.entry_id)
+            for source in topic.sources
+        }
+        with self.vault.locked():
+            changed = self.vault.write_topic(topic, artifacts, entries)
+            topics_index = self.vault.write_topics_index(self.database.list_topics())
+            changed.append(topics_index)
+            self.vault.commit(changed, f"docs: update topic {topic.id}")
+        return changed
+
+    def create_topic(
+        self,
+        title: str,
+        entry_ids: list[str],
+        *,
+        goal: str = "",
+        instructions: str = "",
+    ) -> dict[str, Any]:
+        normalized_title = title.strip()
+        if not normalized_title:
+            raise ValueError("专题标题不能为空")
+        unique_ids = list(dict.fromkeys(value.strip() for value in entry_ids if value.strip()))
+        if not unique_ids:
+            raise ValueError("请至少选择一篇文章作为专题来源")
+        entries = [self.database.get_entry(entry_id) for entry_id in unique_ids]
+        revision, _ = self._topic_revision([(entry, True) for entry in entries])
+        topic = self.database.create_topic(
+            topic_id=f"topic-{uuid.uuid4().hex[:12]}",
+            title=normalized_title[:200],
+            goal=goal.strip()[:4000],
+            instructions=instructions.strip()[:8000],
+            source_revision=revision,
+        )
+        topic = self.database.set_topic_sources(
+            topic.id,
+            [(entry.id, True, entry.updated_at.isoformat()) for entry in entries],
+            source_revision=revision,
+        )
+        self._persist_topic(topic)
+        return self.get_topic(topic.id)
+
+    def get_topic(self, topic_id: str) -> dict[str, Any]:
+        topic = self._refresh_topic(topic_id)
+        artifacts = self.database.list_topic_artifacts(topic_id)
+        return {
+            "topic": topic.model_dump(mode="json"),
+            "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+        }
+
+    def list_topics(self) -> list[dict[str, Any]]:
+        return [self.get_topic(topic.id) for topic in self.database.list_topics()]
+
+    def set_topic_sources(
+        self,
+        topic_id: str,
+        sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        ordered: list[tuple[EntryRecord, bool]] = []
+        seen: set[str] = set()
+        for source in sources:
+            entry_id = str(source.get("entry_id") or "").strip()
+            if not entry_id or entry_id in seen:
+                if entry_id in seen:
+                    raise ValueError("专题来源不能重复")
+                raise ValueError("专题来源缺少文章 ID")
+            seen.add(entry_id)
+            ordered.append((self.database.get_entry(entry_id), bool(source.get("enabled", True))))
+        if not ordered:
+            raise ValueError("专题必须保留至少一篇来源")
+        revision, _ = self._topic_revision(ordered)
+        topic = self.database.set_topic_sources(
+            topic_id,
+            [
+                (entry.id, enabled, entry.updated_at.isoformat())
+                for entry, enabled in ordered
+            ],
+            source_revision=revision,
+        )
+        self._persist_topic(topic)
+        return self.get_topic(topic_id)
+
+    def search_topic(
+        self,
+        topic_id: str,
+        query: str,
+        *,
+        include_stale: bool = False,
+        limit: int = 10,
+    ):
+        self._refresh_topic(topic_id)
+        entry_ids = self.database.enabled_topic_entry_ids(topic_id)
+        return self.search_knowledge(
+            query,
+            include_stale=include_stale,
+            limit=limit,
+            entry_ids=entry_ids,
+        )
+
+    def _topic_context(
+        self, topic: ResearchTopic
+    ) -> tuple[list[dict[str, Any]], list[SourceRevision]]:
+        enabled_sources = [source for source in topic.sources if source.enabled]
+        if not enabled_sources:
+            raise ValueError("当前专题没有启用的来源")
+        enabled_entries = [
+            self.database.get_entry(source.entry_id) for source in enabled_sources
+        ]
+        _, revisions = self._topic_revision(
+            [(entry, True) for entry in enabled_entries]
+        )
+        per_source_budget = max(1200, min(14_000, 52_000 // len(enabled_sources)))
+        contexts: list[dict[str, Any]] = []
+        for source, entry in zip(enabled_sources, enabled_entries, strict=True):
+            data = self.database.get_entry_data(source.entry_id)
+            analysis = data.get("analysis", {})
+            context = {
+                "entry_id": entry.id,
+                "title": entry.title,
+                "original_url": entry.original_url,
+                "inspirations": [item.model_dump(mode="json") for item in entry.inspirations],
+                "summary": analysis.get("one_liner") or entry.summary,
+                "takeaways": analysis.get("takeaways", []),
+                "content_card": analysis.get("content_card", {}),
+                "key_moments": analysis.get("key_moments", []),
+                "knowledge_atoms": [
+                    atom for atom in analysis.get("knowledge_atoms", []) if not atom.get("stale")
+                ],
+            }
+            serialized = json.dumps(context, ensure_ascii=False, default=str)
+            if len(serialized) > per_source_budget:
+                context = {
+                    "entry_id": entry.id,
+                    "title": entry.title,
+                    "original_url": entry.original_url,
+                    "inspirations": context["inspirations"][:3],
+                    "summary": context["summary"],
+                    "takeaways": context["takeaways"][:3],
+                    "key_moments": context["key_moments"][:3],
+                    "knowledge_atoms": context["knowledge_atoms"][:5],
+                }
+            contexts.append(context)
+        return contexts, revisions
+
+    async def generate_topic_artifact(
+        self,
+        topic_id: str,
+        kind: TopicArtifactKind,
+        *,
+        provider: Any | None = None,
+    ) -> dict[str, Any]:
+        labels = {
+            "overview": "专题总览",
+            "comparison": "跨来源对比表",
+            "evidence_map": "证据地图",
+            "consensus": "共识与分歧",
+            "decision_brief": "决策简报",
+            "faq": "专题 FAQ",
+        }
+        if kind == "note":
+            raise ValueError("用户笔记请使用 save_topic_note 保存")
+        topic = self._refresh_topic(topic_id)
+        contexts, revisions = self._topic_context(topic)
+        if provider is None:
+            from .webapp.chat import OpenAICompatibleChatProvider
+
+            provider = OpenAICompatibleChatProvider(self.config.llm)
+        system = (
+            "你是抖库的专题研究助手。只能使用给出的专题来源，不得使用外部知识或全库其他文章。"
+            "区分作品原话、作者观点、测试观察和 AI 推断。每项重要结论必须在句末使用"
+            "〔entry_id〕标注来源；证据不足时明确写“当前专题没有相关证据”。输出中文 Markdown。"
+        )
+        request = {
+            "artifact": labels[kind],
+            "topic_title": topic.title,
+            "research_goal": topic.goal,
+            "custom_instructions": topic.instructions,
+            "required_sections": {
+                "overview": ["研究问题", "来源角色", "核心结论"],
+                "comparison": ["Markdown 对比表：观点、依据、适用条件、局限"],
+                "evidence_map": ["主张", "支持来源", "反对来源", "证据不足"],
+                "consensus": ["共识", "分歧", "分歧成立的条件", "未知信息"],
+                "decision_brief": ["可选方案", "支持依据", "风险", "未知信息", "下一步行动"],
+                "faq": ["只收录来源能够回答的问题与答案"],
+            }[kind],
+            "sources": contexts,
+        }
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(request, ensure_ascii=False, default=str),
+            },
+        ]
+        answer = ""
+        usage: dict[str, int | None] = {}
+        async for chunk in provider.stream(messages):
+            answer += chunk.text
+            if chunk.usage:
+                usage = chunk.usage
+        if not answer.strip():
+            raise ExternalToolError("模型没有返回专题成果")
+        enabled_ids = {source.entry_id for source in topic.sources if source.enabled}
+        if not any(entry_id in answer for entry_id in enabled_ids):
+            raise ExternalToolError("专题成果缺少来源标注，未保存；请重试")
+        now = utc_now()
+        artifact = TopicArtifact(
+            id=f"{kind}-{uuid.uuid4().hex[:12]}",
+            topic_id=topic.id,
+            kind=kind,
+            title=labels[kind],
+            content_markdown=answer.strip(),
+            source_revision=topic.source_revision,
+            source_revisions=revisions,
+            model=provider.model or None,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            created_at=now,
+            updated_at=now,
+        )
+        artifact = self.database.save_topic_artifact(artifact)
+        self._persist_topic(topic)
+        return artifact.model_dump(mode="json")
+
+    def save_topic_note(
+        self,
+        topic_id: str,
+        content: str,
+        *,
+        title: str = "专题笔记",
+        confirmed: bool = False,
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("保存专题笔记前需要用户明确确认")
+        literal = content.strip()
+        if not literal:
+            raise ValueError("专题笔记不能为空")
+        topic = self._refresh_topic(topic_id)
+        _, revisions = self._topic_context(topic)
+        now = utc_now()
+        artifact = TopicArtifact(
+            id=f"note-{uuid.uuid4().hex[:12]}",
+            topic_id=topic_id,
+            kind="note",
+            title=title.strip()[:200] or "专题笔记",
+            content_markdown=literal,
+            source_revision=topic.source_revision,
+            source_revisions=revisions,
+            prompt_version="user-note-v1",
+            user_authored=True,
+            created_at=now,
+            updated_at=now,
+        )
+        artifact = self.database.save_topic_artifact(artifact)
+        self._persist_topic(topic)
+        return artifact.model_dump(mode="json")
 
     def get_entry(self, entry_id: str, *, include_documents: bool = False) -> dict[str, Any]:
         entry = self.database.get_entry(entry_id)
+        entry_data = self.database.get_entry_data(entry_id)
         result: dict[str, Any] = {
             "entry": entry.model_dump(mode="json"),
-            "data": self.database.get_entry_data(entry_id),
+            "data": entry_data,
             "relations": self.database.get_relations(entry_id),
         }
         if include_documents:
@@ -518,8 +1120,11 @@ class DouyinWikiService:
             result["source_markdown"] = (
                 source_path.read_text(encoding="utf-8") if source_path.exists() else None
             )
-            machine_path = (
-                self.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+            creator_folder = str(entry_data.get("creator", {}).get("folder_path") or "")
+            machine_path = self.config.vault_path / (
+                Path(creator_folder) / ".data" / "sources" / f"{entry.video_id}.md"
+                if creator_folder
+                else Path("wiki") / ".data" / "sources" / f"{entry.video_id}.md"
             )
             result["machine_markdown"] = (
                 machine_path.read_text(encoding="utf-8") if machine_path.exists() else None
@@ -626,20 +1231,26 @@ class DouyinWikiService:
 
     async def process_claimed_job(self, job: JobRecord) -> JobRecord:
         try:
-            if job.kind == "reanalyze":
-                return await self._process_reanalysis(job)
-            return await self._process_capture(job)
+            if job.kind == "creator_import":
+                outcome = await self._process_creator_import(job)
+            elif job.kind == "reanalyze":
+                outcome = await self._process_reanalysis(job)
+            else:
+                outcome = await self._process_capture(job)
         except (BrowserAuthRequiredError, CookieRequiredError) as exc:
             is_video = isinstance(exc, CookieRequiredError)
+            is_creator = job.kind == "creator_import"
             next_command = "douyin-wiki auth video" if is_video else "douyin-wiki auth douyin"
-            return self.database.update_job(
+            outcome = self.database.update_job(
                 job.id,
                 status=JobStatus.NEEDS_AUTH,
                 error_code=exc.code,
                 error_message=str(exc),
                 result={
                     "reason": exc.code,
-                    "auth_scope": "video" if is_video else "image_note",
+                    "auth_scope": (
+                        "video" if is_video else ("creator" if is_creator else "image_note")
+                    ),
                     "next_command": next_command,
                     "retry_command": f"douyin-wiki jobs retry {job.id}",
                     "details": exc.details,
@@ -647,7 +1258,7 @@ class DouyinWikiService:
                 unlock=True,
             )
         except DouyinWikiError as exc:
-            return self.database.update_job(
+            outcome = self.database.update_job(
                 job.id,
                 status=JobStatus.FAILED,
                 error_code=exc.code,
@@ -656,13 +1267,108 @@ class DouyinWikiService:
                 unlock=True,
             )
         except Exception as exc:  # noqa: BLE001 - worker must persist unexpected failures
-            return self.database.update_job(
+            outcome = self.database.update_job(
                 job.id,
                 status=JobStatus.FAILED,
                 error_code="internal_error",
                 error_message=str(exc),
                 unlock=True,
             )
+        creator_context = outcome.artifacts.get("creator_context")
+        if creator_context:
+            if outcome.status in {JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_WARNINGS}:
+                entry_id = str(outcome.result.get("entry_id") or "")
+                if entry_id:
+                    self.database.mark_creator_work_imported(
+                        str(creator_context.get("id")),
+                        str(creator_context.get("work_id")),
+                        entry_id,
+                    )
+                    self._refresh_creator_documents(
+                        str(creator_context.get("id")), action="work-imported"
+                    )
+            self._refresh_creator_parent(str(creator_context.get("parent_job_id") or ""))
+        return outcome
+
+    async def _process_creator_import(self, job: JobRecord) -> JobRecord:
+        artifacts = dict(job.artifacts)
+        action = str(artifacts.get("creator_action") or "initial")
+        self.database.update_job(job.id, status=JobStatus.RESOLVING, progress=0.05)
+        target_dir = self.config.work_dir / job.id / "creator-inventory"
+        async with self.download_semaphore:
+            inventory = await self.creator_adapter.inventory(job.request.share_text, target_dir)
+        self.database.update_job(job.id, status=JobStatus.INVENTORYING, progress=0.25)
+        creator_id = creator_id_for(inventory.profile.sec_uid)
+        existing = self.database.find_creator_by_sec_uid(inventory.profile.sec_uid)
+        folder = (
+            existing.folder_path
+            if existing
+            else str(
+                Path("creators")
+                / f"{safe_filename(inventory.profile.nickname, max_length=48)}_{creator_id[-8:]}"
+            )
+        )
+        profile = self._persist_creator_avatar(inventory, folder)
+        inventory = inventory.model_copy(
+            update={
+                "profile": profile,
+                "works": self._persist_creator_previews(inventory, folder),
+            }
+        )
+        creator = self.database.upsert_creator(
+            profile,
+            creator_id=creator_id,
+            folder_path=folder,
+            inspirations=job.request.inspirations,
+        )
+        inventory_result = self.database.record_creator_inventory(
+            job.id,
+            creator.id,
+            inventory.works,
+            complete=inventory.complete,
+            sync=action == "sync",
+        )
+        artifacts_update = {
+            "creator_id": creator.id,
+            "creator_folder": creator.folder_path,
+            "inventory_partial": not inventory.complete,
+            "reported_count": inventory.reported_count,
+        }
+        summary = self.database.creator_inventory_summary(job.id)
+        result = {
+            "creator_id": creator.id,
+            "creator_name": creator.nickname,
+            "creator_path": creator.folder_path,
+            "inventory": inventory_result,
+            "selection": summary,
+            "partial": not inventory.complete,
+            "warnings": inventory.warnings,
+            "next_tool": "get_creator_inventory" if summary["total"] else None,
+        }
+        self.database.update_job(job.id, artifacts=artifacts_update)
+        self._refresh_creator_documents(creator.id, action=f"inventory-{action}")
+        if not summary["total"] and inventory.complete:
+            return self.database.update_job(
+                job.id,
+                status=JobStatus.COMPLETED,
+                progress=1,
+                result={**result, "message": "同步完成：没有发现新作品"},
+                unlock=True,
+            )
+        return self.database.update_job(
+            job.id,
+            status=JobStatus.NEEDS_SELECTION,
+            progress=0.5,
+            result={
+                **result,
+                **(
+                    {"message": "清单不完整，需明确接受 partial 后才能结束本次清点"}
+                    if not summary["total"]
+                    else {}
+                ),
+            },
+            unlock=True,
+        )
 
     async def _process_reanalysis(self, job: JobRecord) -> JobRecord:
         entry_id = str(job.artifacts.get("reanalyze_entry_id", ""))
@@ -761,6 +1467,7 @@ class DouyinWikiService:
         )
         self.database.persist_entry_bundle(updated, data, chunks, relations, reminders)
         source_kind = current_data.get("metadata", {}).get("source_kind", SourceKind.VIDEO.value)
+        creator_folder = str(current_data.get("creator", {}).get("folder_path") or "")
         return self.database.update_job(
             job.id,
             status=JobStatus.COMPLETED,
@@ -768,7 +1475,11 @@ class DouyinWikiService:
             result={
                 "entry_id": updated.id,
                 "source_path": updated.source_path,
-                "machine_data_path": f"wiki/.data/sources/{updated.video_id}.md",
+                "machine_data_path": str(
+                    Path(creator_folder) / ".data" / "sources" / f"{updated.video_id}.md"
+                    if creator_folder
+                    else Path("wiki") / ".data" / "sources" / f"{updated.video_id}.md"
+                ),
                 "summary": updated.summary,
                 "reused_transcript": source_kind == SourceKind.VIDEO.value,
                 "reused_ocr": True,
@@ -798,6 +1509,16 @@ class DouyinWikiService:
         resolved_data = artifacts["resolved"]
         video_id = resolved_data["video_id"]
 
+        if not artifacts.get("creator_context"):
+            known_creator = self.database.find_creator_for_work(video_id)
+            if known_creator:
+                artifacts["creator_context"] = self._creator_context(
+                    known_creator.id, known_creator.folder_path, video_id
+                )
+                self.database.update_job(
+                    job.id, artifacts={"creator_context": artifacts["creator_context"]}
+                )
+
         if resolved_data.get("source_kind", SourceKind.VIDEO.value) == SourceKind.IMAGE_NOTE.value:
             return await self._process_image_note_capture(job, artifacts, resolved_data)
 
@@ -824,7 +1545,13 @@ class DouyinWikiService:
                 )
         effective_inspirations = existing.inspirations if existing else request.inspirations
 
-        assets_dir = self.config.vault_path / "raw" / "assets" / video_id
+        creator_context = artifacts.get("creator_context") or {}
+        creator_folder = str(creator_context.get("folder_path") or "")
+        assets_dir = (
+            self.config.vault_path / creator_folder / "raw" / "assets" / video_id
+            if creator_folder
+            else self.config.vault_path / "raw" / "assets" / video_id
+        )
         if "metadata" not in artifacts or not artifacts.get("video_path"):
             self.database.update_job(job.id, status=JobStatus.DOWNLOADING, progress=0.12)
             async with self.download_semaphore:
@@ -843,6 +1570,28 @@ class DouyinWikiService:
                 progress=0.28,
             )
         metadata = VideoMetadata.model_validate(artifacts["metadata"])
+        if not creator_folder:
+            creator_context, metadata, assets_dir = self._adopt_creator_capture(
+                metadata,
+                work_id=video_id,
+                original_url=str(resolved_data["original_url"]),
+                canonical_url=str(resolved_data["canonical_url"]),
+                current_dir=assets_dir,
+                media_folder="assets",
+            )
+            if creator_context:
+                creator_folder = str(creator_context["folder_path"])
+                artifacts["creator_context"] = creator_context
+                artifacts["metadata"] = metadata.model_dump(mode="json")
+                artifacts["video_path"] = metadata.media_path
+                self.database.update_job(
+                    job.id,
+                    artifacts={
+                        "creator_context": creator_context,
+                        "metadata": artifacts["metadata"],
+                        "video_path": artifacts["video_path"],
+                    },
+                )
         video_path = Path(artifacts["video_path"])
         if metadata.duration_seconds is None:
             metadata.duration_seconds = await self.media.probe_duration(video_path)
@@ -1033,16 +1782,31 @@ class DouyinWikiService:
         )
         title = safe_filename(analysis_data.get("title") or metadata.title)
         entry_id = f"dy-{video_id}"
-        date_prefix = (metadata.published_at or now).date().isoformat()
+        date_prefix = beijing_date(metadata.published_at or now)
         filename = f"{date_prefix}_{title}_{video_id}.md"
-        raw_relative = existing.raw_path if existing else str(Path("raw") / filename)
+        raw_relative = (
+            existing.raw_path
+            if existing
+            else str(
+                Path(creator_folder) / "raw" / "records" / filename
+                if creator_folder
+                else Path("raw") / filename
+            )
+        )
         source_relative = (
-            existing.source_path if existing else str(Path("wiki") / "sources" / filename)
+            existing.source_path
+            if existing
+            else str(
+                Path(creator_folder) / "sources" / filename
+                if creator_folder
+                else Path("wiki") / "sources" / filename
+            )
         )
         cover_path = self._persist_video_cover(
             video_id,
             assets_dir,
             thumbnail_path=metadata.thumbnail_path,
+            creator_folder=creator_folder or None,
         )
         expiry = (
             now + timedelta(days=self.config.media.retention_days)
@@ -1095,6 +1859,15 @@ class DouyinWikiService:
             ),
             "cover_path": cover_path,
             "cover_kind": metadata.thumbnail_kind or ("fallback" if cover_path else None),
+            "creator": (
+                {
+                    "id": creator_context.get("id"),
+                    "folder_path": creator_folder,
+                    "parent_job_id": creator_context.get("parent_job_id"),
+                }
+                if creator_folder
+                else {}
+            ),
         }
         reminders = [
             ReminderCandidate.model_validate(item) for item in analysis_data.get("reminders", [])
@@ -1165,7 +1938,13 @@ class DouyinWikiService:
                 )
         effective_inspirations = existing.inspirations if existing else request.inspirations
 
-        images_dir = self.config.vault_path / "raw" / "images" / work_id
+        creator_context = artifacts.get("creator_context") or {}
+        creator_folder = str(creator_context.get("folder_path") or "")
+        images_dir = (
+            self.config.vault_path / creator_folder / "raw" / "images" / work_id
+            if creator_folder
+            else self.config.vault_path / "raw" / "images" / work_id
+        )
         metadata: VideoMetadata | None = None
         if "metadata" in artifacts:
             candidate = VideoMetadata.model_validate(artifacts["metadata"])
@@ -1184,6 +1963,27 @@ class DouyinWikiService:
             self.database.update_job(
                 job.id, artifacts={"metadata": artifacts["metadata"]}, progress=0.42
             )
+
+        if not creator_folder:
+            creator_context, metadata, images_dir = self._adopt_creator_capture(
+                metadata,
+                work_id=work_id,
+                original_url=str(resolved_data["original_url"]),
+                canonical_url=str(resolved_data["canonical_url"]),
+                current_dir=images_dir,
+                media_folder="images",
+            )
+            if creator_context:
+                creator_folder = str(creator_context["folder_path"])
+                artifacts["creator_context"] = creator_context
+                artifacts["metadata"] = metadata.model_dump(mode="json")
+                self.database.update_job(
+                    job.id,
+                    artifacts={
+                        "creator_context": creator_context,
+                        "metadata": artifacts["metadata"],
+                    },
+                )
 
         absolute_images = [self._vault_path(value) for value in metadata.image_paths]
         images_complete = absolute_images and all(
@@ -1309,11 +2109,25 @@ class DouyinWikiService:
             analysis_data.get("contradictions", []), entry_id
         )
         title = safe_filename(analysis_data.get("title") or metadata.title)
-        date_prefix = (metadata.published_at or now).date().isoformat()
+        date_prefix = beijing_date(metadata.published_at or now)
         filename = f"{date_prefix}_{title}_{work_id}.md"
-        raw_relative = existing.raw_path if existing else str(Path("raw") / filename)
+        raw_relative = (
+            existing.raw_path
+            if existing
+            else str(
+                Path(creator_folder) / "raw" / "records" / filename
+                if creator_folder
+                else Path("raw") / filename
+            )
+        )
         source_relative = (
-            existing.source_path if existing else str(Path("wiki") / "sources" / filename)
+            existing.source_path
+            if existing
+            else str(
+                Path(creator_folder) / "sources" / filename
+                if creator_folder
+                else Path("wiki") / "sources" / filename
+            )
         )
 
         relative_images = [self._vault_relative(path) for path in absolute_images]
@@ -1370,6 +2184,15 @@ class DouyinWikiService:
             ),
             "cover_path": relative_images[0],
             "cover_kind": "image_note_first_image",
+            "creator": (
+                {
+                    "id": creator_context.get("id"),
+                    "folder_path": creator_folder,
+                    "parent_job_id": creator_context.get("parent_job_id"),
+                }
+                if creator_folder
+                else {}
+            ),
         }
         reminders = [
             ReminderCandidate.model_validate(item) for item in analysis_data.get("reminders", [])
@@ -1414,15 +2237,15 @@ class DouyinWikiService:
             for entry in self.database.list_entries():
                 data = self.database.get_entry_data(entry.id)
                 metadata = dict(data.get("metadata", {}))
+                creator_folder = str(data.get("creator", {}).get("folder_path") or "")
+                assets_dir = (
+                    self.config.vault_path / creator_folder / "raw" / "assets" / entry.video_id
+                    if creator_folder
+                    else self.config.vault_path / "raw" / "assets" / entry.video_id
+                )
                 preferred_cover: Path | None = None
                 if data.get("cover_kind") != "douyin_cover":
-                    info_path = (
-                        self.config.vault_path
-                        / "raw"
-                        / "assets"
-                        / entry.video_id
-                        / "original.info.json"
-                    )
+                    info_path = assets_dir / "original.info.json"
                     try:
                         info = json.loads(info_path.read_text(encoding="utf-8"))
                         preferred_cover = download_preferred_cover(info, info_path.parent)
@@ -1433,11 +2256,12 @@ class DouyinWikiService:
                         metadata["thumbnail_kind"] = "douyin_cover"
                 cover_path = self._persist_video_cover(
                     entry.video_id,
-                    self.config.vault_path / "raw" / "assets" / entry.video_id,
+                    assets_dir,
                     thumbnail_path=str(preferred_cover)
                     if preferred_cover
                     else metadata.get("thumbnail_path"),
                     replace_existing=preferred_cover is not None,
+                    creator_folder=creator_folder or None,
                 )
                 if not cover_path:
                     continue
@@ -1506,13 +2330,15 @@ class DouyinWikiService:
         with self.vault.locked():
             written = self.vault.write_entry(entry, data)
             index = self.vault.rebuild_index(entries)
-            log = self.vault.append_log(
-                action,
-                entry.title,
-                log_summary,
-                [*written.changed_paths, index],
-            )
-            changed = [*written.changed_paths, index, log]
+            changed = [*written.changed_paths, index]
+            if not data.get("creator", {}).get("folder_path"):
+                log = self.vault.append_log(
+                    action,
+                    entry.title,
+                    log_summary,
+                    [*written.changed_paths, index],
+                )
+                changed.append(log)
             committed = self.vault.commit(changed, commit_message)
             if (self.config.vault_path / ".git").exists() and not committed:
                 raise ExternalToolError(
@@ -1520,13 +2346,199 @@ class DouyinWikiService:
                     details={"paths": [str(path) for path in changed]},
                 )
 
+    def _persist_creator_avatar(self, inventory: CreatorInventoryResult, folder_path: str):
+        source_value = inventory.profile.avatar_path
+        if not source_value:
+            return inventory.profile
+        source = Path(source_value)
+        if not source.is_file():
+            return inventory.profile.model_copy(update={"avatar_path": None})
+        suffix = (
+            source.suffix.lower()
+            if source.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+            else ".jpg"
+        )
+        target = self.config.vault_path / folder_path / "raw" / f"avatar{suffix}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        return inventory.profile.model_copy(
+            update={"avatar_path": str(target.relative_to(self.config.vault_path))}
+        )
+
+    def _persist_creator_previews(
+        self, inventory: CreatorInventoryResult, folder_path: str
+    ) -> list[CreatorInventoryWork]:
+        covers = self.config.vault_path / folder_path / "raw" / "covers"
+        covers.mkdir(parents=True, exist_ok=True)
+        persisted: list[CreatorInventoryWork] = []
+        for work in inventory.works:
+            source = Path(work.thumbnail_path) if work.thumbnail_path else None
+            if source is None or not source.is_file():
+                persisted.append(work.model_copy(update={"thumbnail_path": None}))
+                continue
+            suffix = (
+                source.suffix.lower()
+                if source.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+                else ".jpg"
+            )
+            target = covers / f"{work.work_id}{suffix}"
+            shutil.copy2(source, target)
+            persisted.append(
+                work.model_copy(
+                    update={"thumbnail_path": str(target.relative_to(self.config.vault_path))}
+                )
+            )
+        return persisted
+
+    @staticmethod
+    def _creator_context(creator_id: str, folder_path: str, work_id: str) -> dict[str, Any]:
+        return {
+            "id": creator_id,
+            "folder_path": folder_path,
+            "parent_job_id": "",
+            "work_id": work_id,
+            "batch_silent": False,
+        }
+
+    def _adopt_creator_capture(
+        self,
+        metadata: VideoMetadata,
+        *,
+        work_id: str,
+        original_url: str,
+        canonical_url: str,
+        current_dir: Path,
+        media_folder: str,
+    ) -> tuple[dict[str, Any] | None, VideoMetadata, Path]:
+        if not metadata.creator_sec_uid:
+            return None, metadata, current_dir
+        creator = self.database.find_creator_by_sec_uid(metadata.creator_sec_uid)
+        if creator is None:
+            return None, metadata, current_dir
+        target_dir = self.config.vault_path / creator.folder_path / "raw" / media_folder / work_id
+        metadata = self._relocate_capture_metadata(metadata, current_dir, target_dir)
+        self.database.register_creator_work(
+            creator.id,
+            CreatorInventoryWork(
+                work_id=work_id,
+                source_kind=metadata.source_kind,
+                canonical_url=canonical_url,
+                original_url=original_url,
+                title=metadata.title,
+                published_at=metadata.published_at,
+                duration_seconds=metadata.duration_seconds,
+                thumbnail_path=metadata.thumbnail_path,
+            ),
+        )
+        return self._creator_context(creator.id, creator.folder_path, work_id), metadata, target_dir
+
+    @staticmethod
+    def _relocate_capture_metadata(
+        metadata: VideoMetadata, current_dir: Path, target_dir: Path
+    ) -> VideoMetadata:
+        current_dir = current_dir.resolve()
+        target_dir = target_dir.resolve()
+        if current_dir != target_dir and current_dir.exists():
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            if not target_dir.exists():
+                shutil.move(str(current_dir), str(target_dir))
+            else:
+                for source in current_dir.iterdir():
+                    target = target_dir / source.name
+                    if not target.exists():
+                        shutil.move(str(source), str(target))
+
+        def relocated(value: str | None) -> str | None:
+            if not value:
+                return value
+            path = Path(value).resolve()
+            try:
+                relative = path.relative_to(current_dir)
+            except ValueError:
+                return value
+            return str(target_dir / relative)
+
+        return metadata.model_copy(
+            update={
+                "media_path": relocated(metadata.media_path),
+                "thumbnail_path": relocated(metadata.thumbnail_path),
+                "image_paths": [
+                    value
+                    for value in (relocated(path) for path in metadata.image_paths)
+                    if value is not None
+                ],
+            }
+        )
+
+    def _refresh_creator_documents(self, creator_id: str, *, action: str) -> None:
+        if not creator_id:
+            return
+        creator = self.database.get_creator(creator_id)
+        works = self.database.list_creator_works(creator_id)
+        entries = self.database.list_entries()
+        with self.vault.locked():
+            changed = self.vault.write_creator(creator, works, entries, action=action)
+            root_index = self.vault.rebuild_index(entries)
+            changed.append(root_index)
+            if (self.config.vault_path / ".git").exists():
+                self.vault.commit(changed, f"creator: {creator.nickname} {action}")
+
+    def _refresh_creator_parent(self, parent_job_id: str) -> None:
+        if not parent_job_id:
+            return
+        with suppress(JobStateError):
+            parent = self.database.get_job(parent_job_id)
+            if parent.kind != "creator_import" or parent.status != JobStatus.MONITORING:
+                return
+            child_ids = list(parent.result.get("child_job_ids", []))
+            children = [self.database.get_job(job_id) for job_id in child_ids]
+            terminal = {
+                JobStatus.COMPLETED,
+                JobStatus.COMPLETED_WITH_WARNINGS,
+                JobStatus.FAILED,
+            }
+            counts: dict[str, int] = {}
+            for child in children:
+                counts[child.status.value] = counts.get(child.status.value, 0) + 1
+            finished = sum(counts.get(status.value, 0) for status in terminal)
+            result = {
+                **parent.result,
+                "selection": self.database.creator_inventory_summary(parent.id),
+                "child_status_counts": counts,
+                "finished_count": finished,
+            }
+            if children and finished < len(children):
+                self.database.update_job(
+                    parent.id,
+                    progress=0.65 + 0.35 * finished / len(children),
+                    result=result,
+                )
+                return
+            warnings = counts.get(JobStatus.FAILED.value, 0) + counts.get(
+                JobStatus.COMPLETED_WITH_WARNINGS.value, 0
+            )
+            self.database.update_job(
+                parent.id,
+                status=(JobStatus.COMPLETED_WITH_WARNINGS if warnings else JobStatus.COMPLETED),
+                progress=1,
+                result={**result, "completed_count": len(children), "warning_count": warnings},
+                unlock=True,
+            )
+
     def _entry_documents_intact(self, entry: EntryRecord) -> bool:
+        data = self.database.get_entry_data(entry.id)
+        creator_folder = str(data.get("creator", {}).get("folder_path") or "")
+        machine_path = (
+            self.config.vault_path / creator_folder / ".data" / "sources" / f"{entry.video_id}.md"
+            if creator_folder
+            else self.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+        )
         return all(
             path.is_file() and path.stat().st_size > 0
             for path in (
                 self.config.vault_path / entry.raw_path,
                 self.config.vault_path / entry.source_path,
-                self.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md",
+                machine_path,
             )
         )
 
@@ -1546,13 +2558,21 @@ class DouyinWikiService:
 
     def rebuild_database_from_vault(self, *, apply: bool = False) -> dict[str, Any]:
         loaded = self.vault.load_entries()
+        loaded_creators = self.vault.load_creators()
+        loaded_topics = self.vault.load_topics()
         report = {
             "dry_run": not apply,
             "entry_count": len(loaded),
             "entry_ids": [entry.id for entry, _ in loaded],
+            "creator_count": len(loaded_creators),
+            "creator_ids": [creator.id for creator, _ in loaded_creators],
+            "topic_count": len(loaded_topics),
+            "topic_ids": [topic.id for topic, _ in loaded_topics],
         }
         if not apply:
             return report
+        if self.database.has_unfinished_creator_jobs():
+            raise JobStateError("存在未完成的博主清点或批量任务，完成后再重建 SQLite")
         prepared: list[
             tuple[
                 EntryRecord,
@@ -1561,7 +2581,7 @@ class DouyinWikiService:
                 list[ReminderCandidate],
             ]
         ] = []
-        self.database.clear_knowledge_cache()
+        self.database.clear_knowledge_cache(include_creators=True)
         # Insert base entries first so relation foreign keys can be restored in pass two.
         for entry, data in loaded:
             self.database.upsert_entry(entry, data)
@@ -1580,6 +2600,10 @@ class DouyinWikiService:
                     continue
                 relations.append(relation)
             self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
+        for creator, works in loaded_creators:
+            self.database.restore_creator_bundle(creator, works)
+        for topic, artifacts in loaded_topics:
+            self.database.restore_topic_bundle(topic, artifacts)
         self.indexer.record_embedding_signature()
         return {**report, "dry_run": False, "status": "rebuilt"}
 
@@ -1630,12 +2654,14 @@ class DouyinWikiService:
                 )
                 changed.extend([report_path, index, log])
                 changed = list(dict.fromkeys(changed))
-                self.vault.commit(changed, f"maintenance: {utc_now().date().isoformat()}")
+                self.vault.commit(changed, f"maintenance: {beijing_date()}")
             self.database.record_maintenance("weekly", report)
         return report
 
     def _trash_assets(self, entry: EntryRecord, *, mark_database: bool = True) -> None:
-        assets = self.config.vault_path / "raw" / "assets" / entry.video_id
+        raw_parent = Path(entry.raw_path).parent
+        raw_root = raw_parent.parent if raw_parent.name == "records" else raw_parent
+        assets = self.config.vault_path / raw_root / "assets" / entry.video_id
         if assets.exists():
             send2trash(str(assets))
         if mark_database:
@@ -1840,8 +2866,13 @@ class DouyinWikiService:
         *,
         thumbnail_path: str | None = None,
         replace_existing: bool = False,
+        creator_folder: str | None = None,
     ) -> str | None:
-        covers_dir = self.config.vault_path / "raw" / "covers"
+        covers_dir = (
+            self.config.vault_path / creator_folder / "raw" / "covers"
+            if creator_folder
+            else self.config.vault_path / "raw" / "covers"
+        )
         covers_dir.mkdir(parents=True, exist_ok=True)
         existing = sorted(covers_dir.glob(f"{video_id}.*"))
         if existing and not replace_existing:
@@ -1872,21 +2903,25 @@ class DouyinWikiService:
 
     def _find_orphan_pages(self) -> list[str]:
         wiki = self.config.vault_path / "wiki"
-        if not wiki.exists():
+        creators_root = self.config.vault_path / "creators"
+        knowledge_roots = [wiki]
+        knowledge_roots.extend(path for path in creators_root.glob("*") if path.is_dir())
+        if not any(root.exists() for root in knowledge_roots):
             return []
         all_content = "\n".join(
             path.read_text(encoding="utf-8", errors="ignore")
             for path in self.config.vault_path.rglob("*.md")
         )
         orphans = []
-        for folder in ("concepts", "entities"):
-            for path in (wiki / folder).glob("*.md"):
-                content = path.read_text(encoding="utf-8", errors="ignore")
-                if "[[wiki/sources/" in content:
-                    continue
-                relative = str(path.relative_to(self.config.vault_path).with_suffix(""))
-                if f"[[{relative}" not in all_content:
-                    orphans.append(str(path.relative_to(self.config.vault_path)))
+        for root in knowledge_roots:
+            for folder in ("concepts", "entities"):
+                for path in (root / folder).glob("*.md"):
+                    content = path.read_text(encoding="utf-8", errors="ignore")
+                    if re.search(r"\[\[[^\]\n]*/sources/", content):
+                        continue
+                    relative = str(path.relative_to(self.config.vault_path).with_suffix(""))
+                    if f"[[{relative}" not in all_content:
+                        orphans.append(str(path.relative_to(self.config.vault_path)))
         return sorted(orphans)
 
     @staticmethod

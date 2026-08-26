@@ -251,9 +251,14 @@ async def test_database_can_be_rebuilt_from_machine_markdown(service) -> None:
     completed = await Worker(service).run_once()
     entry_id = completed.result["entry_id"]
     original = service.database.get_entry(entry_id)
+    topic_id = service.create_topic(
+        "重建测试专题", [entry_id], goal="验证 Markdown 是长期事实源"
+    )["topic"]["id"]
+    service.save_topic_note(topic_id, "重建后仍应存在", confirmed=True)
 
     preview = service.rebuild_database_from_vault()
     assert preview["entry_ids"] == [entry_id]
+    assert preview["topic_ids"] == [topic_id]
     service.database.clear_knowledge_cache()
     assert service.database.list_entries() == []
 
@@ -262,3 +267,6 @@ async def test_database_can_be_rebuilt_from_machine_markdown(service) -> None:
     restored = service.database.get_entry(entry_id)
     assert restored.video_id == original.video_id
     assert service.database.entry_chunk_count(entry_id) > 0
+    restored_topic = service.get_topic(topic_id)
+    assert restored_topic["topic"]["sources"][0]["entry_id"] == entry_id
+    assert restored_topic["artifacts"][0]["content_markdown"] == "重建后仍应存在"

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import plistlib
 from pathlib import Path
 
+import douyin_wiki
 from douyin_wiki.mcp_server import mcp
 from douyin_wiki.secrets import get_secret
 from douyin_wiki.setup import LaunchAgentInstaller
+
+
+def test_package_version_matches_metadata() -> None:
+    assert douyin_wiki.__version__ == importlib.metadata.version("douyin-wiki")
 
 
 def test_mcp_exposes_public_tools() -> None:
@@ -28,6 +34,13 @@ def test_mcp_exposes_public_tools() -> None:
         "reanalyze_entry",
         "reanalyze_all",
         "search_knowledge",
+        "create_topic",
+        "get_topic",
+        "list_topics",
+        "set_topic_sources",
+        "search_topic",
+        "generate_topic_artifact",
+        "save_topic_note",
         "get_entry",
         "add_inspiration",
         "add_purpose",

@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Collection
 from typing import Any
 
 from .adapters.embeddings import EmbeddingService, cosine_similarity
@@ -264,13 +265,24 @@ class KnowledgeSearch:
         self.database = database
         self.embeddings = embeddings
 
-    def search(self, query: str, *, include_stale: bool = False, limit: int = 10) -> list[Evidence]:
+    def search(
+        self,
+        query: str,
+        *,
+        include_stale: bool = False,
+        limit: int = 10,
+        entry_ids: Collection[str] | None = None,
+    ) -> list[Evidence]:
         cleaned = query.strip()
-        if not cleaned:
+        if not cleaned or (entry_ids is not None and not entry_ids):
             return []
+        allowed_ids = None if entry_ids is None else tuple(dict.fromkeys(entry_ids))
         fts_query = _fts_query(cleaned)
         lexical_rows = self.database.fts_search(
-            fts_query, include_stale=include_stale, limit=max(limit * 5, 50)
+            fts_query,
+            include_stale=include_stale,
+            limit=max(limit * 5, 50),
+            entry_ids=allowed_ids,
         )
         lexical_scores: dict[str, float] = {}
         lexical_ranks: dict[str, int] = {}
@@ -280,7 +292,9 @@ class KnowledgeSearch:
             lexical_ranks[row["id"]] = index
 
         query_vector = self.embeddings.embed([cleaned])[0]
-        rows = self.database.fetch_chunks(include_stale=include_stale)
+        rows = self.database.fetch_chunks(
+            include_stale=include_stale, entry_ids=allowed_ids
+        )
         results: list[tuple[float, dict[str, Any]]] = []
         for row in rows:
             vector_score = 0.0
@@ -291,6 +305,18 @@ class KnowledgeSearch:
             lexical_score = lexical_scores.get(row["id"], 0.0)
             rank_bonus = 1.0 / (60 + lexical_ranks[row["id"]]) if row["id"] in lexical_ranks else 0
             inspiration_bonus = 0.12 if _contains_overlap(cleaned, row["purposes_text"]) else 0.0
+            # Type priority can rank relevant evidence, but cannot by itself make an
+            # unrelated chunk eligible inside a strict entry/topic boundary.
+            semantic_floor = 0.32
+            if allowed_ids is not None:
+                semantic_floor = (
+                    0.42
+                    if row["kind"]
+                    in {"knowledge_atom", "inspiration", "summary", "takeaway"}
+                    else 0.52
+                )
+            if lexical_score == 0 and vector_score < semantic_floor and inspiration_bonus == 0:
+                continue
             kind_bonus = {
                 "knowledge_atom": 0.12,
                 "inspiration": 0.08,

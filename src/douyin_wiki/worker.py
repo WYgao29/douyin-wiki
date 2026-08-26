@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from .runtime import LOADED_SOURCE_SIGNATURE, source_signature
 from .service import DouyinWikiService
 
 
 class Worker:
-    def __init__(self, service: DouyinWikiService) -> None:
+    def __init__(
+        self,
+        service: DouyinWikiService,
+        *,
+        loaded_signature: str = LOADED_SOURCE_SIGNATURE,
+        signature_provider: Callable[[], str] = source_signature,
+    ) -> None:
         self.service = service
         self.worker_id = f"worker-{uuid.uuid4().hex}"
+        self.loaded_signature = loaded_signature
+        self.signature_provider = signature_provider
         self.max_parallel_jobs = max(
             2,
             service.config.worker.download_concurrency
@@ -31,13 +42,29 @@ class Worker:
 
     async def run_forever(self) -> None:
         self.service.database.recover_expired_jobs()
-        self.run_due_maintenance()
+        try:
+            self.run_due_maintenance()
+        except Exception as exc:  # Maintenance must not block capture queue availability.
+            sys.stderr.write(
+                f"抖库补偿维护执行失败，Worker 将继续处理采集任务：{type(exc).__name__}: {exc}\n"
+            )
         running: set[asyncio.Task] = set()
         while True:
             completed = {task for task in running if task.done()}
             for task in completed:
-                task.result()
+                try:
+                    task.result()
+                except Exception as exc:  # A single unexpected task must not stop the daemon.
+                    sys.stderr.write(
+                        f"抖库任务收尾失败，Worker 将继续运行：{type(exc).__name__}: {exc}\n"
+                    )
             running -= completed
+            if self.source_changed():
+                if running:
+                    await asyncio.wait(running, timeout=self.service.config.worker.poll_seconds)
+                    continue
+                sys.stderr.write("抖库代码已更新，Worker 正在退出并由 LaunchAgent 重启。\n")
+                return
             self.service.database.recover_expired_jobs()
             while len(running) < self.max_parallel_jobs:
                 job = self.service.database.claim_next_job(
@@ -52,6 +79,13 @@ class Worker:
                 await asyncio.wait(running, timeout=self.service.config.worker.poll_seconds)
             else:
                 await asyncio.sleep(self.service.config.worker.poll_seconds)
+
+    def source_changed(self) -> bool:
+        """Stop an installed daemon before it can claim jobs with stale code."""
+        try:
+            return self.signature_provider() != self.loaded_signature
+        except OSError:
+            return False
 
     async def _process_with_heartbeat(self, job):
         stop = asyncio.Event()

@@ -84,4 +84,4 @@ def test_initialize_migrates_chunks_with_image_index(tmp_path: Path) -> None:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(chunks)")}
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     assert "image_index" in columns
-    assert version == 5
+    assert version == 8

@@ -14,6 +14,7 @@ WORK_ID_PATTERNS = (
     re.compile(r"/(?:share/)?(?P<kind>video|note|gallery)/(?P<id>\d{10,})"),
     re.compile(r"[?&](?:aweme_id|item_id)=(?P<id>\d{10,})"),
 )
+CREATOR_PATH_PATTERN = re.compile(r"/user/(?P<sec_uid>[A-Za-z0-9_-]{8,256})")
 ALLOWED_HOST_SUFFIXES = ("douyin.com", "iesdouyin.com")
 
 
@@ -48,6 +49,13 @@ def extract_video_id(value: str) -> str | None:
     """Compatibility helper returning the Douyin work ID for any supported work."""
     identity = extract_work_identity(value)
     return identity[0] if identity else None
+
+
+def extract_creator_sec_uid(value: str) -> str | None:
+    """Return the stable creator sec_uid from a canonical Douyin user URL."""
+    if match := CREATOR_PATH_PATTERN.search(value):
+        return match.group("sec_uid")
+    return None
 
 
 def _resolved(
