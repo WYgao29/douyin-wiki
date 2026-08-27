@@ -1115,7 +1115,7 @@ class VaultWriter:
         card_lines = self._content_card_lines(
             user_times_to_beijing(analysis.content_card.model_dump(mode="json"))
         )
-        if card_lines:
+        if is_image_note and card_lines:
             card_heading = f"## 内容卡片 · {self._content_type_label(analysis.content_type)}"
             lines.extend(["", card_heading, ""])
             lines.extend(card_lines)
@@ -1129,26 +1129,51 @@ class VaultWriter:
                     f"![抖音图文第 {index} 张]({encode_markdown_path(Path(relative).as_posix())})"
                 )
 
-        if analysis.key_moments:
-            lines.extend(["", "## 关键片段", ""])
-            for moment in analysis.key_moments[:5]:
-                source = {
-                    "audio": "语音",
-                    "ocr": "画面",
-                    "audio+ocr": "语音+画面",
-                    "post_text": "作品正文",
-                    "image_ocr": "图片 OCR",
-                    "post_text+image_ocr": "作品正文+图片 OCR",
-                    "ai_inference": "AI 推断",
-                }[moment.evidence_type]
-                quote = f"；原话：{moment.quote}" if moment.quote else ""
-                locator = (
-                    f"第 {moment.image_index} 张"
-                    if moment.image_index is not None
-                    else format_timestamp(moment.timestamp_ms)
+        if analysis.chapters:
+            lines.extend(["", "## 时间轴图解", ""])
+            chapter_numbers = [
+                "一",
+                "二",
+                "三",
+                "四",
+                "五",
+                "六",
+                "七",
+                "八",
+                "九",
+                "十",
+                "十一",
+                "十二",
+            ]
+            for index, chapter in enumerate(analysis.chapters[:12]):
+                timestamp = format_timestamp(chapter.start_ms)
+                number = chapter_numbers[index]
+                lines.extend(
+                    [
+                        f"### ▶ {timestamp}　{number}、{chapter.title}",
+                        "",
+                        chapter.summary,
+                    ]
                 )
-                prefix = f"[{locator}] " if locator else ""
-                lines.append(f"- {prefix}**{moment.title}** — {moment.summary}（{source}{quote}）")
+                if chapter.key_points:
+                    lines.append("")
+                    lines.extend(f"- {point}" for point in chapter.key_points)
+                if chapter.comparison_table is not None:
+                    lines.extend(
+                        [
+                            "",
+                            *self._chapter_table_lines(
+                                chapter.comparison_table.headers,
+                                chapter.comparison_table.rows,
+                            ),
+                        ]
+                    )
+                lines.append("")
+
+        if not is_image_note and card_lines:
+            card_heading = f"## 内容卡片 · {self._content_type_label(analysis.content_type)}"
+            lines.extend(["", card_heading, ""])
+            lines.extend(card_lines)
 
         if analysis.actions or analysis.reminders:
             lines.extend(["", "## 下一步", ""])
@@ -1283,6 +1308,19 @@ class VaultWriter:
             else:
                 rendered = str(value)
             lines.append(f"- **{label}**：{rendered}")
+        return lines
+
+    @staticmethod
+    def _chapter_table_lines(headers: list[str], rows: list[list[str]]) -> list[str]:
+        def cell(value: str) -> str:
+            return str(value).replace("|", "\\|").replace("\n", "<br>")
+
+        rendered_headers = [cell(value) for value in headers]
+        lines = [
+            "| " + " | ".join(rendered_headers) + " |",
+            "| " + " | ".join("---" for _ in rendered_headers) + " |",
+        ]
+        lines.extend("| " + " | ".join(cell(value) for value in row) + " |" for row in rows)
         return lines
 
     def _ensure_link_page(

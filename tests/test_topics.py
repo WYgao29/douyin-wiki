@@ -18,13 +18,18 @@ def _analysis(title: str, statement: str, atom_id: str) -> dict:
         "takeaways": [statement],
         "content_type": "explanation",
         "content_card": {"kind": "explanation", "question": title},
-        "key_moments": [
+        "chapters": [
             {
-                "timestamp_ms": 5000,
+                "start_ms": 5000,
                 "title": title,
                 "summary": statement,
-                "quote": statement,
-                "evidence_type": "audio",
+                "evidence": [
+                    {
+                        "timestamp_ms": 5000,
+                        "quote": statement,
+                        "evidence_type": "audio",
+                    }
+                ],
             }
         ],
         "knowledge_atoms": [

@@ -38,7 +38,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.1"
+WEB_VERSION = "0.1.2"
 
 
 class CreateSessionRequest(BaseModel):

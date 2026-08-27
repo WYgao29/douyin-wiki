@@ -538,6 +538,14 @@ class DouyinWikiService:
                 "事实、数字、日期、参数和方法应写入 knowledge_atoms，"
                 "并尽可能带 quote，以及 timestamp_ms 或 image_index。",
                 *(
+                    [
+                        "视频必须按内容展开顺序生成时间轴图解 chapters；章节起点应定位主题开始，"
+                        "每章必须包含可核验的语音或画面证据。"
+                    ]
+                    if not is_image_note
+                    else ["静态图文没有视频时间轴，chapters 必须为空数组。"]
+                ),
+                *(
                     ["图文不得伪造 00:00 时间戳，必须用 image_index 定位原图。"]
                     if is_image_note
                     else []
@@ -969,7 +977,7 @@ class DouyinWikiService:
                 "summary": analysis.get("one_liner") or entry.summary,
                 "takeaways": analysis.get("takeaways", []),
                 "content_card": analysis.get("content_card", {}),
-                "key_moments": analysis.get("key_moments", []),
+                "chapters": analysis.get("chapters", []),
                 "knowledge_atoms": [
                     atom for atom in analysis.get("knowledge_atoms", []) if not atom.get("stale")
                 ],
@@ -983,7 +991,7 @@ class DouyinWikiService:
                     "inspirations": context["inspirations"][:3],
                     "summary": context["summary"],
                     "takeaways": context["takeaways"][:3],
-                    "key_moments": context["key_moments"][:3],
+                    "chapters": context["chapters"][:6],
                     "knowledge_atoms": context["knowledge_atoms"][:5],
                 }
             contexts.append(context)
@@ -2796,8 +2804,8 @@ class DouyinWikiService:
 
         def validate_item(item: Any, *, label: str, atom: bool = False) -> None:
             provenance = item.provenance if atom else item.evidence_type
-            timestamp_ms = item.timestamp_ms
-            image_index = item.image_index
+            timestamp_ms = getattr(item, "timestamp_ms", None)
+            image_index = getattr(item, "image_index", None)
             quote = item.quote
             if provenance not in allowed:
                 errors.append(f"{label} 使用了与作品类型不符的来源 {provenance}")
@@ -2843,8 +2851,20 @@ class DouyinWikiService:
                 if not normalized_quote or normalized_quote not in source:
                     errors.append(f"{label} 的引文无法在原始 ASR/OCR/正文中定位")
 
-        for index, moment in enumerate(analysis.key_moments, start=1):
-            validate_item(moment, label=f"关键片段 {index}")
+        if is_image_note and analysis.chapters:
+            errors.append("静态图文不能包含视频时间轴图解")
+        for index, chapter in enumerate(analysis.chapters, start=1):
+            if duration_ms and chapter.start_ms > duration_ms + 5000:
+                errors.append(f"时间轴章节 {index} 的开始时间超出视频时长")
+            if chapter.end_ms is not None and duration_ms and chapter.end_ms > duration_ms + 5000:
+                errors.append(f"时间轴章节 {index} 的结束时间超出视频时长")
+            if not chapter.evidence:
+                errors.append(f"时间轴章节 {index} 缺少可核验证据")
+            for evidence_index, evidence in enumerate(chapter.evidence, start=1):
+                validate_item(
+                    evidence,
+                    label=f"时间轴章节 {index} 证据 {evidence_index}",
+                )
         for index, atom in enumerate(analysis.knowledge_atoms, start=1):
             if atom.id in atom_ids:
                 errors.append(f"知识原子 id 重复：{atom.id}")

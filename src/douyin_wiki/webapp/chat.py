@@ -120,7 +120,7 @@ class ChatContextBuilder:
                     "inspirations": entry.get("inspirations", []),
                     "one_liner": analysis.get("one_liner") or entry.get("summary", ""),
                     "takeaways": analysis.get("takeaways", []),
-                    "key_moments": analysis.get("key_moments", []),
+                    "chapters": analysis.get("chapters", []),
                     "knowledge_atoms": [
                         atom
                         for atom in analysis.get("knowledge_atoms", [])

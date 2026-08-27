@@ -56,6 +56,8 @@ async def test_gateway_agent_handoff_completes_and_emits_routed_events(service) 
     assert context["gateway_context"]["conversation_id"] == "chat-42"
     assert context["inspirations_verbatim"][0]["text"] == "建立个人财经信息源筛选标准"
     assert context["analysis_schema"]["title"] == "AnalysisResultV2"
+    assert "chapters" in context["analysis_schema"]["properties"]
+    assert "key_moments" not in context["analysis_schema"]["properties"]
 
     corrected = service.submit_transcript_correction(
         job.id,

@@ -23,7 +23,6 @@ from douyin_wiki.models import (
     AnalysisResult,
     InspirationInput,
     JobStatus,
-    KeyMoment,
     KnowledgeAtom,
     OCRObservation,
     ReviewIssue,
@@ -143,15 +142,6 @@ class NoteAnalysis(AnalysisProvider):
                 "mechanism": ["位宽越低通常越省显存"],
                 "examples": [],
             },
-            key_moments=[
-                KeyMoment(
-                    image_index=2,
-                    title="显存选择",
-                    summary="第二张给出显存参考",
-                    quote=second_page,
-                    evidence_type="image_ocr",
-                )
-            ],
             knowledge_atoms=[
                 KnowledgeAtom(
                     id="format-choice",

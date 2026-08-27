@@ -1,6 +1,6 @@
 [project]
 name = "douyin-wiki"
-version = "0.1.1"
+version = "0.1.2"
 description = "抖库：面向 AI Agent 的本地抖音知识库"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"

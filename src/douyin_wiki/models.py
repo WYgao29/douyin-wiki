@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import AliasChoices, BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 class RetentionPolicy(StrEnum):
@@ -374,21 +374,46 @@ ContentCard = Annotated[
 ]
 
 
-class KeyMoment(BaseModel):
-    timestamp_ms: int | None = Field(default=None, ge=0)
-    image_index: int | None = Field(default=None, ge=1)
+class ChapterEvidence(BaseModel):
+    timestamp_ms: int = Field(ge=0)
+    quote: str = Field(min_length=1)
+    evidence_type: Literal["audio", "ocr", "audio+ocr"] = "audio"
+
+    @field_validator("quote")
+    @classmethod
+    def validate_quote(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("时间轴图解证据的引文不能为空")
+        return normalized
+
+
+class ChapterTable(BaseModel):
+    headers: list[str] = Field(min_length=2, max_length=6)
+    rows: list[list[str]] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_row_widths(self) -> ChapterTable:
+        expected = len(self.headers)
+        if any(len(row) != expected for row in self.rows):
+            raise ValueError("时间轴图解表格的每行列数必须与表头一致")
+        return self
+
+
+class TimelineChapter(BaseModel):
+    start_ms: int = Field(ge=0)
+    end_ms: int | None = Field(default=None, ge=0)
     title: str
     summary: str
-    quote: str | None = None
-    evidence_type: Literal[
-        "audio",
-        "ocr",
-        "audio+ocr",
-        "post_text",
-        "image_ocr",
-        "post_text+image_ocr",
-        "ai_inference",
-    ] = "audio"
+    key_points: list[str] = Field(default_factory=list, max_length=5)
+    comparison_table: ChapterTable | None = None
+    evidence: list[ChapterEvidence] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> TimelineChapter:
+        if self.end_ms is not None and self.end_ms <= self.start_ms:
+            raise ValueError("时间轴图解章节的结束时间必须晚于开始时间")
+        return self
 
 
 class KnowledgeAtom(BaseModel):
@@ -425,7 +450,7 @@ class AnalysisResultV2(BaseModel):
     content_type: ContentType = "other"
     facets: list[ContentFacet] = Field(default_factory=list)
     content_card: ContentCard = Field(default_factory=OtherCard)
-    key_moments: list[KeyMoment] = Field(default_factory=list, max_length=5)
+    chapters: list[TimelineChapter] = Field(default_factory=list, max_length=12)
     knowledge_atoms: list[KnowledgeAtom] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
@@ -492,23 +517,65 @@ class AnalysisResultV2(BaseModel):
                 for index, claim in enumerate(legacy_claims)
                 if claim.get("text")
             ]
-        if "key_moments" not in data:
-            atoms = [
-                item.model_dump(mode="python") if isinstance(item, BaseModel) else item
-                for item in data["knowledge_atoms"]
-            ]
-            data["key_moments"] = [
-                {
-                    "timestamp_ms": atom.get("timestamp_ms"),
-                    "image_index": atom.get("image_index"),
-                    "title": atom.get("statement", "")[:36],
-                    "summary": atom.get("statement", ""),
-                    "quote": atom.get("quote"),
-                    "evidence_type": atom.get("provenance", "audio"),
-                }
-                for atom in atoms
-                if atom.get("timestamp_ms") is not None or atom.get("image_index") is not None
-            ][:5]
+        legacy_moments = [
+            item.model_dump(mode="python") if isinstance(item, BaseModel) else item
+            for item in data.pop("key_moments", [])
+        ]
+        if "chapters" not in data and legacy_moments:
+            ordered = sorted(
+                (
+                    item
+                    for item in legacy_moments
+                    if isinstance(item, dict) and item.get("timestamp_ms") is not None
+                ),
+                key=lambda item: int(item["timestamp_ms"]),
+            )
+            chapters: list[dict[str, Any]] = []
+            for index, moment in enumerate(ordered):
+                timestamp_ms = int(moment["timestamp_ms"])
+                next_timestamp_candidate = (
+                    int(ordered[index + 1]["timestamp_ms"])
+                    if index + 1 < len(ordered)
+                    else None
+                )
+                next_timestamp = (
+                    next_timestamp_candidate
+                    if next_timestamp_candidate is not None
+                    and next_timestamp_candidate > timestamp_ms
+                    else None
+                )
+                evidence_type = moment.get("evidence_type", "audio")
+                quote = str(moment.get("quote") or "").strip()
+                evidence = []
+                if quote and evidence_type in {"audio", "ocr", "audio+ocr"}:
+                    evidence.append(
+                        {
+                            "timestamp_ms": timestamp_ms,
+                            "quote": quote,
+                            "evidence_type": evidence_type,
+                        }
+                    )
+                chapters.append(
+                    {
+                        "start_ms": timestamp_ms,
+                        "end_ms": next_timestamp,
+                        "title": moment.get("title", "章节"),
+                        "summary": moment.get("summary", ""),
+                        "key_points": [],
+                        "evidence": evidence,
+                    }
+                )
+            data["chapters"] = chapters[:12]
+        raw_chapters = data.get("chapters")
+        if isinstance(raw_chapters, list):
+            data["chapters"] = sorted(
+                raw_chapters,
+                key=lambda item: int(
+                    (item.model_dump(mode="python") if isinstance(item, BaseModel) else item).get(
+                        "start_ms", 0
+                    )
+                ),
+            )
         return data
 
     @model_validator(mode="after")

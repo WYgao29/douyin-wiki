@@ -22,13 +22,15 @@
 - 低置信片段暂停等待人工确认，长于 30 分钟的视频在消耗 AI token 前等待确认。
 - 生成不可变 `raw/` 记录、`wiki/sources/` 一屏精华页、隐藏机器侧车以及概念/实体 wikilink。
 - 自动分类教程、解释、观点、推荐、事件、案例、清单等内容并选择对应知识卡片。
+- 视频按内容展开顺序生成“时间轴图解”，以章节起点、摘要、要点和可选对比表完整整理内容；
+  不再输出零散的“关键片段”列表。
 - 优先保存抖音单独设置的视频封面，并在 `wiki/sources/` 主资料页中直接展示；
   没有独立封面时回退到原始封面或视频关键帧。
 - 使用 SQLite FTS5 + 本地 Embedding 返回带原作品链接，以及时间戳或图片编号的证据包。
 - 优先索引带上下文、时间戳、原文和来源类型的 `knowledge_atoms`。
 - 用户确认后创建 macOS 提醒事项。
 - 每周标记过期内容、检查孤立页面，并把到期媒体移入系统废纸篓。
-- Web v0.1.1 动态读取 Vault，以封面资料库和文章页供用户浏览，并提供带证据引用的本地 AI 对话。
+- Web v0.1.2 动态读取 Vault，以封面资料库和文章页供用户浏览，并提供带证据引用的本地 AI 对话。
 
 ## 安装
 
@@ -339,7 +341,7 @@ uv run douyin-wiki service uninstall
 常驻 Worker 会检测本地程序文件是否已更新：停止领取新任务，等待正在处理的任务结束后退出，
 再由 LaunchAgent 自动启动新进程，避免更新前的旧代码处理新任务。
 
-## Web v0.1.1
+## Web v0.1.2
 
 Web 页面动态扫描 `wiki/sources/` 和 `creators/*/sources/`，不为每篇资料生成或维护单独的
 HTML 文件。新文章入库或已有文章更新后，文件监听器会刷新资料库；`raw/`、`.data/`、日志和
@@ -425,7 +427,7 @@ uv build
 
 ```bash
 python3.12 -m venv /tmp/douku-release-check
-/tmp/douku-release-check/bin/pip install dist/douyin_wiki-0.1.1-py3-none-any.whl
+/tmp/douku-release-check/bin/pip install dist/douyin_wiki-0.1.2-py3-none-any.whl
 /tmp/douku-release-check/bin/douyin-wiki --help
 ```
 
@@ -435,6 +437,6 @@ python3.12 -m venv /tmp/douku-release-check
 ## 当前边界
 
 仅支持本地 macOS 单用户和抖音来源。图文第一版支持静态单图和多图，检测到 Live Photo 会
-明确报错而不会静默丢弃动态内容。Web v0.1.1 仅绑定本机回环地址，内部接口不作为远程公共 API。
+明确报错而不会静默丢弃动态内容。Web v0.1.2 仅绑定本机回环地址，内部接口不作为远程公共 API。
 不包含移动端分享菜单、公网或局域网服务、SaaS、多用户权限、远程同步或自动 Git 推送。
 抖音页面与 cookie 规则可能变化，下载错误会保留稳定错误码和原始诊断信息。

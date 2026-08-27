@@ -19,7 +19,7 @@ from ..models import (
 )
 from ..secrets import get_secret
 
-PROMPT_VERSION = "v2.1-image-note"
+PROMPT_VERSION = "v2.2-timeline-chapters"
 
 
 class AnalysisProvider(ABC):
@@ -291,9 +291,12 @@ counterpoints)；recommendation(subjects, criteria, pros, cons, best_for)；news
 absolute_time, impact, actions, valid_until)；
 story_case(context, turning_points, outcome, lessons)；
 collection(items[{name,traits,scenarios}])；other(notes)。
-one_liner 不超过 120 个中文字符；takeaways 输出 3–5 条；key_moments 输出 3–5 条，每条必须有
-timestamp_ms（图文为 null）、image_index（视频为 null）、title、summary、quote（可空）和
-evidence_type(audio/ocr/audio+ocr/post_text/image_ocr/post_text+image_ocr/ai_inference)。
+one_liner 不超过 120 个中文字符；takeaways 输出 3–5 条。视频必须输出 chapters 时间轴图解，按
+内容实际展开顺序完整覆盖有信息量的部分，通常 4–10 章，不要只挑结论片段。每章包含 start_ms、
+end_ms、title、summary、key_points，以及可选 comparison_table{headers,rows}；章节标题应概括主题，
+start_ms 应定位主题开始处而不是结论出现处。每章 evidence 输出 1–6 条可核验依据，每条包含
+timestamp_ms、quote 和 evidence_type(audio/ocr/audio+ocr)。只有画面存在清晰、结构化对比数据时才
+生成 comparison_table，不得根据推断补表。静态图文没有视频时间轴，chapters 必须为空数组。
 knowledge_atoms 把可检索知识拆成原子，字段为 id、statement、atom_type、provenance、timestamp_ms、
 image_index、quote、context、confidence、valid_until、review_after、stale。事实、数字、日期、参数和
 方法必须尽可能带时间戳或图片编号和原文；AI 推断必须使用 provenance=ai_inference，且不得伪装成
@@ -303,7 +306,7 @@ metadata.existing_knowledge 是从本地知识库召回的既有主张；只有�
 contradictions，必须引用其中真实存在的 entry_id/claim_id，保留双方来源，不要擅自裁决或覆盖。
 日期、促销、活动或待办放入 reminders；不能确定绝对时间时 due_at=null、needs_clarification=true。
 输出一个 JSON 对象，字段必须兼容：title, analysis_version=2, one_liner,
-relevance_to_inspiration, takeaways[], content_type, facets[], content_card, key_moments[],
+relevance_to_inspiration, takeaways[], content_type, facets[], content_card, chapters[],
 knowledge_atoms[], actions[], open_questions[], tags[], concepts[],
 entities[{name,kind,description}],
 contradictions[{id,claim_id,conflicts_with_entry_id,conflicts_with_claim_id,reason,confidence,status}],

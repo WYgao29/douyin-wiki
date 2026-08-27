@@ -5,7 +5,7 @@ import copy
 import pytest
 
 from douyin_wiki.errors import JobStateError
-from douyin_wiki.models import AnalysisMode, JobStatus
+from douyin_wiki.models import AnalysisMode, AnalysisResult, JobStatus
 from douyin_wiki.vault import encode_markdown_path
 from douyin_wiki.worker import Worker
 
@@ -20,27 +20,36 @@ def analysis_payload(kind: str, card: dict) -> dict:
         "content_type": kind,
         "facets": ["comparison"] if kind in {"tutorial", "recommendation"} else [],
         "content_card": {"kind": kind, **card},
-        "key_moments": [
+        "chapters": [
             {
-                "timestamp_ms": 5000,
-                "title": "关键参数",
-                "summary": "视频在这里给出关键参数。",
-                "quote": "筛选信息源要看它能否提供一手证据",
-                "evidence_type": "audio",
+                "start_ms": 0,
+                "end_ms": 5000,
+                "title": "问题背景",
+                "summary": "视频先说明筛选财经信息源的目标。",
+                "key_points": ["减少噪声", "保留一手证据"],
+                "evidence": [
+                    {
+                        "timestamp_ms": 0,
+                        "quote": "财经媒体筛选",
+                        "evidence_type": "ocr",
+                    }
+                ],
             },
             {
-                "timestamp_ms": 0,
-                "title": "画面补充",
-                "summary": "字幕补充了操作条件。",
-                "quote": "财经媒体筛选",
-                "evidence_type": "ocr",
-            },
-            {
-                "timestamp_ms": 5000,
-                "title": "方法结论",
+                "start_ms": 5000,
+                "title": "筛选方法",
                 "summary": "作者总结适用场景。",
-                "quote": "筛选信息源要看它能否提供一手证据",
-                "evidence_type": "audio+ocr",
+                "comparison_table": {
+                    "headers": ["标准", "要求"],
+                    "rows": [["证据", "提供一手证据"]],
+                },
+                "evidence": [
+                    {
+                        "timestamp_ms": 5000,
+                        "quote": "筛选信息源要看它能否提供一手证据",
+                        "evidence_type": "audio+ocr",
+                    }
+                ],
             },
         ],
         "knowledge_atoms": [
@@ -86,6 +95,79 @@ def test_markdown_path_encodes_obsidian_unsafe_filename_characters() -> None:
     assert encoded == "../../raw/%E6%89%8B%E5%86%B2%20%E5%92%96%E5%95%A1%3F%21%F0%9F%8F%86.md"
 
 
+def test_analysis_schema_replaces_key_moments_with_timeline_chapters() -> None:
+    schema = AnalysisResult.model_json_schema()
+    assert "chapters" in schema["properties"]
+    assert "key_moments" not in schema["properties"]
+
+
+def test_legacy_key_moments_upgrade_to_timeline_chapters() -> None:
+    result = AnalysisResult.model_validate(
+        {
+            "title": "旧分析",
+            "key_moments": [
+                {
+                    "timestamp_ms": 5000,
+                    "title": "旧片段",
+                    "summary": "旧片段摘要",
+                    "quote": "筛选信息源要看它能否提供一手证据",
+                    "evidence_type": "audio",
+                }
+            ],
+        }
+    )
+    assert len(result.chapters) == 1
+    assert result.chapters[0].start_ms == 5000
+    assert result.chapters[0].title == "旧片段"
+    assert result.chapters[0].evidence[0].quote == "筛选信息源要看它能否提供一手证据"
+
+
+def test_legacy_key_moments_with_duplicate_timestamps_remain_readable() -> None:
+    result = AnalysisResult.model_validate(
+        {
+            "title": "旧分析",
+            "key_moments": [
+                {
+                    "timestamp_ms": 5000,
+                    "title": "语音结论",
+                    "summary": "语音摘要",
+                    "quote": "筛选信息源要看它能否提供一手证据",
+                    "evidence_type": "audio",
+                },
+                {
+                    "timestamp_ms": 5000,
+                    "title": "画面补充",
+                    "summary": "画面摘要",
+                    "quote": "财经媒体筛选",
+                    "evidence_type": "ocr",
+                },
+            ],
+        }
+    )
+    assert len(result.chapters) == 2
+    assert all(chapter.start_ms == 5000 for chapter in result.chapters)
+    assert all(chapter.end_ms is None for chapter in result.chapters)
+
+
+def test_timeline_chapter_evidence_rejects_blank_quote() -> None:
+    with pytest.raises(ValueError, match="引文不能为空"):
+        AnalysisResult.model_validate(
+            {
+                "title": "无效分析",
+                "chapters": [
+                    {
+                        "start_ms": 0,
+                        "title": "章节",
+                        "summary": "摘要",
+                        "evidence": [
+                            {"timestamp_ms": 0, "quote": "   ", "evidence_type": "audio"}
+                        ],
+                    }
+                ],
+            }
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("kind", "card", "label"), CARD_CASES)
 async def test_v2_adaptive_cards_are_compact(service, kind, card, label) -> None:
@@ -103,7 +185,11 @@ async def test_v2_adaptive_cards_are_compact(service, kind, card, label) -> None
     assert "## 摘要" not in body
     assert "## AI 判断" not in body
     assert "## 维护建议" not in body
-    assert len(body.splitlines()) <= 50
+    assert "## 时间轴图解" in body
+    assert "## 关键片段" not in body
+    assert "### ▶ 00:00\u3000一、问题背景" in body
+    assert "| 标准 | 要求 |" in body
+    assert len(body.splitlines()) <= 70
 
 
 @pytest.mark.asyncio
@@ -129,6 +215,16 @@ async def test_analysis_rejects_untraceable_quote_and_locator(service) -> None:
     payload["knowledge_atoms"][0]["quote"] = "作品中从未出现的参数"
     payload["knowledge_atoms"][0]["timestamp_ms"] = 55000
     with pytest.raises(JobStateError, match="分析证据校验失败"):
+        service.submit_analysis(completed.result["entry_id"], payload, producer="test-agent")
+
+
+@pytest.mark.asyncio
+async def test_analysis_rejects_ungrounded_timeline_chapter(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    payload = analysis_payload("tutorial", {"goal": "测试章节证据"})
+    payload["chapters"][0]["evidence"] = []
+    with pytest.raises(JobStateError, match="时间轴章节 1 缺少可核验证据"):
         service.submit_analysis(completed.result["entry_id"], payload, producer="test-agent")
 
 
