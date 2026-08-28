@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic, sleep
 
+import pytest
 from fastapi.testclient import TestClient
 
 from douyin_wiki.config import AppConfig, load_config
-from douyin_wiki.models import EntryRecord, RetentionPolicy
+from douyin_wiki.errors import EntryNotFoundError
+from douyin_wiki.models import EntryRecord, InspirationInput, RetentionPolicy
 from douyin_wiki.service import DouyinWikiService
 from douyin_wiki.webapp.app import create_app
 from douyin_wiki.webapp.chat import ChatChunk
@@ -66,6 +69,13 @@ def _web_fixture(tmp_path: Path) -> tuple[AppConfig, DouyinWikiService]:
     raw_dir.mkdir(parents=True)
     data_dir.mkdir(parents=True)
     (raw_dir / "cover.webp").write_bytes(b"RIFFfakeWEBP")
+    (vault / "raw" / "测试记录.md").write_text("原始记录", encoding="utf-8")
+    image_dir = vault / "raw" / "images" / "123"
+    image_dir.mkdir(parents=True)
+    (image_dir / "001.webp").write_bytes(b"RIFFfakeIMAGE")
+    cover_dir = vault / "raw" / "covers"
+    cover_dir.mkdir(parents=True)
+    (cover_dir / "123.jpg").write_bytes(b"fakeJPEG")
     source = source_dir / "测试文章_123.md"
     source.write_text(
         """---
@@ -136,6 +146,14 @@ inspirations:
     service.database.upsert_entry(
         entry,
         {
+            "metadata": {
+                "video_id": "123",
+                "original_url": "https://www.douyin.com/video/123",
+                "canonical_url": "https://www.douyin.com/video/123",
+                "title": "测试文章",
+                "author": "测试博主",
+                "source_kind": "video",
+            },
             "analysis": {
                 "analysis_version": 2,
                 "title": "测试文章",
@@ -201,6 +219,9 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'id="chat-close"' in page.text
         assert 'id="applied-filters"' in page.text
         assert 'id="command-dialog"' in page.text
+        assert 'id="trash-nav"' in page.text
+        assert 'id="trash-view"' in page.text
+        assert 'id="destructive-dialog"' in page.text
         assert "/static/icons.svg#" in page.text
         assert "cdn." not in page.text
 
@@ -235,7 +256,263 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "image.width = 900" not in script.text
         assert "image.height = 560" not in script.text
         assert "animatedEntryIds" in script.text
+        assert "删除文章" in script.text
+        assert "彻底删除" in script.text
         assert "最近一次用量：${latestAssistant.total_tokens} token" in script.text
+
+
+def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(
+        config,
+        service=service,
+        chat_provider=FakeChatProvider(),
+        start_watcher=False,
+    )
+    source = config.vault_path / "wiki" / "sources" / "测试文章_123.md"
+    assets = config.vault_path / "raw" / "assets" / "123"
+    images = config.vault_path / "raw" / "images" / "123"
+    cover = config.vault_path / "raw" / "covers" / "123.jpg"
+    raw_record = config.vault_path / "raw" / "测试记录.md"
+    machine = config.vault_path / "wiki" / ".data" / "sources" / "123.md"
+    source_before = source.read_bytes()
+    machine_before = machine.read_bytes()
+    with TestClient(app) as client:
+        topic_id = service.create_topic(
+            "删除恢复测试", ["dy-123"], goal="验证专题来源恢复"
+        )["topic"]["id"]
+        session_id = client.post(
+            "/api/chat/sessions",
+            json={"scope": "entry", "context_entry_id": "dy-123"},
+        ).json()["id"]
+        rejected = client.request(
+            "DELETE", "/api/articles/dy-123", json={"confirmed": False}
+        )
+        assert rejected.status_code == 400
+
+        deleted = client.request(
+            "DELETE", "/api/articles/dy-123", json={"confirmed": True}
+        )
+        assert deleted.status_code == 200
+        trash_id = deleted.json()["trash_id"]
+        assert client.get("/api/library").json()["total"] == 0
+        assert service.database.list_entries() == []
+        assert not source.exists()
+        assert not assets.exists()
+        assert not images.exists()
+        assert not cover.exists()
+        assert not raw_record.exists()
+        assert not machine.exists()
+        assert service.database.get_topic(topic_id).sources == []
+        deleted_session = service.database.get_chat_session(session_id)
+        assert deleted_session.scope == "library"
+        assert deleted_session.context_entry_id is None
+        trash = client.get("/api/trash").json()
+        assert trash["total"] == 1
+        assert trash["items"][0]["title"] == "测试文章"
+        assert client.get("/trash").status_code == 200
+
+        restored = client.post(
+            f"/api/trash/{trash_id}/restore", json={"confirmed": True}
+        )
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["entry_id"] == "dy-123"
+        assert client.get("/api/library").json()["total"] == 1
+        assert source.is_file()
+        assert assets.is_dir()
+        assert images.is_dir()
+        assert cover.is_file()
+        assert raw_record.is_file()
+        assert machine.is_file()
+        assert source.read_bytes() == source_before
+        assert machine.read_bytes() == machine_before
+        assert [
+            item.entry_id for item in service.database.get_topic(topic_id).sources
+        ] == ["dy-123"]
+        restored_session = service.database.get_chat_session(session_id)
+        assert restored_session.scope == "entry"
+        assert restored_session.context_entry_id == "dy-123"
+        assert client.get("/api/trash").json()["total"] == 0
+
+        deleted_again = client.request(
+            "DELETE", "/api/articles/dy-123", json={"confirmed": True}
+        ).json()
+        trash_id = deleted_again["trash_id"]
+        rejected_purge = client.request(
+            "DELETE", f"/api/trash/{trash_id}", json={"confirmed": False}
+        )
+        assert rejected_purge.status_code == 400
+        purged = client.request(
+            "DELETE", f"/api/trash/{trash_id}", json={"confirmed": True}
+        )
+        assert purged.status_code == 200
+        assert purged.json()["status"] == "已彻底删除"
+        assert not (
+            config.vault_path / ".douyin-wiki" / "trash" / "entries" / trash_id
+        ).exists()
+        assert client.get("/api/trash").json()["total"] == 0
+        invalid = client.request(
+            "DELETE", "/api/trash/not-a-valid-id", json={"confirmed": True}
+        )
+        assert invalid.status_code == 400
+
+
+def test_interrupted_delete_is_rolled_back_on_recovery(tmp_path: Path, monkeypatch) -> None:
+    config, service = _web_fixture(tmp_path)
+    source = config.vault_path / "wiki" / "sources" / "测试文章_123.md"
+    original_delete = service.database.delete_entry_projection
+
+    def interrupt_delete(entry_id: str):
+        raise SystemExit(entry_id)
+
+    monkeypatch.setattr(service.database, "delete_entry_projection", interrupt_delete)
+    with pytest.raises(SystemExit):
+        service.trash_entry("dy-123", confirmed=True)
+
+    assert not source.exists()
+    assert service.database.get_entry("dy-123").id == "dy-123"
+    manifests = list(
+        (config.vault_path / ".douyin-wiki" / "trash" / "entries").glob(
+            "*/manifest.json"
+        )
+    )
+    assert len(manifests) == 1
+    assert '"phase": "files_moved"' in manifests[0].read_text(encoding="utf-8")
+
+    monkeypatch.setattr(service.database, "delete_entry_projection", original_delete)
+    report = service.recover_entry_trash_operations()
+    assert report["recovered"]
+    assert source.is_file()
+    assert service.list_trashed_entries() == []
+
+
+def test_interrupted_restore_is_completed_without_ghost_trash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    deleted = service.trash_entry("dy-123", confirmed=True)
+    original_write = service._write_trash_manifest
+
+    def interrupt_after_database_restore(item_dir: Path, manifest: dict) -> None:
+        if manifest.get("phase") == "restored":
+            raise SystemExit("模拟恢复完成后的进程中断")
+        original_write(item_dir, manifest)
+
+    monkeypatch.setattr(
+        service, "_write_trash_manifest", interrupt_after_database_restore
+    )
+    with pytest.raises(SystemExit):
+        service.restore_trashed_entry(deleted["trash_id"], confirmed=True)
+
+    assert service.database.get_entry("dy-123").id == "dy-123"
+    assert (config.vault_path / "wiki" / "sources" / "测试文章_123.md").is_file()
+    item_dir = (
+        config.vault_path
+        / ".douyin-wiki"
+        / "trash"
+        / "entries"
+        / deleted["trash_id"]
+    )
+    assert item_dir.is_dir()
+
+    monkeypatch.setattr(service, "_write_trash_manifest", original_write)
+    report = service.recover_entry_trash_operations()
+    assert deleted["trash_id"] in report["completed"]
+    assert service.list_trashed_entries() == []
+    assert not item_dir.exists()
+
+
+def test_delete_lock_prevents_stale_writer_from_resurrecting_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _config, service = _web_fixture(tmp_path)
+    finalizing = threading.Event()
+    release = threading.Event()
+    writer_started = threading.Event()
+    errors: list[Exception] = []
+    original_finalize = service._finalize_deleted_entry
+
+    def blocking_finalize(*args, **kwargs):
+        finalizing.set()
+        assert release.wait(timeout=3)
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_finalize_deleted_entry", blocking_finalize)
+
+    delete_thread = threading.Thread(
+        target=lambda: service.trash_entry("dy-123", confirmed=True), daemon=True
+    )
+
+    def add_inspiration() -> None:
+        writer_started.set()
+        try:
+            service.add_inspiration("dy-123", InspirationInput(text="并发灵感"))
+        except Exception as exc:
+            errors.append(exc)
+
+    delete_thread.start()
+    assert finalizing.wait(timeout=3)
+    writer_thread = threading.Thread(target=add_inspiration, daemon=True)
+    writer_thread.start()
+    assert writer_started.wait(timeout=1)
+    sleep(0.05)
+    assert writer_thread.is_alive()
+    release.set()
+    delete_thread.join(timeout=3)
+    writer_thread.join(timeout=3)
+
+    assert not delete_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert any(isinstance(error, EntryNotFoundError) for error in errors)
+    with pytest.raises(EntryNotFoundError):
+        service.database.get_entry("dy-123")
+
+
+def test_secondary_delete_and_restore_failures_return_success_with_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _config, service = _web_fixture(tmp_path)
+    topic_id = service.create_topic("次要更新失败", ["dy-123"])["topic"]["id"]
+    monkeypatch.setattr(
+        service.vault,
+        "rebuild_index",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("索引故障")),
+    )
+    deleted = service.trash_entry("dy-123", confirmed=True)
+    assert deleted["warnings"]
+    with pytest.raises(EntryNotFoundError):
+        service.database.get_entry("dy-123")
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        service,
+        "_persist_topic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("专题故障")),
+    )
+    restored = service.restore_trashed_entry(deleted["trash_id"], confirmed=True)
+    assert restored["status"] == "已恢复"
+    assert any("专题" in warning for warning in restored["warnings"])
+    assert service.database.get_entry("dy-123").id == "dy-123"
+    assert service.database.get_topic(topic_id).sources[0].entry_id == "dy-123"
+    assert service.list_trashed_entries() == []
+
+
+def test_web_delete_survives_catalog_refresh_failure(tmp_path: Path, monkeypatch) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+    monkeypatch.setattr(
+        app.state.catalog,
+        "refresh",
+        lambda: (_ for _ in ()).throw(RuntimeError("目录故障")),
+    )
+    with TestClient(app) as client:
+        response = client.request(
+            "DELETE", "/api/articles/dy-123", json={"confirmed": True}
+        )
+    assert response.status_code == 200
+    assert any("网页目录刷新失败" in item for item in response.json()["warnings"])
+    with pytest.raises(EntryNotFoundError):
+        service.database.get_entry("dy-123")
 
 
 def test_topic_web_flow_strict_chat_artifacts_and_note_confirmation(tmp_path: Path) -> None:
@@ -313,7 +590,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.1.2" in page.text
+        assert "/static/model-settings.js?v=0.1.3" in page.text
         assert "settings-info-panel" not in page.text
 
 

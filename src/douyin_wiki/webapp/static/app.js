@@ -33,6 +33,7 @@ const state = {
   currentEntry: document.body.dataset.entryId || "",
   currentTopic: document.body.dataset.topicId || "",
   topics: [],
+  trashItems: [],
   topicSelectionMode: false,
   selectedEntryIds: new Set(),
   currentSession: "",
@@ -46,6 +47,7 @@ const state = {
   libraryLoaded: false,
   catalogHasItems: false,
   animatedEntryIds: new Set(),
+  destructiveAction: null,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -155,6 +157,52 @@ async function api(url, options = {}) {
     throw new Error(detail || "请求失败");
   }
   return response.json();
+}
+
+function openDestructiveDialog({title, description, confirmLabel, action, onSuccess, successMessage}) {
+  state.destructiveAction = {action, onSuccess, successMessage};
+  $("#destructive-title").textContent = title;
+  $("#destructive-description").textContent = description;
+  $("#confirm-destructive").textContent = confirmLabel;
+  $("#confirm-destructive").disabled = false;
+  $("#destructive-error").classList.add("hidden");
+  $("#destructive-dialog").showModal();
+  $("#confirm-destructive").focus();
+}
+
+async function runDestructiveAction() {
+  if (!state.destructiveAction) return;
+  const button = $("#confirm-destructive");
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "处理中…";
+  $("#destructive-error").classList.add("hidden");
+  try {
+    const pending = state.destructiveAction;
+    const result = await pending.action();
+    state.destructiveAction = null;
+    $("#destructive-dialog").close();
+    const warning = result?.warnings?.[0];
+    toast(warning ? `${pending.successMessage || "操作已完成"}；${warning}` : (pending.successMessage || "操作已完成"));
+    try {
+      await pending.onSuccess?.(result);
+    } catch (error) {
+      toast(`操作已完成，但页面刷新失败：${error.message}`);
+    }
+  } catch (error) {
+    $("#destructive-error").textContent = error.message;
+    $("#destructive-error").classList.remove("hidden");
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
+}
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
 function toggleListValue(key, value) {
@@ -280,6 +328,7 @@ function renderFilters() {
   $("#inspiration-only").checked = state.inspirationOnly;
   $$(".nav-item[data-section]").forEach((node) => node.classList.toggle("active", node.dataset.section === state.section));
   $("#topics-nav").classList.remove("active");
+  $("#trash-nav").classList.remove("active");
   $$(".saved-view-button").forEach((node) => node.classList.toggle(
     "active", state.sources.length === 1 && state.sources[0] === node.dataset.savedView,
   ));
@@ -631,8 +680,10 @@ function showLibrary(push = true) {
   $("#article-view").classList.add("hidden");
   $("#topics-view").classList.add("hidden");
   $("#topic-view").classList.add("hidden");
+  $("#trash-view").classList.add("hidden");
   $("#library-view").classList.remove("hidden");
   $("#topics-nav").classList.remove("active");
+  $("#trash-nav").classList.remove("active");
   if (push) history.pushState({}, "", currentLibraryURL());
   document.title = "资料库 · 抖库";
   renderLibrary();
@@ -686,12 +737,112 @@ async function showTopics(push = true) {
   $("#library-view").classList.add("hidden");
   $("#article-view").classList.add("hidden");
   $("#topic-view").classList.add("hidden");
+  $("#trash-view").classList.add("hidden");
   $("#topics-view").classList.remove("hidden");
   $$(".nav-item[data-section]").forEach((node) => node.classList.remove("active"));
   $("#topics-nav").classList.add("active");
+  $("#trash-nav").classList.remove("active");
   if (push) history.pushState({}, "", "/topics");
   document.title = "专题 · 抖库";
   await loadTopics();
+  updateChatContext();
+  closeDrawers();
+}
+
+async function loadTrash() {
+  const data = await api("/api/trash");
+  state.trashItems = data.items || [];
+  renderTrash();
+  return state.trashItems;
+}
+
+function renderTrash() {
+  const root = $("#trash-list");
+  $("#trash-count").textContent = `${state.trashItems.length} 条资料`;
+  if (!state.trashItems.length) {
+    const empty = document.createElement("section");
+    empty.className = "empty-state";
+    empty.append(svgIcon("trash-2"));
+    const title = document.createElement("h2");
+    title.textContent = "废纸篓是空的";
+    const copy = document.createElement("p");
+    copy.textContent = "从文章页面删除的资料会暂存在这里。";
+    empty.append(title, copy);
+    root.replaceChildren(empty);
+    return;
+  }
+  root.replaceChildren(...state.trashItems.map((item) => {
+    const row = document.createElement("article");
+    row.className = "trash-item";
+    const icon = document.createElement("span");
+    icon.className = "trash-item-icon";
+    icon.append(svgIcon(item.source_kind === "image_note" ? "image" : "video"));
+    const copy = document.createElement("div");
+    copy.className = "trash-item-copy";
+    const title = document.createElement("h2");
+    title.textContent = item.title;
+    const meta = document.createElement("p");
+    meta.textContent = `${item.author || "未知作者"} · 删除于 ${item.deleted_display || "时间未知"} · ${formatBytes(item.size_bytes)}`;
+    copy.append(title, meta);
+    const actions = document.createElement("div");
+    actions.className = "trash-item-actions";
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "secondary-button";
+    restore.append(svgIcon("rotate-ccw"), document.createTextNode("恢复"));
+    restore.addEventListener("click", () => openDestructiveDialog({
+      title: "恢复这条资料？",
+      description: `将恢复《${item.title}》的文章、原始记录、视频或图片，并重新加入检索和相关专题。`,
+      confirmLabel: "确认恢复",
+      action: async () => {
+        return api(`/api/trash/${encodeURIComponent(item.trash_id)}/restore`, {
+          method: "POST", body: JSON.stringify({confirmed: true}),
+        });
+      },
+      successMessage: "资料已恢复",
+      onSuccess: async (result) => {
+        await Promise.all([loadTrash(), loadLibrary({showLoading: false}), loadTopics()]);
+        await openArticle(result.entry_id);
+      },
+    }));
+    const purge = document.createElement("button");
+    purge.type = "button";
+    purge.className = "danger-text-button";
+    purge.append(svgIcon("trash-2"), document.createTextNode("彻底删除"));
+    purge.addEventListener("click", () => openDestructiveDialog({
+      title: "彻底删除这条资料？",
+      description: `《${item.title}》及其 ${formatBytes(item.size_bytes)} 本地文件将被永久删除，无法通过抖库恢复；Markdown 可能仍存在于 Git 历史中。`,
+      confirmLabel: "彻底删除",
+      action: async () => {
+        return api(`/api/trash/${encodeURIComponent(item.trash_id)}`, {
+          method: "DELETE", body: JSON.stringify({confirmed: true}),
+        });
+      },
+      successMessage: "资料已彻底删除",
+      onSuccess: async () => {
+        await loadTrash();
+      },
+    }));
+    actions.append(restore, purge);
+    row.append(icon, copy, actions);
+    return row;
+  }));
+}
+
+async function showTrash(push = true) {
+  state.currentEntry = "";
+  state.currentTopic = "";
+  state.topicSelectionMode = false;
+  $("#library-view").classList.add("hidden");
+  $("#article-view").classList.add("hidden");
+  $("#topics-view").classList.add("hidden");
+  $("#topic-view").classList.add("hidden");
+  $("#trash-view").classList.remove("hidden");
+  $$(".nav-item").forEach((node) => node.classList.remove("active"));
+  $("#trash-nav").classList.add("active");
+  if (push) history.pushState({}, "", "/trash");
+  document.title = "废纸篓 · 抖库";
+  await loadTrash();
   updateChatContext();
   closeDrawers();
 }
@@ -835,9 +986,11 @@ async function openTopic(topicId, push = true) {
     $("#library-view").classList.add("hidden");
     $("#article-view").classList.add("hidden");
     $("#topics-view").classList.add("hidden");
+    $("#trash-view").classList.add("hidden");
     $("#topic-view").classList.remove("hidden");
     $$(".nav-item[data-section]").forEach((node) => node.classList.remove("active"));
     $("#topics-nav").classList.add("active");
+    $("#trash-nav").classList.remove("active");
     if (push) history.pushState({topicId}, "", `/topics/${encodeURIComponent(topicId)}`);
     document.title = `${value.topic.title} · 抖库`;
     await loadTopics();
@@ -884,6 +1037,8 @@ function makeArticleHeader(item) {
     });
     copy.append(tags);
   }
+  const actions = document.createElement("div");
+  actions.className = "article-actions";
   if (item.original_url) {
     const source = document.createElement("a");
     source.className = "article-source-link";
@@ -891,8 +1046,30 @@ function makeArticleHeader(item) {
     source.target = "_blank";
     source.rel = "noopener noreferrer";
     source.append(document.createTextNode("打开原作品"), svgIcon("external-link"));
-    copy.append(source);
+    actions.append(source);
   }
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "danger-text-button article-delete-button";
+  remove.append(svgIcon("trash-2"), document.createTextNode("删除文章"));
+  remove.addEventListener("click", () => openDestructiveDialog({
+    title: "删除整条资料？",
+    description: `《${item.title}》的文章、原始记录、机器数据、视频、图片和封面将移入抖库废纸篓，并从检索与专题中移除。`,
+    confirmLabel: "移到废纸篓",
+    action: async () => {
+      return api(`/api/articles/${encodeURIComponent(item.entry_id)}`, {
+        method: "DELETE", body: JSON.stringify({confirmed: true}),
+      });
+    },
+    successMessage: "资料已移到废纸篓",
+    onSuccess: async () => {
+      state.currentEntry = "";
+      await Promise.all([loadLibrary({showLoading: false}), loadTopics(), loadTrash()]);
+      showLibrary();
+    },
+  }));
+  actions.append(remove);
+  copy.append(actions);
   hero.append(copy);
   return hero;
 }
@@ -913,6 +1090,7 @@ function renderArticleData(data, entryId, push) {
   $("#library-view").classList.add("hidden");
   $("#topics-view").classList.add("hidden");
   $("#topic-view").classList.add("hidden");
+  $("#trash-view").classList.add("hidden");
   $("#article-view").classList.remove("hidden");
   if (push) history.pushState({entryId}, "", `/articles/${encodeURIComponent(entryId)}`);
   document.title = `${data.item.title} · 抖库`;
@@ -1587,6 +1765,7 @@ function bindEvents() {
     writeStateToURL("push");
   }));
   $("#topics-nav").addEventListener("click", () => showTopics());
+  $("#trash-nav").addEventListener("click", () => showTrash());
   $("#topic-select-toggle").addEventListener("click", () => {
     if (!state.topicSelectionMode) {
       state.topicSelectionMode = true;
@@ -1713,6 +1892,13 @@ function bindEvents() {
     if (!$("#inspiration-form").reportValidity()) return;
     saveInspiration();
   });
+  $("#confirm-destructive").addEventListener("click", (event) => {
+    event.preventDefault();
+    runDestructiveAction();
+  });
+  $("#destructive-dialog").addEventListener("close", () => {
+    if ($("#destructive-dialog").returnValue === "cancel") state.destructiveAction = null;
+  });
   $("#inspiration-dialog").addEventListener("close", () => state.lastDialogTrigger?.focus());
   $("#command-input").addEventListener("input", () => { state.commandIndex = 0; renderCommandResults(); });
   $("#command-input").addEventListener("keydown", (event) => {
@@ -1733,6 +1919,7 @@ function bindEvents() {
     if (match) openArticle(decodeURIComponent(match[1]), false);
     else if (topicMatch) openTopic(decodeURIComponent(topicMatch[1]), false);
     else if (window.location.pathname === "/topics") showTopics(false);
+    else if (window.location.pathname === "/trash") showTrash(false);
     else {
       readStateFromURL();
       $("#search-input").value = state.query;
@@ -1759,12 +1946,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (state.currentTopic) await openTopic(state.currentTopic, false);
   else if (state.currentEntry) await openArticle(state.currentEntry, false);
   else if (window.location.pathname === "/topics") await showTopics(false);
+  else if (window.location.pathname === "/trash") await showTrash(false);
   await loadSessions();
   const events = new EventSource("/api/library/events");
   events.addEventListener("library", async () => {
     state.allItems = [];
     await loadLibrary({showLoading: false});
     await loadTopics();
+    if (!$("#trash-view").classList.contains("hidden")) await loadTrash();
     if (state.currentEntry) await openArticle(state.currentEntry, false);
     if (state.currentTopic) await openTopic(state.currentTopic, false);
     toast("资料库已更新");

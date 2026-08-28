@@ -1345,6 +1345,229 @@ class Database:
             rows = conn.execute("SELECT * FROM entries ORDER BY created_at DESC").fetchall()
         return [self._entry_from_row(row) for row in rows]
 
+    def snapshot_entry_dependencies(self, entry_id: str) -> dict[str, Any]:
+        """Capture dependent projections before the entry files are moved."""
+        with self.connect() as conn:
+            if conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone() is None:
+                raise EntryNotFoundError(f"entry not found: {entry_id}")
+            topic_ids = [
+                row["topic_id"]
+                for row in conn.execute(
+                    "SELECT topic_id FROM topic_sources WHERE entry_id=? ORDER BY topic_id",
+                    (entry_id,),
+                ).fetchall()
+            ]
+            return {
+                "topics": {
+                    topic_id: [
+                        dict(row)
+                        for row in conn.execute(
+                            """SELECT entry_id, position, enabled, source_revision
+                               FROM topic_sources WHERE topic_id=? ORDER BY position""",
+                            (topic_id,),
+                        ).fetchall()
+                    ]
+                    for topic_id in topic_ids
+                },
+                "creator_works": [
+                    dict(row)
+                    for row in conn.execute(
+                        """SELECT creator_id, work_id, decision, entry_id
+                           FROM creator_works WHERE entry_id=?""",
+                        (entry_id,),
+                    ).fetchall()
+                ],
+                "reminders": [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM reminders WHERE entry_id=?", (entry_id,)
+                    ).fetchall()
+                ],
+                "relations": [
+                    dict(row)
+                    for row in conn.execute(
+                        """SELECT * FROM relations
+                           WHERE source_entry_id=? OR target_entry_id=?""",
+                        (entry_id, entry_id),
+                    ).fetchall()
+                ],
+                "purposes": [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM purposes WHERE entry_id=?", (entry_id,)
+                    ).fetchall()
+                ],
+                "chat_session_ids": [
+                    row["id"]
+                    for row in conn.execute(
+                        """SELECT id FROM web_chat_sessions
+                           WHERE scope='entry' AND context_entry_id=?""",
+                        (entry_id,),
+                    ).fetchall()
+                ],
+            }
+
+    def delete_entry_projection(self, entry_id: str) -> dict[str, Any]:
+        """Remove one rebuildable entry projection and return data needed for restoration."""
+        with self.connect() as conn:
+            if conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone() is None:
+                raise EntryNotFoundError(f"entry not found: {entry_id}")
+            topic_ids = [
+                row["topic_id"]
+                for row in conn.execute(
+                    "SELECT topic_id FROM topic_sources WHERE entry_id=? ORDER BY topic_id",
+                    (entry_id,),
+                ).fetchall()
+            ]
+            topic_sources: dict[str, list[dict[str, Any]]] = {}
+            for topic_id in topic_ids:
+                topic_sources[topic_id] = [
+                    dict(row)
+                    for row in conn.execute(
+                        """SELECT entry_id, position, enabled, source_revision
+                           FROM topic_sources WHERE topic_id=? ORDER BY position""",
+                        (topic_id,),
+                    ).fetchall()
+                ]
+            creator_works = [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT creator_id, work_id, decision, entry_id
+                       FROM creator_works WHERE entry_id=?""",
+                    (entry_id,),
+                ).fetchall()
+            ]
+            reminders = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM reminders WHERE entry_id=?", (entry_id,)
+                ).fetchall()
+            ]
+            relations = [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM relations
+                       WHERE source_entry_id=? OR target_entry_id=?""",
+                    (entry_id, entry_id),
+                ).fetchall()
+            ]
+            chat_session_ids = [
+                row["id"]
+                for row in conn.execute(
+                    """SELECT id FROM web_chat_sessions
+                       WHERE scope='entry' AND context_entry_id=?""",
+                    (entry_id,),
+                ).fetchall()
+            ]
+            purposes = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM purposes WHERE entry_id=?", (entry_id,)
+                ).fetchall()
+            ]
+            chunk_ids = [
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM chunks WHERE entry_id=?", (entry_id,)
+                ).fetchall()
+            ]
+            if chunk_ids:
+                placeholders = ",".join("?" for _ in chunk_ids)
+                conn.execute(
+                    f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", chunk_ids
+                )
+            conn.execute(
+                """UPDATE creator_works
+                   SET decision='skipped', entry_id=NULL
+                   WHERE entry_id=?""",
+                (entry_id,),
+            )
+            conn.execute(
+                """UPDATE web_chat_sessions
+                   SET scope='library', context_entry_id=NULL, updated_at=?
+                   WHERE scope='entry' AND context_entry_id=?""",
+                (iso_now(), entry_id),
+            )
+            conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+        return {
+            "topics": topic_sources,
+            "creator_works": creator_works,
+            "reminders": reminders,
+            "relations": relations,
+            "purposes": purposes,
+            "chat_session_ids": chat_session_ids,
+        }
+
+    def restore_entry_dependencies(
+        self, entry_id: str, snapshot: dict[str, Any]
+    ) -> dict[str, list[str]]:
+        """Restore non-document projections after an entry has been recreated."""
+        restored_creators: list[str] = []
+        with self.connect() as conn:
+            if conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone() is None:
+                raise EntryNotFoundError(f"entry not found: {entry_id}")
+            for item in snapshot.get("creator_works", []):
+                cursor = conn.execute(
+                    """UPDATE creator_works SET decision='imported', entry_id=?
+                       WHERE creator_id=? AND work_id=?""",
+                    (entry_id, item.get("creator_id"), item.get("work_id")),
+                )
+                if cursor.rowcount:
+                    restored_creators.append(str(item.get("creator_id")))
+            for item in snapshot.get("reminders", []):
+                conn.execute(
+                    """INSERT OR REPLACE INTO reminders
+                       (id, entry_id, data_json, status, system_id, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        item["id"],
+                        entry_id,
+                        item["data_json"],
+                        item["status"],
+                        item.get("system_id"),
+                        item["updated_at"],
+                    ),
+                )
+            for item in snapshot.get("relations", []):
+                source_id = str(item.get("source_entry_id") or "")
+                target_id = str(item.get("target_entry_id") or "")
+                if not source_id or not target_id:
+                    continue
+                if not all(
+                    conn.execute("SELECT 1 FROM entries WHERE id=?", (value,)).fetchone()
+                    for value in (source_id, target_id)
+                ):
+                    continue
+                conn.execute(
+                    """INSERT OR REPLACE INTO relations
+                       (source_entry_id, target_entry_id, relation_type, reason,
+                        confidence, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        source_id,
+                        target_id,
+                        item["relation_type"],
+                        item["reason"],
+                        item["confidence"],
+                        item["created_at"],
+                    ),
+                )
+            for item in snapshot.get("purposes", []):
+                conn.execute(
+                    """INSERT OR REPLACE INTO purposes
+                       (id, entry_id, data_json, created_at) VALUES (?, ?, ?, ?)""",
+                    (item["id"], entry_id, item["data_json"], item["created_at"]),
+                )
+            session_ids = [str(value) for value in snapshot.get("chat_session_ids", [])]
+            for session_id in session_ids:
+                conn.execute(
+                    """UPDATE web_chat_sessions
+                       SET scope='entry', context_entry_id=?, updated_at=?
+                       WHERE id=? AND scope='library' AND context_entry_id IS NULL""",
+                    (entry_id, iso_now(), session_id),
+                )
+        return {"creator_ids": list(dict.fromkeys(restored_creators))}
+
     def upsert_entry(self, entry: EntryRecord, data: dict[str, Any]) -> EntryRecord:
         values = self._entry_values(entry, data)
         with self.connect() as conn:

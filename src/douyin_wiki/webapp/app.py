@@ -38,7 +38,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.2"
+WEB_VERSION = "0.1.3"
 
 
 class CreateSessionRequest(BaseModel):
@@ -74,6 +74,10 @@ class GenerateTopicArtifactRequest(BaseModel):
 class SaveTopicNoteRequest(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
     title: str = Field(default="专题笔记", min_length=1, max_length=200)
+    confirmed: bool = False
+
+
+class ConfirmDestructiveActionRequest(BaseModel):
     confirmed: bool = False
 
 
@@ -228,6 +232,7 @@ def create_app(
         core.initialize_runtime()
     else:
         core.database.initialize()
+        core.recover_entry_trash_operations()
     catalog = LibraryCatalog(cfg.vault_path, core.database)
     catalog.refresh()
     notifier = ChangeNotifier()
@@ -274,6 +279,22 @@ def create_app(
     app.state.service = core
     app.state.catalog = catalog
     app.state.chat_provider = provider
+
+    async def publish_mutation(
+        result: dict[str, Any], *, refresh_catalog: bool = True
+    ) -> dict[str, Any]:
+        """Keep a completed mutation successful when a UI refresh needs retrying."""
+        warnings = list(result.get("warnings") or [])
+        if refresh_catalog:
+            try:
+                catalog.refresh()
+            except Exception as exc:
+                warnings.append(f"操作已完成，但网页目录刷新失败：{exc}")
+        try:
+            await notifier.publish()
+        except Exception as exc:
+            warnings.append(f"操作已完成，但网页更新通知失败：{exc}")
+        return {**result, "warnings": warnings}
 
     @app.middleware("http")
     async def same_origin(request: Request, call_next):
@@ -345,6 +366,19 @@ def create_app(
             },
         )
 
+    @app.get("/trash", response_class=HTMLResponse)
+    async def trash_page(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "app.html",
+            {
+                "page_title": "废纸篓",
+                "initial_entry_id": "",
+                "initial_topic_id": "",
+                "web_version": WEB_VERSION,
+            },
+        )
+
     @app.get("/settings/model", response_class=HTMLResponse)
     async def model_settings_page(request: Request):
         return templates.TemplateResponse(
@@ -400,6 +434,51 @@ def create_app(
                 catalog=catalog,
             ),
         }
+
+    @app.delete("/api/articles/{entry_id}")
+    async def trash_article(entry_id: str, payload: ConfirmDestructiveActionRequest):
+        try:
+            result = core.trash_entry(entry_id, confirmed=payload.confirmed)
+        except EntryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="文章不存在") from exc
+        except (ValueError, DouyinWikiError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await publish_mutation(result)
+
+    @app.get("/api/trash")
+    async def list_trash():
+        items = []
+        for raw in core.list_trashed_entries():
+            item = dict(raw)
+            item["deleted_display"] = format_beijing(item.get("deleted_at"))
+            items.append(item)
+        return {"items": items, "total": len(items)}
+
+    @app.post("/api/trash/{trash_id}/restore")
+    async def restore_trash_item(
+        trash_id: str, payload: ConfirmDestructiveActionRequest
+    ):
+        try:
+            result = core.restore_trashed_entry(trash_id, confirmed=payload.confirmed)
+        except EntryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, DouyinWikiError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await publish_mutation(result)
+
+    @app.delete("/api/trash/{trash_id}")
+    async def permanently_delete_trash_item(
+        trash_id: str, payload: ConfirmDestructiveActionRequest
+    ):
+        try:
+            result = core.permanently_delete_trashed_entry(
+                trash_id, confirmed=payload.confirmed
+            )
+        except EntryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await publish_mutation(result, refresh_catalog=False)
 
     @app.get("/api/topics")
     async def list_topics():

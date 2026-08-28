@@ -47,7 +47,8 @@ VAULT_AGENTS = """# 抖库维护规则
 
 这个 Vault 由抖库与 AI 维护，供 AI 检索个人收藏的抖音知识。
 
-- `raw/` 是不可变来源；不得覆盖或删除原始分享文本、ASR、校正版逐字稿和 OCR。
+- `raw/` 是不可变来源；日常维护不得覆盖或单独删除原始分享文本、ASR、校正版逐字稿和 OCR。
+  只有用户在 Web 中明确确认删除整条资料时，才可将整组资料移入抖库废纸篓。
 - `wiki/sources/` 是每条作品的主资料页。
 - `creators/` 中每个博主拥有独立、自包含的资料目录。
 - `topics/` 保存用户选定来源的研究专题、成果和用户专题笔记。
@@ -97,6 +98,23 @@ class VaultWriter:
     @contextmanager
     def locked(self) -> Iterator[None]:
         lock_path = self.vault_path / ".douyin-wiki" / "vault.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def entry_operations_locked(self) -> Iterator[None]:
+        """Serialize entry mutations across Web, CLI, MCP, and worker processes.
+
+        This lock must always be acquired before ``locked()`` when both are
+        needed.  Keeping it separate from the short-lived Vault file lock lets
+        one logical entry mutation cover its SQLite and filesystem changes.
+        """
+        lock_path = self.vault_path / ".douyin-wiki" / "entry-operations.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -361,10 +379,22 @@ class VaultWriter:
                     self._atomic_write(path, content)
             raise
 
+        changed.extend(self.restore_entry_links(entry, data))
+        return WrittenEntry(
+            raw_path=raw_path,
+            source_path=source_path,
+            machine_path=machine_path,
+            changed_paths=changed,
+        )
+
+    def restore_entry_links(self, entry: EntryRecord, data: dict[str, Any]) -> list[Path]:
+        """Restore concept and entity backlinks without rewriting restored evidence files."""
         analysis = AnalysisResult.model_validate(data["analysis"])
+        creator_folder = str(data.get("creator", {}).get("folder_path") or "")
         knowledge_root = (
             self.vault_path / creator_folder if creator_folder else self.vault_path / "wiki"
         )
+        changed: list[Path] = []
         for concept in analysis.concepts:
             path = knowledge_root / "concepts" / f"{safe_filename(concept)}.md"
             if self._ensure_link_page(path, "concept", concept, entry):
@@ -373,12 +403,7 @@ class VaultWriter:
             path = knowledge_root / "entities" / f"{safe_filename(entity.name)}.md"
             if self._ensure_link_page(path, "entity", entity.name, entry, entity.description):
                 changed.append(path)
-        return WrittenEntry(
-            raw_path=raw_path,
-            source_path=source_path,
-            machine_path=machine_path,
-            changed_paths=changed,
-        )
+        return changed
 
     def migrate_inspiration_vocabulary(self) -> list[Path]:
         """Update system labels while preserving all captured user content."""
@@ -577,6 +602,23 @@ class VaultWriter:
         path = self.vault_path / entry.source_path
         self._atomic_write(path, self._render_source(entry, data))
         return path
+
+    def remove_entry_links(self, entry: EntryRecord, data: dict[str, Any]) -> list[Path]:
+        """Remove system-managed concept/entity backlinks to a trashed source page."""
+        creator_folder = str(data.get("creator", {}).get("folder_path") or "")
+        root = self.vault_path / creator_folder if creator_folder else self.vault_path / "wiki"
+        source_target = Path(entry.source_path).with_suffix("").as_posix()
+        marker = f"[[{source_target}"
+        changed: list[Path] = []
+        for folder in ("concepts", "entities"):
+            for path in (root / folder).glob("*.md"):
+                original = path.read_text(encoding="utf-8")
+                lines = [line for line in original.splitlines() if marker not in line]
+                updated = "\n".join(lines).rstrip() + "\n"
+                if updated != original:
+                    self._atomic_write(path, updated)
+                    changed.append(path)
+        return changed
 
     def rebuild_index(self, entries: list[EntryRecord]) -> Path:
         now = beijing_date()
