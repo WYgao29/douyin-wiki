@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import json
 import plistlib
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 import douyin_wiki
+from douyin_wiki import mcp_server
+from douyin_wiki.errors import ExternalToolError, JobStateError
 from douyin_wiki.mcp_server import mcp
-from douyin_wiki.secrets import get_secret
+from douyin_wiki.secrets import get_secret, store_secret
 from douyin_wiki.setup import LaunchAgentInstaller
 
 
@@ -54,6 +61,61 @@ def test_mcp_exposes_public_tools() -> None:
 def test_secret_prefers_environment(monkeypatch) -> None:
     monkeypatch.setenv("DOUYIN_WIKI_TEST_KEY", "secret-value")
     assert get_secret("DOUYIN_WIKI_TEST_KEY") == "secret-value"
+
+
+def test_store_secret_confirms_stdin_and_verifies_keychain_write(monkeypatch) -> None:
+    calls = []
+    responses = iter(
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="secret-value\n", stderr=""),
+        ]
+    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("douyin_wiki.secrets.subprocess.run", fake_run)
+    store_secret("DOUYIN_WIKI_TEST_KEY", "secret-value")
+
+    assert calls[0][0][-1] == "-w"
+    assert calls[0][1]["input"] == "secret-value\nsecret-value\n"
+    assert calls[1][0][1] == "find-generic-password"
+
+
+def test_store_secret_rejects_failed_readback(monkeypatch) -> None:
+    responses = iter(
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(
+        "douyin_wiki.secrets.subprocess.run", lambda *_, **__: next(responses)
+    )
+
+    with pytest.raises(ExternalToolError, match="写入 Keychain 后校验失败"):
+        store_secret("DOUYIN_WIKI_TEST_KEY", "secret-value")
+
+
+def test_mcp_preserves_structured_douyin_wiki_error(monkeypatch) -> None:
+    class BrokenService:
+        def get_job(self, job_id: str):
+            raise JobStateError("任务状态不允许", details={"job_id": job_id})
+
+    monkeypatch.setattr(mcp_server, "_SERVICE", BrokenService())
+    with pytest.raises(ToolError) as captured:
+        asyncio.run(mcp.call_tool("get_job", {"job_id": "job-bad"}))
+
+    payload = json.loads(str(captured.value))
+    assert payload == {
+        "error": {
+            "code": "invalid_job_state",
+            "message": "任务状态不允许",
+            "details": {"job_id": "job-bad"},
+        }
+    }
 
 
 def test_launch_agent_has_homebrew_path(monkeypatch, tmp_path: Path) -> None:

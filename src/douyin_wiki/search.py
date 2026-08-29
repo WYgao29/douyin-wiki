@@ -143,7 +143,8 @@ class KnowledgeIndexer:
             )
 
         vectors = self.embeddings.embed(
-            [chunk["text"] + "\n" + inspirations_text for chunk in chunks]
+            [chunk["text"] + "\n" + inspirations_text for chunk in chunks],
+            persistent=True,
         )
         for chunk, vector in zip(chunks, vectors, strict=True):
             chunk["embedding"] = vector
@@ -163,7 +164,7 @@ class KnowledgeIndexer:
                 *[inspiration.text for inspiration in entry.inspirations],
             ]
         )
-        source_vector = self.embeddings.embed([source_text])[0]
+        source_vector = self.embeddings.embed([source_text], persistent=True)[0]
         candidates: list[tuple[float, dict[str, Any]]] = []
         for row in self.database.fetch_chunks(include_stale=False):
             if row["entry_id"] == entry.id or row["kind"] != "summary" or not row["embedding_json"]:
@@ -289,8 +290,10 @@ class KnowledgeSearch:
             return []
         allowed_ids = None if entry_ids is None else tuple(dict.fromkeys(entry_ids))
         fts_query = _fts_query(cleaned)
+        relaxed_fts_query = _fts_query(cleaned, relaxed=True)
         lexical_rows = self.database.fts_search(
             fts_query,
+            relaxed_query=(relaxed_fts_query if relaxed_fts_query != fts_query else None),
             raw_query=cleaned,
             include_stale=include_stale,
             limit=max(limit * 5, 50),
@@ -299,8 +302,10 @@ class KnowledgeSearch:
         lexical_scores: dict[str, float] = {}
         lexical_ranks: dict[str, int] = {}
         for index, row in enumerate(lexical_rows):
-            rank = float(row.get("rank", 0))
-            lexical_scores[row["id"]] = 1.0 / (1.0 + abs(rank))
+            # bm25() is negative in SQLite FTS5 and its absolute magnitude is not
+            # a normalized probability. SQL already orders each FTS channel, so use
+            # an explicit channel quality and a small reciprocal-rank bonus below.
+            lexical_scores[row["id"]] = float(row.get("match_quality", 1.0))
             lexical_ranks[row["id"]] = index
 
         query_vector = self.embeddings.embed([cleaned])[0]
@@ -385,12 +390,26 @@ class KnowledgeSearch:
         return evidence
 
 
-def _fts_query(value: str) -> str:
+def _fts_query(value: str, *, relaxed: bool = False) -> str:
     groups: list[str] = []
     for part in re.split(r"\s+", value):
         tokens = lexical_tokens(part)
         if tokens:
-            groups.append(" AND ".join(f'"{token.replace(chr(34), "")}"' for token in tokens))
+            if relaxed and re.fullmatch(
+                r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", part
+            ):
+                # A continuous phrase may contain useful terms separated by other
+                # words in the document (e.g. 手机技巧 -> 手机拍照技巧). Use CJK
+                # bigrams as a lower-weight recall channel without broad unigram hits.
+                bigrams = [token for token in tokens if len(token) == 2]
+                terms = bigrams or tokens
+                groups.append(
+                    " OR ".join(f'"{token.replace(chr(34), "")}"' for token in terms)
+                )
+            else:
+                groups.append(
+                    " AND ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
+                )
     return " OR ".join(f"({group})" for group in groups)
 
 

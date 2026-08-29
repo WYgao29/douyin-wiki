@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import warnings
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .config import load_config
+from .errors import DouyinWikiError
 from .localization import (
     add_display_labels,
     parse_creator_decision,
@@ -46,9 +49,32 @@ sync_creator 时执行，不得自动或定时访问博主主页。
 调用 generate_topic_artifact，专题笔记只有用户确认后才能调用 save_topic_note。
 """
 
+
+class DouyinWikiMCP(FastMCP):
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            cause: BaseException | None = exc
+            while cause is not None and not isinstance(cause, DouyinWikiError):
+                cause = cause.__cause__
+            if isinstance(cause, DouyinWikiError):
+                payload = {
+                    "error": {
+                        "code": cause.code,
+                        "message": str(cause),
+                        "details": cause.details,
+                    }
+                }
+                raise ToolError(
+                    json.dumps(payload, ensure_ascii=False, default=str)
+                ) from cause
+            raise
+
+
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", message="Field 'lifespan' has an incomplete definition.*")
-    mcp = FastMCP("抖库", instructions=INSTRUCTIONS)
+    mcp = DouyinWikiMCP("抖库", instructions=INSTRUCTIONS)
 
 _SERVICE: DouyinWikiService | None = None
 

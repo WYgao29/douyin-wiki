@@ -571,10 +571,9 @@ def create_app(
     @app.get("/api/chat/sessions")
     async def list_sessions():
         current_provider = app.state.chat_provider
+        sessions = await asyncio.to_thread(core.database.list_chat_sessions)
         return {
-            "sessions": [
-                item.model_dump(mode="json") for item in core.database.list_chat_sessions()
-            ],
+            "sessions": [item.model_dump(mode="json") for item in sessions],
             "model": current_provider.model or "未配置",
             "configured": current_provider.configured,
         }
@@ -594,7 +593,8 @@ def create_app(
                 raise HTTPException(
                     status_code=400, detail="专题范围对话需要有效的目标专题"
                 ) from exc
-        session = core.database.create_chat_session(
+        session = await asyncio.to_thread(
+            core.database.create_chat_session,
             scope=payload.scope,
             context_entry_id=payload.context_entry_id,
             context_topic_id=payload.context_topic_id,
@@ -604,8 +604,8 @@ def create_app(
     @app.get("/api/chat/sessions/{session_id}")
     async def get_session(session_id: str):
         try:
-            session = core.database.get_chat_session(session_id)
-            messages = core.database.list_chat_messages(session_id)
+            session = await asyncio.to_thread(core.database.get_chat_session, session_id)
+            messages = await asyncio.to_thread(core.database.list_chat_messages, session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {
@@ -621,21 +621,24 @@ def create_app(
 
     @app.delete("/api/chat/sessions/{session_id}")
     async def delete_session(session_id: str):
-        if not core.database.delete_chat_session(session_id):
+        if not await asyncio.to_thread(core.database.delete_chat_session, session_id):
             raise HTTPException(status_code=404, detail="对话不存在")
         return {"status": "已删除"}
 
     @app.post("/api/chat/sessions/{session_id}/messages")
     async def send_message(session_id: str, payload: SendMessageRequest):
         try:
-            session = core.database.get_chat_session(session_id)
-            history = core.database.list_chat_messages(session_id, limit=24)
+            session = await asyncio.to_thread(core.database.get_chat_session, session_id)
+            history = await asyncio.to_thread(
+                core.database.list_chat_messages, session_id, limit=24
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         if session.scope == "topic" and not session.context_topic_id:
             raise HTTPException(status_code=409, detail="该对话关联的专题已不存在，请新建对话")
         try:
-            messages, citations = context_builder.build(
+            messages, citations = await asyncio.to_thread(
+                context_builder.build,
                 payload.content,
                 context_entry_id=(
                     session.context_entry_id if session.scope == "entry" else None
@@ -649,10 +652,14 @@ def create_app(
             raise HTTPException(
                 status_code=409, detail="该对话关联的专题已不存在，请新建对话"
             ) from exc
-        core.database.add_chat_message(session_id, "user", payload.content)
+        await asyncio.to_thread(
+            core.database.add_chat_message, session_id, "user", payload.content
+        )
         if session.title == "新对话":
-            core.database.update_chat_session(
-                session_id, title=payload.content.strip().replace("\n", " ")[:32]
+            await asyncio.to_thread(
+                core.database.update_chat_session,
+                session_id,
+                title=payload.content.strip().replace("\n", " ")[:32],
             )
 
         async def response_stream() -> AsyncIterator[str]:
@@ -670,7 +677,8 @@ def create_app(
                 if session.scope == "topic" and not citations:
                     answer = "当前专题没有相关证据。"
                     yield _event("delta", {"text": answer})
-                    saved = core.database.add_chat_message(
+                    saved = await asyncio.to_thread(
+                        core.database.add_chat_message,
                         session_id,
                         "assistant",
                         answer,
@@ -693,7 +701,8 @@ def create_app(
                         yield _event("delta", {"text": chunk.text})
                     if chunk.usage:
                         usage = chunk.usage
-                saved = core.database.add_chat_message(
+                saved = await asyncio.to_thread(
+                    core.database.add_chat_message,
                     session_id,
                     "assistant",
                     answer,
@@ -715,7 +724,8 @@ def create_app(
                 )
             except (DouyinWikiError, httpx.HTTPError) as exc:
                 if answer:
-                    core.database.add_chat_message(
+                    await asyncio.to_thread(
+                        core.database.add_chat_message,
                         session_id,
                         "assistant",
                         answer,

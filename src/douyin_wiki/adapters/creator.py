@@ -241,8 +241,11 @@ class DouyinCreatorAdapter:
                     cookies = await context.cookies("https://www.douyin.com/")
                     body = (await page.locator("body").inner_text(timeout=10_000))[:20_000]
                     status = response.status if response else None
+                    final_url = page.url
                     await context.close()
-                ready = bool(_usable_auth_cookies(cookies)) and not _page_auth_blocked(body, status)
+                ready = bool(_usable_auth_cookies(cookies)) and not _page_auth_blocked(
+                    body, status, final_url
+                )
                 return AuthCheckResult(
                     scope="creator",
                     state="ready" if ready else "needs_login",
@@ -392,7 +395,9 @@ class DouyinCreatorAdapter:
         response = await page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
         await page.wait_for_timeout(2000)
         body = (await page.locator("body").inner_text(timeout=10_000))[:50_000]
-        if _page_auth_blocked(body, response.status if response else None):
+        if _page_auth_blocked(
+            body, response.status if response else None, page.url
+        ):
             raise BrowserAuthRequiredError(
                 "博主主页要求登录或安全验证",
                 details={"action": "douyin-wiki auth douyin"},

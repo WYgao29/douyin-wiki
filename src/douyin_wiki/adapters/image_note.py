@@ -65,10 +65,32 @@ def _usable_auth_cookies(
     ]
 
 
-def _page_auth_blocked(text: str, status: int | None) -> bool:
-    lowered = text[:2000].lower()
-    return status in {401, 403} or any(
-        token in lowered for token in ("登录后查看", "请登录", "验证码", "安全验证")
+def _page_auth_blocked(text: str, status: int | None, url: str | None = None) -> bool:
+    if status in {401, 403}:
+        return True
+    lowered_url = (url or "").lower()
+    if any(
+        token in lowered_url
+        for token in ("passport.douyin.com", "/verify", "captcha", "security-check")
+    ):
+        return True
+    sample = text[:20_000].lower()
+    if any(
+        token in sample
+        for token in (
+            "captcha_verify",
+            "verifycenter",
+            "login-panel",
+            '"is_login":false',
+            '"islogin":false',
+        )
+    ):
+        return True
+    # Plain words such as “请登录” may be legitimate post text. Treat them as an
+    # auth wall only when the visible page itself is a short blocking message.
+    visible = re.sub(r"\s+", " ", sample).strip()
+    return len(visible) <= 500 and any(
+        token in visible for token in ("登录后查看", "请登录", "验证码", "安全验证")
     )
 
 
@@ -399,8 +421,9 @@ class PlaywrightImageNoteDownloader:
                 usable = _usable_auth_cookies(cookies)
                 body_text = (await page.locator("body").inner_text(timeout=10_000))[:20_000]
                 status = response.status if response else None
+                final_url = page.url
                 await context.close()
-                if _page_auth_blocked(body_text, status):
+                if _page_auth_blocked(body_text, status, final_url):
                     return AuthCheckResult(
                         scope="image_note",
                         state="needs_login",
@@ -457,7 +480,9 @@ class PlaywrightImageNoteDownloader:
                 while asyncio.get_running_loop().time() < deadline:
                     cookies = await context.cookies("https://www.douyin.com/")
                     body_text = (await page.locator("body").inner_text(timeout=10_000))[:20_000]
-                    if _usable_auth_cookies(cookies) and not _page_auth_blocked(body_text, None):
+                    if _usable_auth_cookies(cookies) and not _page_auth_blocked(
+                        body_text, None, page.url
+                    ):
                         await context.close()
                         return
                     await asyncio.sleep(2)
@@ -526,7 +551,9 @@ class PlaywrightImageNoteDownloader:
                         metadata, image_urls = await self._from_dom(page, url=url, work_id=work_id)
 
                     if not image_urls:
-                        self._raise_page_error(body_text, response.status if response else None)
+                        self._raise_page_error(
+                            body_text, response.status if response else None, page.url
+                        )
 
                     image_paths = await self._download_images(context, image_urls, target_dir)
                     if metadata is None:
@@ -641,8 +668,8 @@ class PlaywrightImageNoteDownloader:
         )
 
     @staticmethod
-    def _raise_page_error(text: str, status: int | None) -> None:
-        if _page_auth_blocked(text, status):
+    def _raise_page_error(text: str, status: int | None, url: str | None = None) -> None:
+        if _page_auth_blocked(text, status, url):
             raise BrowserAuthRequiredError("抖音会话需要登录或验证；请运行 douyin-wiki auth douyin")
         if "地区" in text and any(token in text for token in ("限制", "不可用", "无法查看")):
             raise RegionRestrictedError("该图文作品存在地区限制")

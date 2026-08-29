@@ -2234,6 +2234,7 @@ class Database:
         self,
         query: str,
         *,
+        relaxed_query: str | None = None,
         raw_query: str | None = None,
         include_stale: bool = False,
         limit: int = 50,
@@ -2248,18 +2249,31 @@ class Database:
             conditions.append(f"c.entry_id IN ({placeholders})")
             filter_values.extend(entry_ids)
         filter_clause = "" if not conditions else "AND " + " AND ".join(conditions)
-        rows: list[sqlite3.Row] = []
+        rows: list[dict[str, Any]] = []
         with self.connect() as conn:
-            try:
-                rows = conn.execute(
-                    f"""SELECT c.*, bm25(chunks_fts, 0, 0, 1.0, 1.6, 0.8) AS rank
-                        FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.chunk_id
-                        WHERE chunks_fts MATCH ? {filter_clause}
-                        ORDER BY rank LIMIT ?""",
-                    (query, *filter_values, limit),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = []
+            def append_fts(match_query: str, match_kind: str, quality: float) -> None:
+                try:
+                    matched = conn.execute(
+                        f"""SELECT c.*, bm25(chunks_fts, 0, 0, 1.0, 1.6, 0.8) AS rank
+                            FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.chunk_id
+                            WHERE chunks_fts MATCH ? {filter_clause}
+                            ORDER BY rank LIMIT ?""",
+                        (match_query, *filter_values, limit),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    return
+                seen = {row["id"] for row in rows}
+                rows.extend(
+                    {
+                        **dict(row),
+                        "match_kind": match_kind,
+                        "match_quality": quality,
+                    }
+                    for row in matched
+                    if row["id"] not in seen
+                )
+
+            append_fts(query, "fts_strict", 1.0)
             exact_query = (raw_query if raw_query is not None else query).strip()
             if exact_query:
                 escaped = exact_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -2272,13 +2286,24 @@ class Database:
                     placeholders = ",".join("?" for _ in entry_ids)
                     like_conditions.append(f"c.entry_id IN ({placeholders})")
                 like_rows = conn.execute(
-                    f"""SELECT c.*, 0 AS rank FROM chunks c
+                    f"""SELECT c.* FROM chunks c
                         WHERE {' AND '.join(like_conditions)} LIMIT ?""",
                     (f"%{escaped}%", f"%{escaped}%", *filter_values, limit),
                 ).fetchall()
                 seen = {row["id"] for row in rows}
-                rows = [*rows, *(row for row in like_rows if row["id"] not in seen)][:limit]
-        return [dict(row) for row in rows]
+                rows.extend(
+                    {
+                        **dict(row),
+                        "rank": None,
+                        "match_kind": "exact_substring",
+                        "match_quality": 0.95,
+                    }
+                    for row in like_rows
+                    if row["id"] not in seen
+                )
+            if relaxed_query:
+                append_fts(relaxed_query, "fts_relaxed", 0.72)
+        return rows[:limit]
 
     def replace_relations(self, source_entry_id: str, relations: list[dict[str, Any]]) -> None:
         with self.connect() as conn:

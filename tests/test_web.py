@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -594,8 +595,16 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert "settings-info-panel" not in page.text
 
 
-def test_chat_stream_persists_history_and_usage(tmp_path: Path) -> None:
+def test_chat_stream_persists_history_and_usage(tmp_path: Path, monkeypatch) -> None:
     config, service = _web_fixture(tmp_path)
+    original_add_message = service.database.add_chat_message
+
+    def add_message_off_event_loop(*args, **kwargs):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return original_add_message(*args, **kwargs)
+
+    monkeypatch.setattr(service.database, "add_chat_message", add_message_off_event_loop)
     app = create_app(
         config,
         service=service,

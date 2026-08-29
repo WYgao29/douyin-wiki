@@ -68,6 +68,29 @@ def test_config_patch_preserves_comments_and_unknown_keys(tmp_path: Path) -> Non
     assert 'model = "new" # 模型注释' in content
 
 
+def test_config_patch_ignores_section_like_text_inside_multiline_values(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'analysis_mode = "gateway"\n\n[llm]\n'
+        'banner = """\n[not-a-section]\n保留这段文字\n"""\n'
+        'aliases = [\n  "[array-value]",\n]\n'
+        'model = """\nold\n[also-not-a-section]\n"""\n'
+        'base_url = "https://old.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    update_config_values(
+        config_path,
+        {"llm": {"model": "new", "base_url": "https://new.example/v1"}},
+    )
+
+    content = config_path.read_text(encoding="utf-8")
+    assert content.count("model = ") == 1
+    assert "[not-a-section]\n保留这段文字" in content
+    assert 'aliases = [\n  "[array-value]",\n]' in content
+    assert load_config(config_path).llm.model == "new"
+
+
 def test_configure_model_allows_loopback_endpoint_without_api_key(
     tmp_path: Path, monkeypatch
 ) -> None:

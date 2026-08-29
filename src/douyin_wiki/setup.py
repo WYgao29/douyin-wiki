@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tomllib
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -126,47 +127,11 @@ def update_config_values(
         raise FileNotFoundError(path)
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     for section, values in updates.items():
-        section_start = 0
-        section_end = len(lines)
-        if section is not None:
-            header = f"[{section}]"
-            section_index = next(
-                (index for index, line in enumerate(lines) if line.strip() == header), None
-            )
-            if section_index is None:
-                if lines and not lines[-1].endswith("\n"):
-                    lines[-1] += "\n"
-                lines.extend([f"\n{header}\n"])
-                section_index = len(lines) - 1
-            section_start = section_index + 1
-            section_end = next(
-                (
-                    index
-                    for index in range(section_start, len(lines))
-                    if re.match(r"^\s*\[", lines[index])
-                ),
-                len(lines),
-            )
-        else:
-            section_end = next(
-                (index for index, line in enumerate(lines) if re.match(r"^\s*\[", line)),
-                len(lines),
-            )
-        missing: list[str] = []
         for key, value in values.items():
-            rendered = _toml_scalar(value)
-            key_pattern = re.compile(rf"^(?P<indent>\s*){re.escape(key)}\s*=.*$")
-            matched = False
-            for index in range(section_start, section_end):
-                if match := key_pattern.match(lines[index].rstrip("\n")):
-                    comment = _toml_inline_comment(lines[index].rstrip("\n"))
-                    lines[index] = f"{match.group('indent')}{key} = {rendered}{comment}\n"
-                    matched = True
-                    break
-            if not matched:
-                missing.append(f"{key} = {rendered}\n")
-        if missing:
-            lines[section_end:section_end] = missing
+            lines = _patch_toml_value(lines, section, key, _toml_scalar(value))
+    content = "".join(lines)
+    # Never replace a valid configuration with a malformed line-level patch.
+    tomllib.loads(content)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -177,7 +142,7 @@ def update_config_values(
             suffix=".tmp",
             delete=False,
         ) as handle:
-            handle.writelines(lines)
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
             temporary_path = Path(handle.name)
@@ -186,6 +151,174 @@ def update_config_values(
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     return path
+
+
+def _patch_toml_value(
+    lines: list[str], section: str | None, key: str, rendered: str
+) -> list[str]:
+    records = _toml_records(lines)
+    existing = next(
+        (
+            record
+            for record in records
+            if record["kind"] == "key"
+            and record["section"] == section
+            and record["name"] == key
+        ),
+        None,
+    )
+    if existing is not None:
+        start = int(existing["start"])
+        end = int(existing["end"])
+        original = lines[start].rstrip("\r\n")
+        indent = re.match(r"^\s*", original).group(0)
+        comment = _toml_inline_comment(original)
+        return [
+            *lines[:start],
+            f"{indent}{key} = {rendered}{comment}\n",
+            *lines[end:],
+        ]
+
+    section_records = [record for record in records if record["kind"] == "section"]
+    if section is None:
+        insertion = int(section_records[0]["start"]) if section_records else len(lines)
+    else:
+        header = next(
+            (record for record in section_records if record["name"] == section), None
+        )
+        if header is None:
+            result = list(lines)
+            if result and not result[-1].endswith(("\n", "\r")):
+                result[-1] += "\n"
+            if result and result[-1].strip():
+                result.append("\n")
+            result.extend([f"[{section}]\n", f"{key} = {rendered}\n"])
+            return result
+        following = next(
+            (
+                record
+                for record in section_records
+                if int(record["start"]) > int(header["start"])
+            ),
+            None,
+        )
+        insertion = int(following["start"]) if following else len(lines)
+    return [*lines[:insertion], f"{key} = {rendered}\n", *lines[insertion:]]
+
+
+def _toml_records(lines: list[str]) -> list[dict[str, object]]:
+    """Locate real TOML sections and key spans without parsing text inside values."""
+    records: list[dict[str, object]] = []
+    section: str | None = None
+    string_state: str | None = None
+    square_depth = 0
+    brace_depth = 0
+    pending_key: dict[str, object] | None = None
+
+    for line_index, line in enumerate(lines):
+        at_top_level = string_state is None and square_depth == 0 and brace_depth == 0
+        if at_top_level:
+            header_match = re.match(
+                r"^\s*\[([A-Za-z0-9_.-]+)\]\s*(?:#.*)?$", line.rstrip("\r\n")
+            )
+            if header_match:
+                section = header_match.group(1)
+                records.append(
+                    {"kind": "section", "section": section, "name": section, "start": line_index}
+                )
+            elif key_match := re.match(
+                r"^\s*([A-Za-z0-9_-]+)\s*=", line.rstrip("\r\n")
+            ):
+                pending_key = {
+                    "kind": "key",
+                    "section": section,
+                    "name": key_match.group(1),
+                    "start": line_index,
+                    "end": line_index + 1,
+                }
+                records.append(pending_key)
+
+        string_state, square_depth, brace_depth = _scan_toml_line(
+            line, string_state, square_depth, brace_depth
+        )
+        if (
+            pending_key is not None
+            and string_state is None
+            and square_depth == 0
+            and brace_depth == 0
+        ):
+            pending_key["end"] = line_index + 1
+            pending_key = None
+
+    if pending_key is not None:
+        pending_key["end"] = len(lines)
+    return records
+
+
+def _scan_toml_line(
+    line: str,
+    string_state: str | None,
+    square_depth: int,
+    brace_depth: int,
+) -> tuple[str | None, int, int]:
+    index = 0
+    while index < len(line):
+        if string_state == "triple_basic":
+            if line.startswith('"""', index):
+                string_state = None
+                index += 3
+            elif line[index] == "\\":
+                index += 2
+            else:
+                index += 1
+            continue
+        if string_state == "triple_literal":
+            if line.startswith("'''", index):
+                string_state = None
+                index += 3
+            else:
+                index += 1
+            continue
+        if string_state == "basic":
+            if line[index] == "\\":
+                index += 2
+            elif line[index] == '"':
+                string_state = None
+                index += 1
+            else:
+                index += 1
+            continue
+        if string_state == "literal":
+            if line[index] == "'":
+                string_state = None
+            index += 1
+            continue
+
+        if line[index] == "#":
+            break
+        if line.startswith('"""', index):
+            string_state = "triple_basic"
+            index += 3
+        elif line.startswith("'''", index):
+            string_state = "triple_literal"
+            index += 3
+        elif line[index] == '"':
+            string_state = "basic"
+            index += 1
+        elif line[index] == "'":
+            string_state = "literal"
+            index += 1
+        else:
+            if line[index] == "[":
+                square_depth += 1
+            elif line[index] == "]":
+                square_depth = max(0, square_depth - 1)
+            elif line[index] == "{":
+                brace_depth += 1
+            elif line[index] == "}":
+                brace_depth = max(0, brace_depth - 1)
+            index += 1
+    return string_state, square_depth, brace_depth
 
 
 def _toml_scalar(value: object) -> str:

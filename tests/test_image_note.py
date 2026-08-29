@@ -347,6 +347,8 @@ def test_image_note_auth_check_rejects_expired_cookie_and_challenge() -> None:
     assert _page_auth_blocked("请登录后查看", 200) is True
     assert _page_auth_blocked("抖音首页", 403) is True
     assert _page_auth_blocked("抖音首页", 200) is False
+    assert _page_auth_blocked("正文内容" * 300 + "请登录支持我们的活动", 200) is False
+    assert _page_auth_blocked("普通页面", 200, "https://passport.douyin.com/login") is True
 
 
 def test_structured_note_parser_preserves_order_music_and_rejects_live_photo() -> None:

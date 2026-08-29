@@ -500,6 +500,14 @@ async def test_two_character_chinese_search_uses_lexical_index(service) -> None:
 
     assert service.search_knowledge("苹果")[0].entry_id == entry.id
     assert service.search_knowledge("拍照")[0].entry_id == entry.id
+    assert service.search_knowledge("手机技巧")[0].entry_id == entry.id
+
+    substring_rows = service.database.fts_search(
+        '("不匹配")', raw_query="手机拍照"
+    )
+    assert substring_rows[0]["match_kind"] == "exact_substring"
+    assert substring_rows[0]["rank"] is None
+    assert substring_rows[0]["match_quality"] < 1
 
 
 @pytest.mark.asyncio
@@ -614,6 +622,32 @@ def test_embedding_model_failure_uses_deterministic_fallback(monkeypatch) -> Non
     assert len(first) == 32
     assert embeddings.provider_name == "char-ngram-fallback"
     assert embeddings.last_error == "ValueError: broken model cache"
+
+
+def test_loaded_embedding_model_failure_never_persists_fallback_vectors() -> None:
+    class FlakyModel:
+        calls = 0
+
+        def get_sentence_embedding_dimension(self) -> int:
+            return 3
+
+        def encode(self, texts, **_):
+            self.calls += 1
+            if self.calls == 1:
+                return [[1.0, 0.0, 0.0] for _ in texts]
+            raise RuntimeError("temporary model failure")
+
+    embeddings = EmbeddingService(EmbeddingSettings(provider="sentence-transformers"))
+    embeddings._model = FlakyModel()
+    embeddings._load_attempted = True
+    embeddings._dimensions = 3
+    embeddings.provider_name = "sentence-transformers:test"
+
+    assert embeddings.embed(["first"], persistent=True) == [[1.0, 0.0, 0.0]]
+    with pytest.raises(ExternalToolError, match="未写入不兼容向量"):
+        embeddings.embed(["second"], persistent=True)
+    assert embeddings.provider_name == "sentence-transformers:test"
+    assert embeddings.embed(["query"]) == [[0.0, 0.0, 0.0]]
 
 
 def test_provider_mode_allows_loopback_endpoint_without_api_key(monkeypatch) -> None:
