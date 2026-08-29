@@ -51,6 +51,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
         stored_key = get_secret(settings.api_key_env)
         self.api_key = stored_key if llm_api_key_required(settings.base_url) else ""
         self.configured = llm_is_configured(settings, self.api_key)
+        self.last_usage: dict[str, int] = {}
 
     def _require_configured(self) -> None:
         if not self.configured:
@@ -83,9 +84,23 @@ class OpenAICompatibleProvider(AnalysisProvider):
                         response = await client.post(url, headers=headers, json=body)
                     response.raise_for_status()
                     payload = response.json()
+                    usage = payload.get("usage") or {}
+                    self.last_usage = {
+                        key: int(value)
+                        for key, value in usage.items()
+                        if isinstance(value, int)
+                    }
                     content = payload["choices"][0]["message"]["content"]
                     return _parse_json_content(content)
-            except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            except (
+                httpx.HTTPError,
+                AttributeError,
+                KeyError,
+                IndexError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
                 last_error = exc
                 if attempt < self.settings.max_retries:
                     await asyncio.sleep(2**attempt)
@@ -118,14 +133,23 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     ensure_ascii=False,
                 ),
             )
-            by_id = {
-                int(item["id"]): str(item["text"]).strip() for item in result.get("segments", [])
-            }
+            by_id: dict[int, str] = {}
+            for item in result.get("segments", []):
+                try:
+                    identifier = int(item["id"])
+                    text = str(item["text"]).strip()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if text:
+                    by_id[identifier] = text
             for segment in chunk:
                 updated = segment.model_copy(update={"text": by_id.get(segment.id, segment.text)})
                 corrected.append(updated)
             for index, item in enumerate(result.get("review_issues", [])):
-                segment_id = int(item.get("segment_id", -1))
+                try:
+                    segment_id = int(item.get("segment_id", -1))
+                except (TypeError, ValueError):
+                    continue
                 source = next((segment for segment in chunk if segment.id == segment_id), None)
                 if source:
                     issues.append(

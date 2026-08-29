@@ -13,6 +13,7 @@ from douyin_wiki.setup import (
     VaultSetupMode,
     doctor,
     obsidian_vault_status,
+    update_config_values,
     validate_vault_target,
     write_config,
 )
@@ -45,6 +46,26 @@ def test_config_round_trips_quoted_strings_and_is_written_atomically(tmp_path: P
     assert loaded.llm.model == 'provider/model"quoted'
     assert loaded.media.browser_profile == 'Profile "Work"'
     assert not list(tmp_path.glob(".config.toml.*.tmp"))
+
+
+def test_config_patch_preserves_comments_and_unknown_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '# 用户注释\nanalysis_mode = "gateway"\ncustom_root = "keep"\n\n'
+        '[llm]\nmodel = "old" # 模型注释\ncustom_llm = 42\n',
+        encoding="utf-8",
+    )
+
+    update_config_values(
+        config_path,
+        {None: {"analysis_mode": "provider"}, "llm": {"model": "new"}},
+    )
+
+    content = config_path.read_text(encoding="utf-8")
+    assert "# 用户注释" in content
+    assert 'custom_root = "keep"' in content
+    assert "custom_llm = 42" in content
+    assert 'model = "new" # 模型注释' in content
 
 
 def test_configure_model_allows_loopback_endpoint_without_api_key(
@@ -85,6 +106,13 @@ def test_configure_model_allows_loopback_endpoint_without_api_key(
     configured = load_config(config_path)
     assert configured.analysis_mode == AnalysisMode.PROVIDER
     assert configured.llm.model == "local-model"
+
+
+def test_configure_model_does_not_expose_api_key_option() -> None:
+    result = runner.invoke(app, ["configure-model", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--api-key" not in result.output
 
 
 def test_first_init_guides_new_vault_and_is_idempotent(tmp_path: Path) -> None:

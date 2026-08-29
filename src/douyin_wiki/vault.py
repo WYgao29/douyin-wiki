@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import re
 import subprocess
@@ -94,6 +95,7 @@ def encode_markdown_path(value: str) -> str:
 class VaultWriter:
     def __init__(self, vault_path: Path) -> None:
         self.vault_path = vault_path
+        self.last_entry_load_errors: list[dict[str, str]] = []
 
     @contextmanager
     def locked(self) -> Iterator[None]:
@@ -368,9 +370,12 @@ class VaultWriter:
             if raw_content is not None:
                 self._atomic_write(raw_path, raw_content)
                 changed.append(raw_path)
-            self._atomic_write(source_path, source_content)
-            self._atomic_write(machine_path, machine_content)
-            changed.extend([source_path, machine_path])
+            if previous[source_path] != source_content:
+                self._atomic_write(source_path, source_content)
+                changed.append(source_path)
+            if previous[machine_path] != machine_content:
+                self._atomic_write(machine_path, machine_content)
+                changed.append(machine_path)
         except Exception:
             for path, content in previous.items():
                 if content is None:
@@ -396,14 +401,26 @@ class VaultWriter:
         )
         changed: list[Path] = []
         for concept in analysis.concepts:
-            path = knowledge_root / "concepts" / f"{safe_filename(concept)}.md"
+            path = self._collision_safe_page_path(knowledge_root / "concepts", concept)
             if self._ensure_link_page(path, "concept", concept, entry):
                 changed.append(path)
         for entity in analysis.entities:
-            path = knowledge_root / "entities" / f"{safe_filename(entity.name)}.md"
+            path = self._collision_safe_page_path(knowledge_root / "entities", entity.name)
             if self._ensure_link_page(path, "entity", entity.name, entry, entity.description):
                 changed.append(path)
         return changed
+
+    @staticmethod
+    def _collision_safe_page_path(folder: Path, title: str) -> Path:
+        path = folder / f"{safe_filename(title)}.md"
+        if not path.exists():
+            return path
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        heading = re.search(r"^#\s+(.+)$", content, re.M)
+        if heading and heading.group(1).strip() == title:
+            return path
+        digest = hashlib.sha256(title.encode("utf-8")).hexdigest()[:8]
+        return folder / f"{safe_filename(title, max_length=70)}-{digest}.md"
 
     def migrate_inspiration_vocabulary(self) -> list[Path]:
         """Update system labels while preserving all captured user content."""
@@ -842,76 +859,92 @@ class VaultWriter:
     def load_entries(self) -> list[tuple[EntryRecord, dict[str, Any]]]:
         """Rehydrate the rebuildable knowledge cache from tracked Markdown files."""
         results: list[tuple[EntryRecord, dict[str, Any]]] = []
+        self.last_entry_load_errors = []
         machine_paths = list((self.vault_path / "wiki" / ".data" / "sources").glob("*.md"))
         machine_paths.extend((self.vault_path / "creators").glob("*/.data/sources/*.md"))
         for machine_path in sorted(machine_paths):
-            machine_frontmatter, machine_body = self._parse_document(machine_path)
-            payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
-            if not payload_match:
+            try:
+                loaded = self._load_entry(machine_path)
+            except Exception as exc:  # A user-edited sidecar must not block all rebuilds.
+                self.last_entry_load_errors.append(
+                    {
+                        "path": str(machine_path.relative_to(self.vault_path)),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
                 continue
-            payload = yaml.safe_load(payload_match.group("payload")) or {}
-            if not isinstance(payload, dict):
-                continue
-            source_page = machine_frontmatter.get("source_page")
-            if not source_page:
-                continue
-            source_path = self.vault_path / str(source_page)
-            if not source_path.is_file():
-                continue
-            source_frontmatter, source_body = self._parse_document(source_path)
-            analysis = AnalysisResult.model_validate(payload.get("analysis", {}))
-            title_match = re.search(r"^#\s+(.+)$", source_body, re.M)
-            title = title_match.group(1).strip() if title_match else analysis.title
-            captured_at = parse_datetime(source_frontmatter.get("captured_at")) or utc_now()
-            updated_at = parse_datetime(machine_frontmatter.get("updated")) or captured_at
-            inspirations = [
-                InspirationInput.model_validate(item)
-                for item in source_frontmatter.get("inspirations", [])
-            ]
-            retention = parse_retention(
-                str(source_frontmatter.get("media_retention", RetentionPolicy.TEMPORARY.value))
-            )
-            entry = EntryRecord(
-                id=f"dy-{source_frontmatter['video_id']}",
-                video_id=str(source_frontmatter["video_id"]),
-                title=title,
-                original_url=str(source_frontmatter.get("source_url") or ""),
-                canonical_url=str(source_frontmatter.get("canonical_url") or ""),
-                raw_path=str(source_frontmatter.get("source_path") or ""),
-                source_path=str(source_page),
-                status=parse_entry_status(str(source_frontmatter.get("status") or "active")),
-                media_status=parse_media_status(
-                    str(source_frontmatter.get("media_status") or "present")
-                ),
-                retention=retention,
-                media_expires_at=parse_datetime(source_frontmatter.get("media_expires_at")),
-                summary=analysis.one_liner,
-                inspirations=inspirations,
-                tags=[str(item) for item in source_frontmatter.get("tags", [])],
-                created_at=captured_at,
-                updated_at=updated_at,
-            )
-            provenance = payload.get("model_provenance", {})
-            data = {
-                "share_text": payload.get("share_text", ""),
-                "inspirations": [item.model_dump(mode="json") for item in inspirations],
-                "metadata": payload.get("metadata", {}),
-                "ocr": payload.get("ocr", []),
-                "review_issues": payload.get("review_issues", []),
-                "relations": payload.get("relations", []),
-                "creator": payload.get("creator", {}),
-                "analysis": analysis.model_dump(mode="json"),
-                "provider": provenance.get("provider"),
-                "model": provenance.get("model"),
-                "prompt_version": provenance.get("prompt_version"),
-                "cover_path": source_frontmatter.get("cover_image"),
-                "cover_kind": source_frontmatter.get("cover_kind"),
-            }
-            if machine_frontmatter.get("source_kind") == SourceKind.VIDEO.value:
-                data["transcript_raw"] = payload.get("transcript_raw", [])
-                data["transcript_corrected"] = payload.get("transcript_corrected", [])
-            results.append((entry, data))
+            if loaded is not None:
+                results.append(loaded)
         return results
+
+    def _load_entry(self, machine_path: Path) -> tuple[EntryRecord, dict[str, Any]]:
+        machine_frontmatter, machine_body = self._parse_document(machine_path)
+        payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
+        if not payload_match:
+            raise ValueError("机器侧车缺少 YAML 数据块")
+        payload = yaml.safe_load(payload_match.group("payload")) or {}
+        if not isinstance(payload, dict):
+            raise ValueError("机器侧车 YAML 顶层必须是对象")
+        source_page = machine_frontmatter.get("source_page")
+        if not source_page:
+            raise ValueError("机器侧车缺少 source_page")
+        source_path = self.vault_path / str(source_page)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"资料页不存在：{source_page}")
+        source_frontmatter, source_body = self._parse_document(source_path)
+        analysis = AnalysisResult.model_validate(payload.get("analysis", {}))
+        title_match = re.search(r"^#\s+(.+)$", source_body, re.M)
+        title = title_match.group(1).strip() if title_match else analysis.title
+        captured_at = parse_datetime(source_frontmatter.get("captured_at")) or utc_now()
+        updated_at = parse_datetime(machine_frontmatter.get("updated")) or captured_at
+        inspirations = [
+            InspirationInput.model_validate(item)
+            for item in source_frontmatter.get("inspirations", [])
+        ]
+        retention = parse_retention(
+            str(source_frontmatter.get("media_retention", RetentionPolicy.TEMPORARY.value))
+        )
+        entry = EntryRecord(
+            id=f"dy-{source_frontmatter['video_id']}",
+            video_id=str(source_frontmatter["video_id"]),
+            title=title,
+            original_url=str(source_frontmatter.get("source_url") or ""),
+            canonical_url=str(source_frontmatter.get("canonical_url") or ""),
+            raw_path=str(source_frontmatter.get("source_path") or ""),
+            source_path=str(source_page),
+            status=parse_entry_status(str(source_frontmatter.get("status") or "active")),
+            media_status=parse_media_status(
+                str(source_frontmatter.get("media_status") or "present")
+            ),
+            retention=retention,
+            media_expires_at=parse_datetime(source_frontmatter.get("media_expires_at")),
+            summary=analysis.one_liner,
+            inspirations=inspirations,
+            tags=[str(item) for item in source_frontmatter.get("tags", [])],
+            created_at=captured_at,
+            updated_at=updated_at,
+        )
+        provenance = payload.get("model_provenance", {})
+        data = {
+            "share_text": payload.get("share_text", ""),
+            "inspirations": [item.model_dump(mode="json") for item in inspirations],
+            "metadata": payload.get("metadata", {}),
+            "ocr": payload.get("ocr", []),
+            "review_issues": payload.get("review_issues", []),
+            "relations": payload.get("relations", []),
+            "creator": payload.get("creator", {}),
+            "analysis": analysis.model_dump(mode="json"),
+            "provider": provenance.get("provider"),
+            "model": provenance.get("model"),
+            "prompt_version": provenance.get("prompt_version"),
+            "cover_path": source_frontmatter.get("cover_image"),
+            "cover_kind": source_frontmatter.get("cover_kind"),
+            "reminder_states": payload.get("reminder_states", []),
+        }
+        if machine_frontmatter.get("source_kind") == SourceKind.VIDEO.value:
+            data["transcript_raw"] = payload.get("transcript_raw", [])
+            data["transcript_corrected"] = payload.get("transcript_corrected", [])
+        return entry, data
 
     def load_creators(self) -> list[tuple[CreatorRecord, list[CreatorWorkRecord]]]:
         """Load creator decisions from the tracked hidden creator sidecars."""
@@ -1245,6 +1278,7 @@ class VaultWriter:
             "review_issues": data.get("review_issues", []),
             "relations": data.get("relations", []),
             "creator": data.get("creator", {}),
+            "reminder_states": data.get("reminder_states", []),
             "model_provenance": {
                 "provider": data.get("provider"),
                 "model": data.get("model"),

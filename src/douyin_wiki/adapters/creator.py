@@ -5,7 +5,6 @@ import fcntl
 import hashlib
 import json
 import mimetypes
-import re
 import subprocess
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -97,7 +96,7 @@ def _work_from_aweme(detail: dict[str, Any]) -> CreatorInventoryWork | None:
     duration_seconds = None
     with suppress(TypeError, ValueError):
         value = float(duration)
-        duration_seconds = value / 1000 if value > 10_000 else value
+        duration_seconds = value / 1000
     cover = None
     for candidate in (
         detail.get("cover"),
@@ -286,29 +285,28 @@ class DouyinCreatorAdapter:
             context = await playwright.chromium.launch_persistent_context(
                 **self._launch_options(headless=True)
             )
-            page = context.pages[0] if context.pages else await context.new_page()
-            cookies = await context.cookies("https://www.douyin.com/")
-            if not _usable_auth_cookies(cookies):
-                await context.close()
-                raise BrowserAuthRequiredError(
-                    "博主主页清点需要专用浏览器登录",
-                    details={"action": "douyin-wiki auth douyin"},
+            try:
+                page = context.pages[0] if context.pages else await context.new_page()
+                cookies = await context.cookies("https://www.douyin.com/")
+                if not _usable_auth_cookies(cookies):
+                    raise BrowserAuthRequiredError(
+                        "博主主页清点需要专用浏览器登录",
+                        details={"action": "douyin-wiki auth douyin"},
+                    )
+
+                if sec_uid is None and work_url and work_id:
+                    sec_uid = await self._creator_from_work(page, work_url, work_id)
+                    if sec_uid is None:
+                        sec_uid = await asyncio.to_thread(self._yt_dlp_creator_sec_uid, work_url)
+                    if sec_uid is None:
+                        raise VideoUnavailableError("无法从该作品识别稳定的博主主页")
+
+                profile_url = f"https://www.douyin.com/user/{sec_uid}"
+                return await self._inventory_profile(
+                    context, page, profile_url, original_url=source_url, target_dir=target_dir
                 )
-
-            if sec_uid is None and work_url and work_id:
-                sec_uid = await self._creator_from_work(page, work_url, work_id)
-                if sec_uid is None:
-                    sec_uid = await asyncio.to_thread(self._yt_dlp_creator_sec_uid, work_url)
-                if sec_uid is None:
-                    await context.close()
-                    raise VideoUnavailableError("无法从该作品识别稳定的博主主页")
-
-            profile_url = f"https://www.douyin.com/user/{sec_uid}"
-            result = await self._inventory_profile(
-                context, page, profile_url, original_url=source_url, target_dir=target_dir
-            )
-            await context.close()
-            return result
+            finally:
+                await context.close()
 
     async def _creator_from_work(self, page: Any, url: str, work_id: str) -> str | None:
         payloads: list[Any] = []
@@ -433,18 +431,22 @@ class DouyinCreatorAdapter:
         expected_sec_uid = extract_creator_sec_uid(profile_url)
         for payload in [*other_payloads, *post_payloads]:
             candidate = _author_from_node(payload)
-            if candidate and str(candidate.get("sec_uid") or "") == expected_sec_uid:
+            candidate_sec_uid = str((candidate or {}).get("sec_uid") or "")
+            candidate_uid = str((candidate or {}).get("uid") or "")
+            if candidate and (
+                candidate_sec_uid == expected_sec_uid
+                or (str(expected_sec_uid).isdigit() and candidate_uid == expected_sec_uid)
+            ):
                 author = candidate
                 break
         if author is None:
+            if str(expected_sec_uid).isdigit():
+                raise VideoUnavailableError("无法把数字 uid 解析为稳定的 sec_uid")
             author = {
                 "sec_uid": expected_sec_uid,
                 "nickname": (await page.title()).removesuffix("的抖音 - 抖音").strip()
                 or "抖音博主",
             }
-            count_match = re.search(r"作品\s*(\d+)", body)
-            if count_match:
-                author["aweme_count"] = int(count_match.group(1))
 
         profile = _profile_from_author(author, original_url)
         reported = profile.reported_work_count

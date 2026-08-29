@@ -10,6 +10,7 @@ from douyin_wiki.adapters.image_note import (
     _best_image_url,
     _dedupe_image_urls,
     _dom_text_metadata,
+    _find_aweme_detail,
     _metadata_from_aweme,
     _page_auth_blocked,
     _usable_auth_cookies,
@@ -34,6 +35,18 @@ from douyin_wiki.service import DouyinWikiService
 from douyin_wiki.worker import Worker
 
 WORK_ID = "7674987897195870714"
+
+
+def test_aweme_detail_must_match_requested_work() -> None:
+    payload = {
+        "recommendations": [
+            {"aweme_id": "9999999999999999999", "images": [{"url_list": ["wrong"]}]}
+        ],
+        "aweme_detail": {"aweme_id": WORK_ID, "images": [{"url_list": ["right"]}]},
+    }
+    detail = _find_aweme_detail(payload, expected_work_id=WORK_ID)
+    assert detail and detail["aweme_id"] == WORK_ID
+    assert _find_aweme_detail(payload, expected_work_id="1111111111111111111") is None
 
 
 class NoteResolver:

@@ -66,32 +66,35 @@ def _usable_auth_cookies(
 
 
 def _page_auth_blocked(text: str, status: int | None) -> bool:
-    lowered = text.lower()
+    lowered = text[:2000].lower()
     return status in {401, 403} or any(
         token in lowered for token in ("登录后查看", "请登录", "验证码", "安全验证")
     )
 
 
-def _find_aweme_detail(value: Any) -> dict[str, Any] | None:
+def _find_aweme_detail(value: Any, *, expected_work_id: str | None = None) -> dict[str, Any] | None:
     """Find a work-detail object in the different envelopes used by Douyin."""
+    def matches(candidate: dict[str, Any]) -> bool:
+        candidate_id = str(candidate.get("aweme_id") or candidate.get("item_id") or "")
+        return bool(candidate_id and (expected_work_id is None or candidate_id == expected_work_id))
+
     if isinstance(value, dict):
         for key in ("aweme_detail", "aweme", "item", "note_detail"):
             candidate = value.get(key)
             if isinstance(candidate, dict) and (
-                candidate.get("aweme_id")
-                or candidate.get("images")
-                or candidate.get("image_post_info")
+                matches(candidate)
+                and (candidate.get("images") or candidate.get("image_post_info"))
             ):
                 return candidate
-        if value.get("aweme_id") and (value.get("images") or value.get("image_post_info")):
+        if matches(value) and (value.get("images") or value.get("image_post_info")):
             return value
         for child in value.values():
-            found = _find_aweme_detail(child)
+            found = _find_aweme_detail(child, expected_work_id=expected_work_id)
             if found:
                 return found
     elif isinstance(value, list):
         for child in value:
-            found = _find_aweme_detail(child)
+            found = _find_aweme_detail(child, expected_work_id=expected_work_id)
             if found:
                 return found
     return None
@@ -484,54 +487,62 @@ class PlaywrightImageNoteDownloader:
                 context = await playwright.chromium.launch_persistent_context(
                     **self._launch_options(headless=True)
                 )
-                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    page = context.pages[0] if context.pages else await context.new_page()
 
-                async def capture_response(response: Any) -> None:
-                    lowered = response.url.lower()
-                    if not any(token in lowered for token in ("aweme", "detail", "note")):
-                        return
-                    if "json" not in response.headers.get("content-type", "").lower():
-                        return
-                    try:
-                        payloads.append(await response.json())
-                    except Exception:
-                        return
+                    async def capture_response(response: Any) -> None:
+                        lowered = response.url.lower()
+                        if not any(token in lowered for token in ("aweme", "detail", "note")):
+                            return
+                        if "json" not in response.headers.get("content-type", "").lower():
+                            return
+                        try:
+                            payloads.append(await response.json())
+                        except Exception:
+                            return
 
-                page.on("response", capture_response)
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(2500)
-                body_text = (await page.locator("body").inner_text(timeout=10_000))[:20_000]
-
-                metadata: VideoMetadata | None = None
-                image_urls: list[str] = []
-                for payload in payloads:
-                    if detail := _find_aweme_detail(payload):
-                        metadata, image_urls = _metadata_from_aweme(
-                            detail, url=url, work_id=work_id
-                        )
-                        if image_urls:
+                    page.on("response", capture_response)
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                    for _ in range(20):
+                        if any(
+                            _find_aweme_detail(payload, expected_work_id=work_id)
+                            for payload in payloads
+                        ):
                             break
+                        await page.wait_for_timeout(500)
+                    body_text = (await page.locator("body").inner_text(timeout=10_000))[:20_000]
 
-                if not image_urls:
-                    metadata, image_urls = await self._from_dom(page, url=url, work_id=work_id)
+                    metadata: VideoMetadata | None = None
+                    image_urls: list[str] = []
+                    for payload in payloads:
+                        if detail := _find_aweme_detail(payload, expected_work_id=work_id):
+                            metadata, image_urls = _metadata_from_aweme(
+                                detail, url=url, work_id=work_id
+                            )
+                            if image_urls:
+                                break
 
-                if not image_urls:
-                    self._raise_page_error(body_text, response.status if response else None)
+                    if not image_urls:
+                        metadata, image_urls = await self._from_dom(page, url=url, work_id=work_id)
 
-                image_paths = await self._download_images(context, image_urls, target_dir)
-                if metadata is None:
-                    metadata = VideoMetadata(
-                        video_id=work_id,
-                        original_url=url,
-                        canonical_url=f"https://www.douyin.com/note/{work_id}",
-                        title="抖音图文作品",
-                        source_kind=SourceKind.IMAGE_NOTE,
-                    )
-                metadata.image_paths = [str(path) for path in image_paths]
-                metadata.thumbnail_path = str(image_paths[0])
-                metadata.thumbnail_kind = "image_note_first_image"
-                await context.close()
-                return metadata
+                    if not image_urls:
+                        self._raise_page_error(body_text, response.status if response else None)
+
+                    image_paths = await self._download_images(context, image_urls, target_dir)
+                    if metadata is None:
+                        metadata = VideoMetadata(
+                            video_id=work_id,
+                            original_url=url,
+                            canonical_url=f"https://www.douyin.com/note/{work_id}",
+                            title="抖音图文作品",
+                            source_kind=SourceKind.IMAGE_NOTE,
+                        )
+                    metadata.image_paths = [str(path) for path in image_paths]
+                    metadata.thumbnail_path = str(image_paths[0])
+                    metadata.thumbnail_kind = "image_note_first_image"
+                    return metadata
+                finally:
+                    await context.close()
         except (BrowserAuthRequiredError, LivePhotoUnsupportedError, RegionRestrictedError):
             raise
         except VideoUnavailableError:

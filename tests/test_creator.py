@@ -136,12 +136,22 @@ def test_collect_mixed_creator_post_payload() -> None:
                     "desc": "本地模型选择",
                     "images": [{"url_list": ["https://x/b"]}],
                 },
+                {
+                    "aweme_id": "7674987897195870715",
+                    "desc": "五秒短视频",
+                    "video": {"duration": 5_000},
+                },
             ],
             "has_more": 0,
         }
     )
-    assert [item.source_kind for item in works] == [SourceKind.VIDEO, SourceKind.IMAGE_NOTE]
+    assert [item.source_kind for item in works] == [
+        SourceKind.VIDEO,
+        SourceKind.IMAGE_NOTE,
+        SourceKind.VIDEO,
+    ]
     assert works[0].duration_seconds == 87
+    assert works[2].duration_seconds == 5
     assert has_more is False
 
 
@@ -158,6 +168,11 @@ async def test_creator_inventory_selection_and_isolated_vault(creator_service) -
     inventory = service.get_creator_inventory(job.id)
     assert inventory["total"] == 2
     assert [item["ordinal"] for item in inventory["items"]] == [1, 2]
+    empty = service.set_creator_work_selection(
+        job.id, CreatorWorkDecision.SELECTED, ordinals=[]
+    )
+    assert empty["changed"] == 0
+    assert empty["selection"]["pending"] == 2
     with pytest.raises(Exception, match="仍有未决定作品"):
         service.confirm_creator_import(job.id)
 

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shutil
 import socket
 import subprocess
@@ -114,6 +115,101 @@ def write_config(config: AppConfig, path: Path | None = None, *, overwrite: bool
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     return target
+
+
+def update_config_values(
+    path: Path,
+    updates: dict[str | None, dict[str, object]],
+) -> Path:
+    """Patch known TOML keys while preserving comments and unknown settings."""
+    if not path.exists():
+        raise FileNotFoundError(path)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for section, values in updates.items():
+        section_start = 0
+        section_end = len(lines)
+        if section is not None:
+            header = f"[{section}]"
+            section_index = next(
+                (index for index, line in enumerate(lines) if line.strip() == header), None
+            )
+            if section_index is None:
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.extend([f"\n{header}\n"])
+                section_index = len(lines) - 1
+            section_start = section_index + 1
+            section_end = next(
+                (
+                    index
+                    for index in range(section_start, len(lines))
+                    if re.match(r"^\s*\[", lines[index])
+                ),
+                len(lines),
+            )
+        else:
+            section_end = next(
+                (index for index, line in enumerate(lines) if re.match(r"^\s*\[", line)),
+                len(lines),
+            )
+        missing: list[str] = []
+        for key, value in values.items():
+            rendered = _toml_scalar(value)
+            key_pattern = re.compile(rf"^(?P<indent>\s*){re.escape(key)}\s*=.*$")
+            matched = False
+            for index in range(section_start, section_end):
+                if match := key_pattern.match(lines[index].rstrip("\n")):
+                    comment = _toml_inline_comment(lines[index].rstrip("\n"))
+                    lines[index] = f"{match.group('indent')}{key} = {rendered}{comment}\n"
+                    matched = True
+                    break
+            if not matched:
+                missing.append(f"{key} = {rendered}\n")
+        if missing:
+            lines[section_end:section_end] = missing
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.writelines(lines)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def _toml_scalar(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _toml_inline_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote == '"':
+            escaped = True
+        elif character in {'"', "'"}:
+            quote = None if quote == character else character if quote is None else quote
+        elif character == "#" and quote is None:
+            return " " + line[index:].lstrip()
+    return ""
 
 
 def doctor(config: AppConfig) -> dict[str, Any]:

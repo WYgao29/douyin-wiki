@@ -1497,13 +1497,22 @@ function makeCitation(citation, index) {
   location.textContent = formatLocation(citation);
   meta.append(location);
   if (citation.original_url) {
+    let safeSourceUrl = null;
+    try {
+      const parsed = new URL(citation.original_url);
+      if (["http:", "https:"].includes(parsed.protocol)) safeSourceUrl = parsed.href;
+    } catch (_error) {
+      safeSourceUrl = null;
+    }
+    if (safeSourceUrl) {
     const source = document.createElement("a");
-    source.href = citation.original_url;
+    source.href = safeSourceUrl;
     source.target = "_blank";
     source.rel = "noopener noreferrer";
     source.textContent = "原作品";
     source.append(svgIcon("external-link"));
     meta.append(source);
+    }
   }
   copy.append(title, meta);
   if (citation.snippet) {

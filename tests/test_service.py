@@ -304,21 +304,24 @@ async def test_two_hour_limit_can_be_overridden(service) -> None:
         "https://v.douyin.com/uvHsRpXIn8s/",
         options=CaptureOptions(approve_cloud_analysis=True),
     )
-    failed = await Worker(service).run_once()
-    assert failed.status == JobStatus.FAILED
-    assert failed.error_code == "video_too_long"
+    paused = await Worker(service).run_once()
+    assert paused.status == JobStatus.WAITING_CONFIRMATION
+    assert paused.result["reason"] == "video_too_long"
+    service.approve_job(paused.id)
+    completed = await Worker(service).run_once()
+    assert completed.status == JobStatus.COMPLETED
 
 
 @pytest.mark.asyncio
-async def test_failed_job_can_retry_from_checkpoint(service) -> None:
+async def test_long_job_can_continue_from_checkpoint(service) -> None:
     service.downloader = FakeDownloader(duration=121 * 60)
     job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
-    failed = await Worker(service).run_once()
-    assert failed.status == JobStatus.FAILED
-    assert "metadata" in failed.artifacts
-    retried = service.retry_job(job.id)
+    paused = await Worker(service).run_once()
+    assert paused.status == JobStatus.WAITING_CONFIRMATION
+    assert "metadata" in paused.artifacts
+    retried = service.approve_job(job.id)
     assert retried.status == JobStatus.QUEUED
-    assert retried.artifacts["metadata"] == failed.artifacts["metadata"]
+    assert retried.artifacts["metadata"] == paused.artifacts["metadata"]
 
 
 @pytest.mark.asyncio
@@ -479,6 +482,40 @@ async def test_confirm_reminder_requires_absolute_time(service, fake_reminders) 
     assert repeated["system_id"] == "system-reminder-1"
     assert repeated["candidate"]["due_at"] == "2026-09-01T09:00:00+08:00"
     assert len(fake_reminders.created) == 1
+    service.rebuild_database_from_vault(apply=True)
+    rebuilt = service.confirm_reminder(entry_id, "reminder-1", confirmed=True)
+    assert rebuilt["system_id"] == "system-reminder-1"
+    assert len(fake_reminders.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_character_chinese_search_uses_lexical_index(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry = service.database.get_entry(completed.result["entry_id"])
+    data = service.database.get_entry_data(entry.id)
+    data["analysis"]["one_liner"] = "今天教你苹果手机拍照技巧"
+    service.database.upsert_entry(entry, data)
+    service.indexer.index_entry(entry, data)
+
+    assert service.search_knowledge("苹果")[0].entry_id == entry.id
+    assert service.search_knowledge("拍照")[0].entry_id == entry.id
+
+
+@pytest.mark.asyncio
+async def test_rebuild_reports_bad_entry_without_clearing_database(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+    entry = service.database.get_entry(entry_id)
+    machine = service.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+    machine.write_text("---\ntype: broken\n---\n", encoding="utf-8")
+
+    report = service.rebuild_database_from_vault(apply=False)
+    assert report["entry_errors"]
+    with pytest.raises(JobStateError, match="entry_errors"):
+        service.rebuild_database_from_vault(apply=True)
+    assert service.database.get_entry(entry_id).id == entry_id
 
 
 @pytest.mark.asyncio

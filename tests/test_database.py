@@ -4,7 +4,10 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from douyin_wiki.database import Database
+from douyin_wiki.errors import JobLeaseLostError
 from douyin_wiki.models import CaptureRequest, InspirationInput, JobStatus
 
 
@@ -84,4 +87,23 @@ def test_initialize_migrates_chunks_with_image_index(tmp_path: Path) -> None:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(chunks)")}
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     assert "image_index" in columns
-    assert version == 8
+    assert version == 9
+
+
+def test_stale_worker_cannot_update_or_unlock_new_owner(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    job = database.create_job(CaptureRequest(share_text="https://v.douyin.com/test/"))
+    assert database.claim_next_job(worker_id="worker-a", lease_seconds=30)
+    assert database.recover_expired_jobs(datetime.now(UTC) + timedelta(minutes=1)) == 1
+    claimed = database.claim_next_job(worker_id="worker-b", lease_seconds=300)
+    assert claimed and claimed.id == job.id
+
+    with database.claimed_job_updates(job.id, "worker-a"), pytest.raises(JobLeaseLostError):
+        database.update_job(job.id, status=JobStatus.COMPLETED, unlock=True)
+
+    current = database.get_job(job.id)
+    assert current.status == JobStatus.QUEUED
+    with database.connect() as connection:
+        owner = connection.execute("SELECT lock_owner FROM jobs WHERE id=?", (job.id,)).fetchone()
+    assert owner["lock_owner"] == "worker-b"

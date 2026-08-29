@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import uuid
+import warnings
 from contextlib import suppress
 from datetime import timedelta
 from importlib.resources import files
@@ -41,8 +42,8 @@ from .errors import (
     DouyinWikiError,
     EntryNotFoundError,
     ExternalToolError,
+    JobLeaseLostError,
     JobStateError,
-    VideoTooLongError,
 )
 from .models import (
     AnalysisMode,
@@ -419,6 +420,8 @@ class DouyinWikiService:
                 "creator_id": creator_id,
                 "inventory_partial": False,
             },
+            status=JobStatus.NEEDS_SELECTION,
+            progress=0.5,
         )
         self.database.create_creator_run_items(job.id, creator_id, work_ids)
         self.database.set_creator_run_selection(
@@ -657,7 +660,11 @@ class DouyinWikiService:
             raise JobStateError("只有处于“等待用户确认”状态的任务可以批准")
         return self.database.requeue_job(
             job_id,
-            artifacts={"ai_analysis_approved": True, "cloud_analysis_approved": True},
+            artifacts={
+                "ai_analysis_approved": True,
+                "cloud_analysis_approved": True,
+                "long_video_approved": True,
+            },
         )
 
     def retry_job(self, job_id: str) -> JobRecord:
@@ -885,7 +892,7 @@ class DouyinWikiService:
             changed = self.vault.write_topic(topic, artifacts, entries)
             topics_index = self.vault.write_topics_index(self.database.list_topics())
             changed.append(topics_index)
-            self.vault.commit(changed, f"docs: update topic {topic.id}")
+            self._commit_vault(changed, f"docs: update topic {topic.id}")
         return changed
 
     def create_topic(
@@ -1244,14 +1251,22 @@ class DouyinWikiService:
         )
 
         safe: list[Path] = []
+        configured_root = self.config.vault_path.absolute()
         for candidate in candidates:
+            try:
+                lexical_relative = candidate.absolute().relative_to(configured_root)
+            except ValueError:
+                continue
+            cursor = configured_root
+            for part in lexical_relative.parts:
+                cursor /= part
+                if cursor.is_symlink():
+                    raise ValueError("资料包含 Vault 内部符号链接，已停止删除")
             try:
                 resolved = candidate.resolve()
                 relative = resolved.relative_to(vault)
             except (OSError, ValueError):
                 continue
-            if candidate.absolute() != resolved:
-                raise ValueError("资料包含符号链接，已停止删除以保护 Vault 其他文件")
             if not relative.parts or relative.parts[0] == ".douyin-wiki" or not resolved.exists():
                 continue
             safe.append(resolved)
@@ -1884,10 +1899,12 @@ class DouyinWikiService:
         entry = self.database.get_entry(entry_id)
         candidate, status, system_id = self.database.get_reminder(entry_id, reminder_id)
         if status == "created":
+            warning = self._sync_reminder_documents(entry_id)
             return {
                 "status": status,
                 "system_id": system_id,
                 "candidate": candidate.model_dump(mode="json"),
+                **({"warning": warning} if warning else {}),
             }
         candidate_data = candidate.model_dump(mode="python")
         if due_at:
@@ -1896,7 +1913,9 @@ class DouyinWikiService:
         if title:
             candidate_data["title"] = title
         candidate = ReminderCandidate.model_validate(candidate_data)
-        if not self.database.claim_reminder_creation(entry_id, reminder_id, candidate):
+        if status != "creating" and not self.database.claim_reminder_creation(
+            entry_id, reminder_id, candidate
+        ):
             candidate, status, system_id = self.database.get_reminder(entry_id, reminder_id)
             return {
                 "status": status,
@@ -1904,16 +1923,38 @@ class DouyinWikiService:
                 "candidate": candidate.model_dump(mode="json"),
             }
         try:
-            created_id = self.reminders.create(candidate, source_url=entry.original_url)
+            created_id = self.reminders.create(
+                candidate,
+                source_url=entry.original_url,
+                idempotency_key=f"{entry_id}:{candidate.id}",
+            )
         except Exception:
             self.database.release_reminder_creation(entry_id, reminder_id)
             raise
         self.database.mark_reminder_created(entry_id, reminder_id, created_id)
+        warning = self._sync_reminder_documents(entry_id)
         return {
             "status": "created",
             "system_id": created_id,
             "candidate": candidate.model_dump(mode="json"),
+            **({"warning": warning} if warning else {}),
         }
+
+    def _sync_reminder_documents(self, entry_id: str) -> str | None:
+        with self.vault.entry_operations_locked(), self.vault.locked():
+            entry = self.database.get_entry(entry_id)
+            data = self.database.get_entry_data(entry_id)
+            written = self.vault.write_entry(entry, data)
+            commit_failed = (
+                bool(written.changed_paths)
+                and (self.config.vault_path / ".git").exists()
+                and not self.vault.commit(
+                    written.changed_paths, f"reminder: record state for {entry.video_id}"
+                )
+            )
+            if commit_failed:
+                return "提醒已创建并保存，但 Git 提交失败；后续维护会再次提交"
+        return None
 
     async def process_claimed_job(self, job: JobRecord) -> JobRecord:
         try:
@@ -1923,6 +1964,8 @@ class DouyinWikiService:
                 outcome = await self._process_reanalysis(job)
             else:
                 outcome = await self._process_capture(job)
+        except JobLeaseLostError:
+            raise
         except (BrowserAuthRequiredError, CookieRequiredError) as exc:
             is_video = isinstance(exc, CookieRequiredError)
             is_creator = job.kind == "creator_import"
@@ -2241,7 +2284,13 @@ class DouyinWikiService:
             if creator_folder
             else self.config.vault_path / "raw" / "assets" / video_id
         )
-        if "metadata" not in artifacts or not artifacts.get("video_path"):
+        checkpoint_video = Path(str(artifacts.get("video_path") or ""))
+        video_checkpoint_valid = (
+            bool(artifacts.get("video_path"))
+            and checkpoint_video.is_file()
+            and checkpoint_video.stat().st_size > 0
+        )
+        if "metadata" not in artifacts or not video_checkpoint_valid:
             self.database.update_job(job.id, status=JobStatus.DOWNLOADING, progress=0.12)
             async with self.download_semaphore:
                 metadata = await self.downloader.download(
@@ -2291,9 +2340,19 @@ class DouyinWikiService:
         if (
             duration_minutes > self.config.media.max_duration_minutes
             and not request.options.allow_long
+            and not artifacts.get("long_video_approved")
         ):
-            raise VideoTooLongError(
-                f"视频时长 {duration_minutes:.1f} 分钟，超过默认上限；请使用 allow_long=true"
+            return self.database.update_job(
+                job.id,
+                status=JobStatus.WAITING_CONFIRMATION,
+                progress=0.3,
+                result={
+                    "reason": "video_too_long",
+                    "duration_minutes": round(duration_minutes, 1),
+                    "message": "视频超过默认时长上限；确认后可继续处理已下载媒体",
+                    "next_tool": "approve_job",
+                },
+                unlock=True,
             )
         approved = (
             request.options.approve_cloud_analysis
@@ -2698,8 +2757,14 @@ class DouyinWikiService:
             }
             ocr_items: list[OCRObservation] = []
             for observation in raw_ocr:
-                image_index = observation.image_index or image_index_by_path.get(
-                    str(Path(observation.image_path).resolve()) if observation.image_path else ""
+                image_index = (
+                    observation.image_index
+                    or observation.source_index
+                    or image_index_by_path.get(
+                        str(Path(observation.image_path).resolve())
+                        if observation.image_path
+                        else ""
+                    )
                 )
                 if image_index is None and observation.timestamp_ms:
                     image_index = int(observation.timestamp_ms)
@@ -3036,12 +3101,7 @@ class DouyinWikiService:
                     [*written.changed_paths, index],
                 )
                 changed.append(log)
-            committed = self.vault.commit(changed, commit_message)
-            if (self.config.vault_path / ".git").exists() and not committed:
-                raise ExternalToolError(
-                    "Vault 文档已生成，但 Git 提交失败；任务可安全重试",
-                    details={"paths": [str(path) for path in changed]},
-                )
+            self._commit_vault(changed, commit_message)
 
     def _persist_entry_documents_and_bundle(
         self,
@@ -3206,7 +3266,19 @@ class DouyinWikiService:
             root_index = self.vault.rebuild_index(entries)
             changed.append(root_index)
             if (self.config.vault_path / ".git").exists():
-                self.vault.commit(changed, f"creator: {creator.nickname} {action}")
+                self._commit_vault(changed, f"creator: {creator.nickname} {action}")
+
+    def _commit_vault(self, changed: list[Path], message: str) -> bool:
+        if not (self.config.vault_path / ".git").exists():
+            return True
+        committed = self.vault.commit(changed, message)
+        if not committed:
+            warnings.warn(
+                f"Vault 与 SQLite 已保存，但 Git 提交失败，文件保持为待提交状态：{message}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return committed
 
     def _refresh_creator_parent(self, parent_job_id: str) -> None:
         if not parent_job_id:
@@ -3306,9 +3378,14 @@ class DouyinWikiService:
             "creator_ids": [creator.id for creator, _ in loaded_creators],
             "topic_count": len(loaded_topics),
             "topic_ids": [topic.id for topic, _ in loaded_topics],
+            "entry_errors": list(self.vault.last_entry_load_errors),
         }
         if not apply:
             return report
+        if self.vault.last_entry_load_errors:
+            raise JobStateError(
+                "Vault 中存在无法解析的资料；请根据 dry-run 的 entry_errors 修复后再重建"
+            )
         if self.database.has_unfinished_creator_jobs():
             raise JobStateError("存在未完成的博主清点或批量任务，完成后再重建 SQLite")
         prepared: list[
@@ -3711,9 +3788,9 @@ class DouyinWikiService:
 
 def _deduplicate_issues(issues: list[ReviewIssue]) -> list[ReviewIssue]:
     result: list[ReviewIssue] = []
-    seen: set[tuple[int, int, str]] = set()
+    seen: set[tuple[int, int, int | None, str]] = set()
     for issue in issues:
-        key = (issue.start_ms, issue.end_ms, issue.raw_text)
+        key = (issue.start_ms, issue.end_ms, issue.image_index, issue.raw_text)
         if key not in seen:
             seen.add(key)
             result.append(issue)

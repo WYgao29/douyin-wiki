@@ -79,6 +79,14 @@ class OpenAICompatibleChatProvider:
                 return
             except (httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
                 last_error = exc
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
+                    if status in {401, 403}:
+                        raise ModelConfigurationError(
+                            "模型接口拒绝了 API Key，请检查密钥和模型权限。"
+                        ) from exc
+                    if status not in {408, 429} and status < 500:
+                        break
                 if emitted or attempt >= self.settings.max_retries:
                     break
                 await asyncio.sleep(2**attempt)

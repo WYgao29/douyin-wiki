@@ -4,7 +4,7 @@ import re
 
 from .models import ReviewIssue, TranscriptSegment
 
-MATERIAL_PATTERN = re.compile(r"\d|[年月日号点时分]|元|块|折|%|[A-Za-z]{2,}")
+MATERIAL_PATTERN = re.compile(r"\d|元|块|折|%|[A-Za-z]{2,}")
 
 
 def detect_review_issues(segments: list[TranscriptSegment]) -> list[ReviewIssue]:
@@ -13,8 +13,9 @@ def detect_review_issues(segments: list[TranscriptSegment]) -> list[ReviewIssue]
         low_confidence = (segment.confidence is not None and segment.confidence < 0.55) or (
             segment.avg_logprob is not None and segment.avg_logprob < -1.0
         )
+        very_low_confidence = segment.confidence is not None and segment.confidence < 0.35
         material = bool(MATERIAL_PATTERN.search(segment.text))
-        if low_confidence and (material or (segment.confidence or 0) < 0.35):
+        if low_confidence and (material or very_low_confidence):
             issues.append(
                 ReviewIssue(
                     id=f"asr-{segment.id}",

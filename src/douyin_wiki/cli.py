@@ -9,6 +9,7 @@ from typing import Annotated
 import typer
 
 from .config import AppConfig, default_config_path, llm_api_key_required, load_config
+from .errors import DouyinWikiError
 from .localization import (
     localize_for_user,
     parse_creator_decision,
@@ -32,6 +33,7 @@ from .setup import (
     VaultSetupMode,
     WebLaunchAgentInstaller,
     obsidian_vault_status,
+    update_config_values,
     validate_vault_target,
     write_config,
 )
@@ -217,20 +219,14 @@ def init_command(
 @app.command("configure-model")
 def configure_model(
     model: Annotated[str, typer.Option(prompt=True, help="模型名称")],
-    api_key: Annotated[
-        str | None,
-        typer.Option(
-            hide_input=True,
-            help="API key；本机 loopback 模型可留空",
-        ),
-    ] = None,
     base_url: Annotated[str | None, typer.Option(help="OpenAI-compatible base URL")] = None,
     config_path: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     target = config_path or default_config_path()
     config = load_config(target)
     resolved_base_url = base_url or config.llm.base_url
-    if llm_api_key_required(resolved_base_url) and not api_key:
+    api_key: str | None = None
+    if llm_api_key_required(resolved_base_url):
         api_key = typer.prompt(
             "API key",
             hide_input=True,
@@ -244,7 +240,20 @@ def configure_model(
         }
     )
     config = config.model_copy(update={"llm": llm, "analysis_mode": AnalysisMode.PROVIDER})
-    write_config(config, target, overwrite=True)
+    if target.exists():
+        update_config_values(
+            target,
+            {
+                None: {"analysis_mode": AnalysisMode.PROVIDER.value},
+                "llm": {
+                    "enabled": True,
+                    "model": config.llm.model,
+                    "base_url": config.llm.base_url,
+                },
+            },
+        )
+    else:
+        write_config(config, target, overwrite=True)
     if api_key:
         store_secret(config.llm.api_key_env, api_key)
     installer = LaunchAgentInstaller(target)
@@ -277,7 +286,10 @@ def configure_analysis_mode(
 ) -> None:
     target = config_path or default_config_path()
     config = load_config(target).model_copy(update={"analysis_mode": mode})
-    write_config(config, target, overwrite=True)
+    if target.exists():
+        update_config_values(target, {None: {"analysis_mode": mode.value}})
+    else:
+        write_config(config, target, overwrite=True)
     installer = LaunchAgentInstaller(target)
     worker_plist = installer.launch_agents / f"{installer.WORKER_LABEL}.plist"
     restarted = False
@@ -328,7 +340,10 @@ def capture_command(
     config_path: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     inspirations = [InspirationInput(text=value) for value in (inspiration or [])]
-    if inspirations and any(value is not None for value in (quote, start_ms, end_ms)):
+    anchored = any(value is not None for value in (quote, start_ms, end_ms))
+    if anchored and len(inspirations) != 1:
+        raise typer.BadParameter("quote/start-ms/end-ms 必须与且仅与一条 --inspiration 一起使用")
+    if inspirations and anchored:
         inspirations[0] = inspirations[0].model_copy(
             update={"quote": quote, "start_ms": start_ms, "end_ms": end_ms}
         )
@@ -831,9 +846,9 @@ def worker_run(
     once: bool = False,
     config_path: Path | None = None,
 ) -> None:
-    worker = Worker(_service(config_path))
     if forever and once:
         raise typer.BadParameter("--forever 和 --once 不能同时使用")
+    worker = Worker(_service(config_path))
     result = asyncio.run(worker.run_forever() if forever else worker.run_once())
     if not forever:
         _print(result.model_dump(mode="json") if result else {"status": "idle"})
@@ -903,7 +918,23 @@ def web_status(config_path: Path | None = None) -> None:
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except DouyinWikiError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": exc.code,
+                        "message": str(exc),
+                        "details": exc.details,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

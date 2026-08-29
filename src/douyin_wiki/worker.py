@@ -4,9 +4,11 @@ import asyncio
 import sys
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from .errors import JobLeaseLostError
 from .runtime import LOADED_SOURCE_SIGNATURE, source_signature
 from .service import DouyinWikiService
 
@@ -89,6 +91,7 @@ class Worker:
 
     async def _process_with_heartbeat(self, job):
         stop = asyncio.Event()
+        lease_lost = asyncio.Event()
 
         async def heartbeat() -> None:
             while True:
@@ -103,13 +106,31 @@ class Worker:
                         self.worker_id,
                         lease_seconds=self.service.config.worker.lease_seconds,
                     ):
+                        lease_lost.set()
                         return
 
         heartbeat_task = asyncio.create_task(heartbeat())
+        async def process():
+            with self.service.database.claimed_job_updates(job.id, self.worker_id):
+                return await self.service.process_claimed_job(job)
+
+        processing_task = asyncio.create_task(process())
+        lease_lost_task = asyncio.create_task(lease_lost.wait())
         try:
-            return await self.service.process_claimed_job(job)
+            done, _ = await asyncio.wait(
+                {processing_task, lease_lost_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if processing_task in done:
+                return processing_task.result()
+            processing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await processing_task
+            raise JobLeaseLostError(f"任务 {job.id} 的 Worker 租约已失效")
         finally:
             stop.set()
+            lease_lost_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lease_lost_task
             await heartbeat_task
 
     def run_due_maintenance(self, now: datetime | None = None) -> dict | None:

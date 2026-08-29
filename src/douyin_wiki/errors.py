@@ -51,5 +51,9 @@ class JobStateError(DouyinWikiError):
     code = "invalid_job_state"
 
 
+class JobLeaseLostError(JobStateError):
+    code = "job_lease_lost"
+
+
 class EntryNotFoundError(DouyinWikiError):
     code = "entry_not_found"

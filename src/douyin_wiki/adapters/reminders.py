@@ -11,10 +11,19 @@ function run(argv) {
   const title = argv[0];
   const dueAt = argv[1];
   const notes = argv[2];
+  const marker = argv[3];
   const app = Application('Reminders');
   app.includeStandardAdditions = true;
   const lists = app.lists();
   if (!lists.length) throw new Error('No reminder list is available');
+  for (const list of lists) {
+    for (const existing of list.reminders()) {
+      const body = existing.body() || '';
+      if (body.includes(marker)) {
+        return JSON.stringify({id: existing.id(), name: existing.name(), existing: true});
+      }
+    }
+  }
   const reminder = app.Reminder({name: title, body: notes, dueDate: new Date(dueAt)});
   lists[0].reminders.push(reminder);
   return JSON.stringify({id: reminder.id(), name: reminder.name()});
@@ -23,10 +32,16 @@ function run(argv) {
 
 
 class MacOSReminderAdapter:
-    def create(self, candidate: ReminderCandidate, *, source_url: str) -> str:
+    def create(
+        self, candidate: ReminderCandidate, *, source_url: str, idempotency_key: str | None = None
+    ) -> str:
         if candidate.due_at is None or candidate.needs_clarification:
             raise JobStateError("提醒时间不明确，必须先由用户确认绝对时间")
-        notes = f"来源：{source_url}\n原因：{candidate.reason}\n原话：{candidate.source_quote}"
+        marker = f"douyin-wiki:{idempotency_key or candidate.id}"
+        notes = (
+            f"来源：{source_url}\n原因：{candidate.reason}\n原话：{candidate.source_quote}"
+            f"\n\n[{marker}]"
+        )
         try:
             result = subprocess.run(
                 [
@@ -39,6 +54,7 @@ class MacOSReminderAdapter:
                     candidate.title,
                     candidate.due_at.isoformat(),
                     notes,
+                    marker,
                 ],
                 capture_output=True,
                 text=True,

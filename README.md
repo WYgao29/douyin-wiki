@@ -30,7 +30,7 @@
 - 优先索引带上下文、时间戳、原文和来源类型的 `knowledge_atoms`。
 - 用户确认后创建 macOS 提醒事项。
 - 每周标记过期内容、检查孤立页面，并把到期媒体移入系统废纸篓。
-- Web v0.1.3 动态读取 Vault，以封面资料库和文章页供用户浏览，并提供带证据引用的本地 AI 对话。
+- Web v0.1.4 动态读取 Vault，以封面资料库和文章页供用户浏览，并提供带证据引用的本地 AI 对话。
 
 ## 安装
 
@@ -341,7 +341,7 @@ uv run douyin-wiki service uninstall
 常驻 Worker 会检测本地程序文件是否已更新：停止领取新任务，等待正在处理的任务结束后退出，
 再由 LaunchAgent 自动启动新进程，避免更新前的旧代码处理新任务。
 
-## Web v0.1.3
+## Web v0.1.4
 
 Web 页面动态扫描 `wiki/sources/` 和 `creators/*/sources/`，不为每篇资料生成或维护单独的
 HTML 文件。新文章入库或已有文章更新后，文件监听器会刷新资料库；`raw/`、`.data/`、日志和
@@ -427,7 +427,7 @@ uv build
 
 ```bash
 python3.12 -m venv /tmp/douku-release-check
-/tmp/douku-release-check/bin/pip install dist/douyin_wiki-0.1.3-py3-none-any.whl
+/tmp/douku-release-check/bin/pip install dist/douyin_wiki-0.1.4-py3-none-any.whl
 /tmp/douku-release-check/bin/douyin-wiki --help
 ```
 
@@ -437,6 +437,6 @@ python3.12 -m venv /tmp/douku-release-check
 ## 当前边界
 
 仅支持本地 macOS 单用户和抖音来源。图文第一版支持静态单图和多图，检测到 Live Photo 会
-明确报错而不会静默丢弃动态内容。Web v0.1.3 仅绑定本机回环地址，内部接口不作为远程公共 API。
+明确报错而不会静默丢弃动态内容。Web v0.1.4 仅绑定本机回环地址，内部接口不作为远程公共 API。
 不包含移动端分享菜单、公网或局域网服务、SaaS、多用户权限、远程同步或自动 Git 推送。
 抖音页面与 cookie 规则可能变化，下载错误会保留稳定错误码和原始诊断信息。

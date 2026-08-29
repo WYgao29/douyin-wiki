@@ -32,13 +32,13 @@ from ..localization import label_entry_status
 from ..models import InspirationDraft, InspirationInput, TopicArtifactKind
 from ..secrets import get_secret, store_secret
 from ..service import DouyinWikiService
-from ..setup import write_config
+from ..setup import update_config_values, write_config
 from ..time_utils import beijing_iso, format_beijing
 from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.3"
+WEB_VERSION = "0.1.4"
 
 
 class CreateSessionRequest(BaseModel):
@@ -714,7 +714,24 @@ def create_app(
                     },
                 )
             except (DouyinWikiError, httpx.HTTPError) as exc:
-                yield _event("error", {"message": str(exc)})
+                if answer:
+                    core.database.add_chat_message(
+                        session_id,
+                        "assistant",
+                        answer,
+                        citations=citations,
+                        model=current_provider.model or None,
+                    )
+                details = getattr(exc, "details", {})
+                cause = str(details.get("cause") or "").strip()
+                yield _event(
+                    "error",
+                    {
+                        "message": str(exc),
+                        "cause": cause[:500] or None,
+                        "partial_saved": bool(answer),
+                    },
+                )
             except Exception:
                 yield _event("error", {"message": "AI 对话暂时不可用，请稍后重试。"})
 
@@ -782,12 +799,22 @@ def create_app(
                 updated = current_config.model_copy(update={"llm": llm})
                 if payload.api_key:
                     await asyncio.to_thread(store_secret, llm.api_key_env, payload.api_key)
-                await asyncio.to_thread(
-                    write_config,
-                    updated,
-                    config_path_value,
-                    overwrite=True,
-                )
+                if config_path_value.exists():
+                    await asyncio.to_thread(
+                        update_config_values,
+                        config_path_value,
+                        {
+                            "llm": {
+                                "enabled": True,
+                                "base_url": llm.base_url,
+                                "model": llm.model,
+                            }
+                        },
+                    )
+                else:
+                    await asyncio.to_thread(
+                        write_config, updated, config_path_value, overwrite=True
+                    )
                 app.state.config = updated
                 core.config = updated
                 app.state.chat_provider = await asyncio.to_thread(provider_factory, llm)
@@ -848,7 +875,8 @@ def create_app(
         if catalog.get(payload.entry_id) is None:
             raise HTTPException(status_code=404, detail="目标文章不存在")
         try:
-            entry = core.add_inspiration(
+            entry = await asyncio.to_thread(
+                core.add_inspiration,
                 payload.entry_id,
                 InspirationInput(
                     text=payload.text,
@@ -859,7 +887,7 @@ def create_app(
             )
         except EntryNotFoundError as exc:
             raise HTTPException(status_code=404, detail="目标文章尚未进入知识索引") from exc
-        catalog.refresh()
+        await asyncio.to_thread(catalog.refresh)
         await notifier.publish()
         return {
             "status": "灵感已保存",

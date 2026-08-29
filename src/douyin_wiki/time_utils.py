@@ -29,7 +29,8 @@ def parse_datetime(value: str | date | datetime | None) -> datetime | None:
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day, tzinfo=UTC)
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def to_beijing(value: str | date | datetime) -> datetime:

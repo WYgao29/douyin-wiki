@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import unicodedata
 import uuid
 from collections.abc import Collection, Iterable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .errors import EntryNotFoundError, JobStateError
+from .errors import EntryNotFoundError, JobLeaseLostError, JobStateError
 from .models import (
     CaptureRequest,
     ChatMessage,
@@ -296,8 +299,29 @@ CREATE TABLE IF NOT EXISTS web_chat_messages (
 CREATE INDEX IF NOT EXISTS idx_web_chat_messages_session
 ON web_chat_messages(session_id, id);
 
-PRAGMA user_version=8;
 """
+
+
+_LEXICAL_PARTS = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+|[\w]+", re.UNICODE)
+_ACTIVE_CLAIM: ContextVar[tuple[str, str] | None] = ContextVar("active_job_claim", default=None)
+
+
+def lexical_tokens(value: str) -> list[str]:
+    """Return deterministic FTS tokens, including CJK unigrams and bigrams."""
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    tokens: list[str] = []
+    for match in _LEXICAL_PARTS.finditer(normalized):
+        part = match.group(0)
+        if re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+", part):
+            tokens.extend(part)
+            tokens.extend(part[index : index + 2] for index in range(len(part) - 1))
+        else:
+            tokens.append(part)
+    return list(dict.fromkeys(token for token in tokens if token))
+
+
+def lexical_document(value: str) -> str:
+    return " ".join(lexical_tokens(value))
 
 
 class Database:
@@ -319,8 +343,18 @@ class Database:
         finally:
             conn.close()
 
+    @contextmanager
+    def claimed_job_updates(self, job_id: str, worker_id: str) -> Iterable[None]:
+        """Fence updates made while one worker owns a claimed job."""
+        token = _ACTIVE_CLAIM.set((job_id, worker_id))
+        try:
+            yield
+        finally:
+            _ACTIVE_CLAIM.reset(token)
+
     def initialize(self) -> None:
         with self.connect() as conn:
+            previous_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             conn.executescript(SCHEMA)
             self._migrate_chat_sessions_for_topics(conn)
             chunk_columns = {
@@ -340,8 +374,31 @@ class Database:
             }
             if "superseded_at" not in event_columns:
                 conn.execute("ALTER TABLE job_events ADD COLUMN superseded_at TEXT")
+            if previous_version < 9:
+                self._rebuild_fts_conn(conn)
             self._retire_undeliverable_events_conn(conn)
-            conn.execute("PRAGMA user_version=8")
+            conn.execute("PRAGMA user_version=9")
+
+    @staticmethod
+    def _rebuild_fts_conn(conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM chunks_fts")
+        rows = conn.execute(
+            "SELECT id, entry_id, text, purposes_text, tags_text FROM chunks"
+        ).fetchall()
+        conn.executemany(
+            """INSERT INTO chunks_fts(chunk_id, entry_id, text, purposes, tags)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (
+                    row["id"],
+                    row["entry_id"],
+                    lexical_document(row["text"]),
+                    lexical_document(row["purposes_text"]),
+                    lexical_document(row["tags_text"]),
+                )
+                for row in rows
+            ],
+        )
 
     @staticmethod
     def _migrate_chat_sessions_for_topics(conn: sqlite3.Connection) -> None:
@@ -434,6 +491,8 @@ class Database:
         *,
         kind: str = "capture",
         artifacts: dict[str, Any] | None = None,
+        status: JobStatus = JobStatus.QUEUED,
+        progress: float = 0,
     ) -> JobRecord:
         job_id = uuid.uuid4().hex
         now = iso_now()
@@ -442,11 +501,12 @@ class Database:
                 """INSERT INTO jobs
                    (id, kind, status, progress, request_json, artifacts_json, result_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, 0, ?, ?, '{}', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)""",
                 (
                     job_id,
                     kind,
-                    JobStatus.QUEUED.value,
+                    status.value,
+                    max(0.0, min(1.0, progress)),
                     request.model_dump_json(),
                     json.dumps(artifacts or {}, ensure_ascii=False),
                     now,
@@ -554,12 +614,14 @@ class Database:
         return self._job_from_row(row)
 
     def renew_job_lease(self, job_id: str, worker_id: str, *, lease_seconds: int = 180) -> bool:
-        expires = (utc_now() + timedelta(seconds=max(30, lease_seconds))).isoformat()
+        current = utc_now()
+        expires = (current + timedelta(seconds=max(30, lease_seconds))).isoformat()
         with self.connect() as conn:
             changed = conn.execute(
                 """UPDATE jobs SET lease_expires_at=?, updated_at=?
-                   WHERE id=? AND lock_owner=? AND locked_at IS NOT NULL""",
-                (expires, iso_now(), job_id, worker_id),
+                   WHERE id=? AND lock_owner=? AND locked_at IS NOT NULL
+                     AND lease_expires_at>?""",
+                (expires, current.isoformat(), job_id, worker_id, current.isoformat()),
             ).rowcount
         return bool(changed)
 
@@ -610,33 +672,48 @@ class Database:
         error_message: str | None = None,
         unlock: bool = False,
     ) -> JobRecord:
-        current = self.get_job(job_id)
-        assignments = ["updated_at=?"]
-        values: list[Any] = [iso_now()]
-        if status is not None:
-            assignments.append("status=?")
-            values.append(status.value)
-        if progress is not None:
-            assignments.append("progress=?")
-            values.append(max(0.0, min(1.0, progress)))
-        if artifacts is not None:
-            merged = {**current.artifacts, **artifacts}
-            assignments.append("artifacts_json=?")
-            values.append(json.dumps(merged, ensure_ascii=False))
-        if result is not None:
-            assignments.append("result_json=?")
-            values.append(json.dumps(result, ensure_ascii=False))
-        if error_code is not None:
-            assignments.append("error_code=?")
-            values.append(error_code)
-        if error_message is not None:
-            assignments.append("error_message=?")
-            values.append(error_message)
-        if unlock:
-            assignments.extend(["locked_at=NULL", "lock_owner=NULL", "lease_expires_at=NULL"])
-        values.append(job_id)
+        active_claim = _ACTIVE_CLAIM.get()
+        expected_owner = active_claim[1] if active_claim and active_claim[0] == job_id else None
         with self.connect() as conn:
-            conn.execute(f"UPDATE jobs SET {', '.join(assignments)} WHERE id=?", values)
+            conn.execute("BEGIN IMMEDIATE")
+            current_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if current_row is None:
+                raise JobStateError(f"job not found: {job_id}")
+            current = self._job_from_row(current_row)
+            assignments = ["updated_at=?"]
+            values: list[Any] = [iso_now()]
+            if status is not None:
+                assignments.append("status=?")
+                values.append(status.value)
+            if progress is not None:
+                assignments.append("progress=?")
+                values.append(max(0.0, min(1.0, progress)))
+            merged_artifacts = current.artifacts
+            if artifacts is not None:
+                merged_artifacts = {**current.artifacts, **artifacts}
+                assignments.append("artifacts_json=?")
+                values.append(json.dumps(merged_artifacts, ensure_ascii=False))
+            if result is not None:
+                assignments.append("result_json=?")
+                values.append(json.dumps(result, ensure_ascii=False))
+            if error_code is not None:
+                assignments.append("error_code=?")
+                values.append(error_code)
+            if error_message is not None:
+                assignments.append("error_message=?")
+                values.append(error_message)
+            if unlock:
+                assignments.extend(["locked_at=NULL", "lock_owner=NULL", "lease_expires_at=NULL"])
+            where = "id=?"
+            values.append(job_id)
+            if expected_owner is not None:
+                where += " AND lock_owner=? AND locked_at IS NOT NULL AND lease_expires_at>?"
+                values.extend([expected_owner, utc_now().isoformat()])
+            changed = conn.execute(
+                f"UPDATE jobs SET {', '.join(assignments)} WHERE {where}", values
+            ).rowcount
+            if expected_owner is not None and not changed:
+                raise JobLeaseLostError(f"任务 {job_id} 的 Worker 租约已失效")
             if (
                 status is not None
                 and status != current.status
@@ -654,7 +731,7 @@ class Database:
                 }
             ):
                 event_result = dict(result if result is not None else current.result)
-                if creator_context := current.artifacts.get("creator_context"):
+                if creator_context := merged_artifacts.get("creator_context"):
                     event_result["creator_context"] = creator_context
                 event_time = iso_now()
                 conn.execute(
@@ -672,7 +749,8 @@ class Database:
                         event_time,
                     ),
                 )
-        return self.get_job(job_id)
+            updated_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return self._job_from_row(updated_row)
 
     def requeue_job(self, job_id: str, *, artifacts: dict[str, Any] | None = None) -> JobRecord:
         job = self.get_job(job_id)
@@ -1155,6 +1233,8 @@ class Database:
     ) -> int:
         if decision not in {CreatorWorkDecision.SELECTED, CreatorWorkDecision.SKIPPED}:
             raise JobStateError("作品只能标记为“已选入库”或“未入库”")
+        if (ordinals is not None or work_ids is not None) and not (ordinals or work_ids):
+            return 0
         clauses = ["job_id=?"]
         params: list[Any] = [job_id]
         if ordinals:
@@ -1165,7 +1245,7 @@ class Database:
             placeholders = ",".join("?" for _ in work_ids)
             clauses.append(f"work_id IN ({placeholders})")
             params.extend(work_ids)
-        if not ordinals and not work_ids:
+        if ordinals is None and work_ids is None:
             clauses.append("1=1")
         with self.connect() as conn:
             rows = conn.execute(
@@ -1667,9 +1747,9 @@ class Database:
                     (
                         chunk_id,
                         entry.id,
-                        chunk["text"],
-                        chunk.get("purposes_text", ""),
-                        chunk.get("tags_text", ""),
+                        lexical_document(chunk["text"]),
+                        lexical_document(chunk.get("purposes_text", "")),
+                        lexical_document(chunk.get("tags_text", "")),
                     ),
                 )
             conn.execute("DELETE FROM relations WHERE source_entry_id=?", (entry.id,))
@@ -1699,15 +1779,22 @@ class Database:
                     (entry.id,),
                 ).fetchall()
             }
+            persisted_states = {
+                str(item.get("id")): item
+                for item in data.get("reminder_states", [])
+                if isinstance(item, dict) and item.get("status") == "created"
+            }
             conn.executemany(
                 """INSERT INTO reminders
                    (id, entry_id, data_json, status, system_id, updated_at)
-                   VALUES (?, ?, ?, 'candidate', NULL, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         self._reminder_storage_id(entry.id, reminder.id),
                         entry.id,
                         reminder.model_dump_json(),
+                        "created" if reminder.id in persisted_states else "candidate",
+                        persisted_states.get(reminder.id, {}).get("system_id"),
                         now,
                     )
                     for reminder in reminders
@@ -1977,6 +2064,13 @@ class Database:
 
     def mark_reminder_created(self, entry_id: str, reminder_id: str, system_id: str) -> None:
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT data_json FROM reminders WHERE entry_id=? AND id IN (?, ?)",
+                (entry_id, reminder_id, self._reminder_storage_id(entry_id, reminder_id)),
+            ).fetchone()
+            if row is None:
+                raise EntryNotFoundError(f"reminder not found: {reminder_id}")
+            candidate = ReminderCandidate.model_validate_json(row["data_json"])
             conn.execute(
                 """UPDATE reminders SET status='created', system_id=?, updated_at=?
                    WHERE entry_id=? AND id IN (?, ?)""",
@@ -1987,6 +2081,29 @@ class Database:
                     reminder_id,
                     self._reminder_storage_id(entry_id, reminder_id),
                 ),
+            )
+            entry_row = conn.execute(
+                "SELECT data_json FROM entries WHERE id=?", (entry_id,)
+            ).fetchone()
+            if entry_row is None:
+                raise EntryNotFoundError(f"entry not found: {entry_id}")
+            data = json.loads(entry_row["data_json"])
+            states = [
+                item
+                for item in data.get("reminder_states", [])
+                if isinstance(item, dict) and str(item.get("id")) != candidate.id
+            ]
+            states.append(
+                {
+                    "id": candidate.id,
+                    "status": "created",
+                    "system_id": system_id,
+                }
+            )
+            data["reminder_states"] = states
+            conn.execute(
+                "UPDATE entries SET data_json=?, updated_at=? WHERE id=?",
+                (json.dumps(data, ensure_ascii=False), iso_now(), entry_id),
             )
 
     def claim_reminder_creation(
@@ -2077,9 +2194,9 @@ class Database:
                     (
                         chunk_id,
                         entry_id,
-                        chunk["text"],
-                        chunk.get("purposes_text", ""),
-                        chunk.get("tags_text", ""),
+                        lexical_document(chunk["text"]),
+                        lexical_document(chunk.get("purposes_text", "")),
+                        lexical_document(chunk.get("tags_text", "")),
                     ),
                 )
 
@@ -2117,6 +2234,7 @@ class Database:
         self,
         query: str,
         *,
+        raw_query: str | None = None,
         include_stale: bool = False,
         limit: int = 50,
         entry_ids: Collection[str] | None = None,
@@ -2130,6 +2248,7 @@ class Database:
             conditions.append(f"c.entry_id IN ({placeholders})")
             filter_values.extend(entry_ids)
         filter_clause = "" if not conditions else "AND " + " AND ".join(conditions)
+        rows: list[sqlite3.Row] = []
         with self.connect() as conn:
             try:
                 rows = conn.execute(
@@ -2140,7 +2259,10 @@ class Database:
                     (query, *filter_values, limit),
                 ).fetchall()
             except sqlite3.OperationalError:
-                escaped = query.replace("%", "\\%").replace("_", "\\_")
+                rows = []
+            exact_query = (raw_query if raw_query is not None else query).strip()
+            if exact_query:
+                escaped = exact_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 like_conditions = [
                     "(c.text LIKE ? ESCAPE '\\' OR c.purposes_text LIKE ? ESCAPE '\\')"
                 ]
@@ -2149,11 +2271,13 @@ class Database:
                 if entry_ids is not None:
                     placeholders = ",".join("?" for _ in entry_ids)
                     like_conditions.append(f"c.entry_id IN ({placeholders})")
-                rows = conn.execute(
+                like_rows = conn.execute(
                     f"""SELECT c.*, 0 AS rank FROM chunks c
                         WHERE {' AND '.join(like_conditions)} LIMIT ?""",
                     (f"%{escaped}%", f"%{escaped}%", *filter_values, limit),
                 ).fetchall()
+                seen = {row["id"] for row in rows}
+                rows = [*rows, *(row for row in like_rows if row["id"] not in seen)][:limit]
         return [dict(row) for row in rows]
 
     def replace_relations(self, source_entry_id: str, relations: list[dict[str, Any]]) -> None:

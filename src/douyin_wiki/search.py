@@ -8,7 +8,7 @@ from collections.abc import Collection
 from typing import Any
 
 from .adapters.embeddings import EmbeddingService, cosine_similarity
-from .database import Database
+from .database import Database, lexical_tokens
 from .errors import EntryNotFoundError
 from .models import AnalysisResult, EntryRecord, Evidence, OCRObservation, TranscriptSegment
 
@@ -27,7 +27,13 @@ class KnowledgeIndexer:
         entries = self.database.list_entries()
         for entry in entries:
             self.index_entry(entry, self.database.get_entry_data(entry.id))
-        self.database.set_index_metadata("embedding_signature", signature)
+        final_signature = self.embeddings.signature()
+        if final_signature != signature:
+            # A model may fail midway and switch to the deterministic fallback.
+            # Rebuild the whole corpus once more so vector spaces never remain mixed.
+            for entry in entries:
+                self.index_entry(entry, self.database.get_entry_data(entry.id))
+        self.database.set_index_metadata("embedding_signature", final_signature)
         return len(entries)
 
     def record_embedding_signature(self) -> None:
@@ -204,7 +210,7 @@ class KnowledgeIndexer:
             )
         semantic = [
             item
-            for _, item in sorted(candidates, reverse=True)
+            for _, item in sorted(candidates, key=lambda candidate: candidate[0], reverse=True)
             if item["target_entry_id"] not in contradiction_targets
         ]
         relations.extend(semantic[:5])
@@ -257,7 +263,12 @@ class KnowledgeIndexer:
                     },
                 )
             )
-        return [item for _, item in sorted(candidates, reverse=True)[:limit]]
+        return [
+            item
+            for _, item in sorted(candidates, key=lambda candidate: candidate[0], reverse=True)[
+                :limit
+            ]
+        ]
 
 
 class KnowledgeSearch:
@@ -280,6 +291,7 @@ class KnowledgeSearch:
         fts_query = _fts_query(cleaned)
         lexical_rows = self.database.fts_search(
             fts_query,
+            raw_query=cleaned,
             include_stale=include_stale,
             limit=max(limit * 5, 50),
             entry_ids=allowed_ids,
@@ -374,10 +386,12 @@ class KnowledgeSearch:
 
 
 def _fts_query(value: str) -> str:
-    tokens = [token for token in re.split(r"\s+", value) if token]
-    if len(tokens) == 1:
-        return f'"{tokens[0].replace(chr(34), "")}"'
-    return " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
+    groups: list[str] = []
+    for part in re.split(r"\s+", value):
+        tokens = lexical_tokens(part)
+        if tokens:
+            groups.append(" AND ".join(f'"{token.replace(chr(34), "")}"' for token in tokens))
+    return " OR ".join(f"({group})" for group in groups)
 
 
 def _contains_overlap(query: str, text: str) -> bool:

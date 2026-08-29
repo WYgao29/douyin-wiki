@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -63,17 +66,22 @@ AUTH_FAILURE_TERMS = (
 
 def _run(command: list[str], *, timeout: float = 3600) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=timeout,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         raise ExternalToolError(f"缺少外部工具：{command[0]}") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
         raise ExternalToolError(f"外部工具超时：{command[0]}") from exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _require_success(result: subprocess.CompletedProcess[str], tool: str) -> None:
@@ -130,7 +138,7 @@ def _inspect_chromium_auth_cookies(databases: list[Path]) -> tuple[str, int, Pat
     for database in databases:
         try:
             uri = f"file:{quote(str(database))}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+            with closing(sqlite3.connect(uri, uri=True, timeout=1)) as connection:
                 rows = connection.execute(
                     """SELECT name, expires_utc FROM cookies
                        WHERE host_key LIKE '%douyin.com'
@@ -623,9 +631,12 @@ class VisionOCR:
         return await asyncio.to_thread(self._recognize_sync, frames)
 
     def _recognize_sync(self, frames: list[tuple[int, Path]]) -> list[OCRObservation]:
-        result = _run(
-            ["swift", str(self.script_path), *[str(frame[1]) for frame in frames]], timeout=3600
-        )
+        arguments = [
+            value
+            for source_index, path in frames
+            for value in (str(source_index), str(path))
+        ]
+        result = _run(["swift", str(self.script_path), *arguments], timeout=3600)
         if result.returncode != 0:
             raise ExternalToolError(
                 "macOS Vision OCR 执行失败",
@@ -640,15 +651,22 @@ class VisionOCR:
             ) from exc
         if not isinstance(payload, list):
             raise ExternalToolError("macOS Vision OCR 返回格式错误")
-        timestamp_by_path = {str(path): timestamp for timestamp, path in frames}
+        failures = [item for item in payload if item.get("error")]
+        if failures:
+            raise ExternalToolError(
+                "macOS Vision OCR 无法解码部分图片",
+                details={"failures": failures[:20]},
+            )
         observations: list[OCRObservation] = []
         for item in payload:
             text = str(item.get("text", "")).strip()
             path = str(item.get("path", ""))
+            source_index = int(item.get("sourceIndex", 0))
             if text:
                 observations.append(
                     OCRObservation(
-                        timestamp_ms=timestamp_by_path.get(path, 0),
+                        timestamp_ms=source_index,
+                        source_index=source_index,
                         text=text,
                         confidence=item.get("confidence"),
                         image_path=path,

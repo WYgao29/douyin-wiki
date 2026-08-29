@@ -179,8 +179,10 @@ class FakeReminderAdapter:
     def __init__(self) -> None:
         self.created = []
 
-    def create(self, candidate: ReminderCandidate, *, source_url: str) -> str:
-        self.created.append((candidate, source_url))
+    def create(
+        self, candidate: ReminderCandidate, *, source_url: str, idempotency_key: str | None = None
+    ) -> str:
+        self.created.append((candidate, source_url, idempotency_key))
         return "system-reminder-1"
 
 

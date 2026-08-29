@@ -229,6 +229,7 @@ class ReviewIssue(BaseModel):
 
 class OCRObservation(BaseModel):
     timestamp_ms: int | None = Field(default=None, ge=0)
+    source_index: int | None = Field(default=None, ge=0)
     image_index: int | None = Field(default=None, ge=1)
     text: str
     confidence: float | None = Field(default=None, ge=0, le=1)
@@ -675,6 +676,11 @@ class Citation(BaseModel):
     timestamp_ms: int | None = None
     image_index: int | None = Field(default=None, ge=1)
     original_url: str = ""
+
+    @field_validator("original_url")
+    @classmethod
+    def safe_original_url(cls, value: str) -> str:
+        return value if value.startswith(("https://", "http://")) else ""
 
 
 class SourceRevision(BaseModel):
