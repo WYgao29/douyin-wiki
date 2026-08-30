@@ -30,6 +30,18 @@ def test_gateway_is_default_analysis_mode(tmp_path: Path) -> None:
     assert load_config(tmp_path / "missing.toml").vault_path.name == "抖库"
 
 
+def test_auth_guidance_defaults_round_trip_through_toml(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(render_default_config(AppConfig()), encoding="utf-8")
+
+    loaded = load_config(config_path)
+
+    assert loaded.auth_guidance.enabled is True
+    assert loaded.auth_guidance.timeout_seconds == 600
+    assert loaded.auth_guidance.poll_seconds == 5
+    assert "[auth_guidance]" in config_path.read_text(encoding="utf-8")
+
+
 def test_config_round_trips_quoted_strings_and_is_written_atomically(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     vault = tmp_path / '包含"引号的 Vault'

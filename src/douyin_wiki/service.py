@@ -188,8 +188,29 @@ class DouyinWikiService:
         check = await self.downloader.authenticate()
         return check.model_dump(mode="json")
 
-    async def get_auth_status(self, *, video_url: str | None = None) -> dict[str, Any]:
-        async def unsupported(scope: str, source: str) -> AuthCheckResult:
+    async def check_auth_scope(
+        self,
+        scope: str,
+        *,
+        video_url: str | None = None,
+    ) -> AuthCheckResult:
+        if scope == "video":
+            adapter = self.downloader
+            kwargs = {"video_url": video_url}
+            source = self.config.media.browser
+        elif scope == "image_note":
+            adapter = self.image_note_downloader
+            kwargs = {}
+            source = str(self.config.browser_profile_dir)
+        elif scope == "creator":
+            adapter = self.creator_adapter
+            kwargs = {}
+            source = str(self.config.browser_profile_dir)
+        else:
+            raise ValueError(f"不支持的授权范围：{scope}")
+
+        check_auth = getattr(adapter, "check_auth", None)
+        if check_auth is None:
             return AuthCheckResult(
                 scope=scope,
                 state="unavailable",
@@ -197,23 +218,14 @@ class DouyinWikiService:
                 cookie_source=source,
                 message="当前注入的下载适配器不支持认证状态检查",
             )
+        return await check_auth(**kwargs)
 
-        video_task = (
-            self.downloader.check_auth(video_url=video_url)
-            if hasattr(self.downloader, "check_auth")
-            else unsupported("video", self.config.media.browser)
+    async def get_auth_status(self, *, video_url: str | None = None) -> dict[str, Any]:
+        video, image_note, creator = await asyncio.gather(
+            self.check_auth_scope("video", video_url=video_url),
+            self.check_auth_scope("image_note"),
+            self.check_auth_scope("creator"),
         )
-        image_task = (
-            self.image_note_downloader.check_auth()
-            if hasattr(self.image_note_downloader, "check_auth")
-            else unsupported("image_note", str(self.config.browser_profile_dir))
-        )
-        creator_task = (
-            self.creator_adapter.check_auth()
-            if hasattr(self.creator_adapter, "check_auth")
-            else unsupported("creator", str(self.config.browser_profile_dir))
-        )
-        video, image_note, creator = await asyncio.gather(video_task, image_task, creator_task)
         return {
             "video": video.model_dump(mode="json"),
             "image_note": image_note.model_dump(mode="json"),

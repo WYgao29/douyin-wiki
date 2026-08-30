@@ -14,6 +14,7 @@ from douyin_wiki.config import EmbeddingSettings, LLMSettings
 from douyin_wiki.errors import CookieRequiredError, ExternalToolError, JobStateError
 from douyin_wiki.models import (
     AnalysisMode,
+    AuthCheckResult,
     CaptureOptions,
     GatewayContext,
     InspirationInput,
@@ -28,6 +29,23 @@ from .conftest import FakeDownloader, FakeTranscriber
 class CookieExpiredDownloader:
     async def download(self, url: str, video_id: str, target_dir: Path):
         raise CookieRequiredError("需要更新浏览器 cookie")
+
+
+class ScopedAuthAdapter:
+    def __init__(self, scope: str) -> None:
+        self.scope = scope
+        self.check_calls: list[dict] = []
+
+    async def check_auth(self, **kwargs) -> AuthCheckResult:
+        self.check_calls.append(kwargs)
+        return AuthCheckResult(
+            scope=self.scope,
+            state="ready",
+            ok=True,
+            server_verified=True,
+            cookie_source=f"fake-{self.scope}",
+            message=f"{self.scope} ready",
+        )
 
 
 class BrokenOCR:
@@ -336,6 +354,42 @@ async def test_video_cookie_failure_enters_needs_auth_and_can_retry(service) -> 
     assert paused.result["retry_command"].endswith(job.id)
     service.downloader = FakeDownloader()
     assert service.retry_job(job.id).status == JobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_check_auth_scope_video_does_not_probe_other_adapters(service) -> None:
+    video = ScopedAuthAdapter("video")
+    image_note = ScopedAuthAdapter("image_note")
+    creator = ScopedAuthAdapter("creator")
+    service.downloader = video
+    service.image_note_downloader = image_note
+    service.creator_adapter = creator
+    video_url = "https://www.douyin.com/video/7659645255277039717"
+
+    result = await service.check_auth_scope("video", video_url=video_url)
+
+    assert result.scope == "video"
+    assert result.server_verified is True
+    assert video.check_calls == [{"video_url": video_url}]
+    assert image_note.check_calls == []
+    assert creator.check_calls == []
+
+
+@pytest.mark.asyncio
+async def test_check_auth_scope_image_note_does_not_probe_other_adapters(service) -> None:
+    video = ScopedAuthAdapter("video")
+    image_note = ScopedAuthAdapter("image_note")
+    creator = ScopedAuthAdapter("creator")
+    service.downloader = video
+    service.image_note_downloader = image_note
+    service.creator_adapter = creator
+
+    result = await service.check_auth_scope("image_note")
+
+    assert result.scope == "image_note"
+    assert image_note.check_calls == [{}]
+    assert video.check_calls == []
+    assert creator.check_calls == []
 
 
 @pytest.mark.asyncio

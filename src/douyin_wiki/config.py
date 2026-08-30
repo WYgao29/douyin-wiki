@@ -57,6 +57,12 @@ class WorkerSettings(BaseModel):
     heartbeat_seconds: int = 30
 
 
+class AuthGuidanceSettings(BaseModel):
+    enabled: bool = True
+    timeout_seconds: int = Field(default=600, ge=30, le=1800)
+    poll_seconds: float = Field(default=5, ge=2, le=30)
+
+
 class WebSettings(BaseModel):
     enabled: bool = True
     host: str = "127.0.0.1"
@@ -77,6 +83,7 @@ class AppConfig(BaseModel):
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
+    auth_guidance: AuthGuidanceSettings = Field(default_factory=AuthGuidanceSettings)
     web: WebSettings = Field(default_factory=WebSettings)
 
     @property
@@ -189,6 +196,11 @@ media_concurrency = {cfg.worker.media_concurrency}
 analysis_concurrency = {cfg.worker.analysis_concurrency}
 lease_seconds = {cfg.worker.lease_seconds}
 heartbeat_seconds = {cfg.worker.heartbeat_seconds}
+
+[auth_guidance]
+enabled = {str(cfg.auth_guidance.enabled).lower()}
+timeout_seconds = {cfg.auth_guidance.timeout_seconds}
+poll_seconds = {cfg.auth_guidance.poll_seconds}
 
 [web]
 enabled = {str(cfg.web.enabled).lower()}
