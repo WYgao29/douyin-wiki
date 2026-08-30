@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -7,7 +9,14 @@ from pathlib import Path
 import pytest
 
 from douyin_wiki.adapters.embeddings import EmbeddingService
-from douyin_wiki.auth_guidance import AuthGuidanceCoordinator
+from douyin_wiki.auth_guidance import (
+    AUTH_DIALOG_SCRIPT,
+    AUTH_NOTIFICATION_SCRIPT,
+    AuthGuidanceCoordinator,
+    FileChannelLock,
+    MacOSDialog,
+    SubprocessAuthGuidanceLauncher,
+)
 from douyin_wiki.config import AppConfig, AuthGuidanceSettings, EmbeddingSettings
 from douyin_wiki.models import AuthCheckResult, CaptureRequest, JobStatus
 from douyin_wiki.service import DouyinWikiService
@@ -99,6 +108,34 @@ class FakeClock:
 
     async def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+class FakeCommandRunner:
+    def __init__(self, *, stdout: str = "confirmed\n", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv: list[str], **kwargs):
+        self.calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            self.returncode,
+            stdout=self.stdout,
+            stderr="",
+        )
+
+
+class FakeProcessLauncher:
+    def __init__(self, *, error: OSError | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[list[str], dict]] = []
+
+    def __call__(self, argv: list[str], **kwargs):
+        self.calls.append((argv, kwargs))
+        if self.error:
+            raise self.error
+        return object()
 
 
 def make_service(
@@ -326,3 +363,131 @@ async def test_job_leaving_needs_auth_during_verification_is_not_requeued(
 
     assert outcome.retried_job_ids == ()
     assert service.database.get_job(job.id).status == JobStatus.FAILED
+
+
+def test_macos_dialog_passes_dynamic_values_as_argv() -> None:
+    runner = FakeCommandRunner(stdout="confirmed\n")
+    dialog = MacOSDialog(runner=runner)
+
+    confirmed = dialog.confirm("douyin", {"image_note": 2, "creator": 1})
+
+    assert confirmed is True
+    argv, kwargs = runner.calls[0]
+    assert argv == [
+        "osascript",
+        "-e",
+        AUTH_DIALOG_SCRIPT,
+        "--",
+        "图文与博主",
+        "3",
+        "图文 2 个，博主 1 个",
+    ]
+    assert kwargs == {
+        "check": False,
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+    }
+
+
+def test_macos_dialog_cancel_and_notification_are_non_destructive() -> None:
+    runner = FakeCommandRunner(stdout="cancelled\n")
+    dialog = MacOSDialog(runner=runner)
+
+    assert dialog.confirm("video", {"video": 1}) is False
+    dialog.notify("抖库授权成功", "授权成功，已继续 1 个任务")
+
+    assert runner.calls[1][0] == [
+        "osascript",
+        "-e",
+        AUTH_NOTIFICATION_SCRIPT,
+        "--",
+        "抖库授权成功",
+        "授权成功，已继续 1 个任务",
+    ]
+
+
+def test_file_channel_lock_deduplicates_douyin_scopes(tmp_path: Path) -> None:
+    first = FileChannelLock(tmp_path)
+    second = FileChannelLock(tmp_path)
+
+    with first.acquire("douyin") as first_acquired, second.acquire(
+        "douyin"
+    ) as second_acquired:
+        assert first_acquired is True
+        assert second_acquired is False
+    with second.acquire("douyin") as acquired_after_release:
+        assert acquired_after_release is True
+
+
+def test_subprocess_launcher_uses_current_python_without_shell(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    process_launcher = FakeProcessLauncher()
+    launcher = SubprocessAuthGuidanceLauncher(
+        config_path=config_path,
+        settings=AuthGuidanceSettings(),
+        platform_name="darwin",
+        process_launcher=process_launcher,
+    )
+
+    launched = launcher.launch(scope="image_note", trigger_job_id="a" * 32)
+
+    assert launched is True
+    argv, kwargs = process_launcher.calls[0]
+    assert argv == [
+        sys.executable,
+        "-m",
+        "douyin_wiki.auth_guidance",
+        "--config-path",
+        str(config_path),
+        "--scope",
+        "image_note",
+        "--job-id",
+        "a" * 32,
+    ]
+    assert kwargs == {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "start_new_session": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("enabled", "platform_name", "scope", "job_id"),
+    [
+        (False, "darwin", "video", "a" * 32),
+        (True, "linux", "video", "a" * 32),
+        (True, "darwin", "unknown", "a" * 32),
+        (True, "darwin", "video", "not-a-job-id"),
+    ],
+)
+def test_subprocess_launcher_declines_unsupported_invocations(
+    tmp_path: Path,
+    enabled: bool,
+    platform_name: str,
+    scope: str,
+    job_id: str,
+) -> None:
+    process_launcher = FakeProcessLauncher()
+    launcher = SubprocessAuthGuidanceLauncher(
+        config_path=tmp_path / "config.toml",
+        settings=AuthGuidanceSettings(enabled=enabled),
+        platform_name=platform_name,
+        process_launcher=process_launcher,
+    )
+
+    assert launcher.launch(scope=scope, trigger_job_id=job_id) is False
+    assert process_launcher.calls == []
+
+
+def test_subprocess_launcher_failure_returns_false(tmp_path: Path) -> None:
+    launcher = SubprocessAuthGuidanceLauncher(
+        config_path=tmp_path / "config.toml",
+        settings=AuthGuidanceSettings(),
+        platform_name="darwin",
+        process_launcher=FakeProcessLauncher(error=OSError("launch failed")),
+    )
+
+    assert launcher.launch(scope="video", trigger_job_id="b" * 32) is False
