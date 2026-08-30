@@ -65,3 +65,119 @@ async def test_resolve_image_note_sample() -> None:
     assert result.video_id == "7674987897195870714"
     assert result.source_kind == SourceKind.IMAGE_NOTE
     assert result.canonical_url == "https://www.douyin.com/note/7674987897195870714"
+
+
+@pytest.mark.asyncio
+async def test_final_note_redirect_overrides_intermediate_video_route() -> None:
+    work_id = "7659645255277039717"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "v.douyin.com":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": f"https://www.iesdouyin.com/share/video/{work_id}/"
+                },
+            )
+        if request.url.host == "www.iesdouyin.com":
+            return httpx.Response(
+                302,
+                headers={
+                    "location": (
+                        f"https://www.douyin.com/note/{work_id}"
+                        "?previous_page=web_code_link"
+                    )
+                },
+            )
+        return httpx.Response(200)
+
+    result = await DouyinShareResolver(transport=httpx.MockTransport(handler)).resolve(
+        "https://v.douyin.com/example/"
+    )
+
+    assert result.video_id == work_id
+    assert result.source_kind == SourceKind.IMAGE_NOTE
+    assert result.canonical_url == f"https://www.douyin.com/note/{work_id}"
+    assert result.redirect_chain[-1].startswith(f"https://www.douyin.com/note/{work_id}")
+
+
+@pytest.mark.asyncio
+async def test_final_video_redirect_overrides_intermediate_note_route() -> None:
+    work_id = "7659645255277039717"
+    locations = iter(
+        (
+            f"https://www.douyin.com/note/{work_id}",
+            f"https://www.douyin.com/video/{work_id}",
+        )
+    )
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        location = next(locations, None)
+        return (
+            httpx.Response(302, headers={"location": location})
+            if location
+            else httpx.Response(200)
+        )
+
+    result = await DouyinShareResolver(transport=httpx.MockTransport(handler)).resolve(
+        "https://v.douyin.com/example/"
+    )
+
+    assert result.source_kind == SourceKind.VIDEO
+    assert result.canonical_url == f"https://www.douyin.com/video/{work_id}"
+
+
+@pytest.mark.asyncio
+async def test_redirect_chain_rejects_conflicting_work_ids() -> None:
+    locations = iter(
+        (
+            "https://www.douyin.com/video/7659645255277039717",
+            "https://www.douyin.com/note/7678561149449331835",
+        )
+    )
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        location = next(locations, None)
+        return (
+            httpx.Response(302, headers={"location": location})
+            if location
+            else httpx.Response(200)
+        )
+
+    with pytest.raises(InvalidShareTextError, match="作品 ID 不一致"):
+        await DouyinShareResolver(transport=httpx.MockTransport(handler)).resolve(
+            "https://v.douyin.com/example/"
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_link_redirect_limit_is_rejected() -> None:
+    request_count = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            302,
+            headers={"location": f"https://v.douyin.com/hop-{request_count}/"},
+        )
+
+    with pytest.raises(InvalidShareTextError, match="重定向次数过多"):
+        await DouyinShareResolver(transport=httpx.MockTransport(handler)).resolve(
+            "https://v.douyin.com/example/"
+        )
+    assert request_count == 8
+
+
+@pytest.mark.asyncio
+async def test_direct_canonical_url_never_calls_transport() -> None:
+    def unexpected_request(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("canonical URL must not perform an HTTP request")
+
+    work_id = "7659645255277039717"
+    resolver = DouyinShareResolver(transport=httpx.MockTransport(unexpected_request))
+
+    result = await resolver.resolve(f"https://www.douyin.com/note/{work_id}")
+
+    assert result.source_kind == SourceKind.IMAGE_NOTE
+    assert result.canonical_url == f"https://www.douyin.com/note/{work_id}"

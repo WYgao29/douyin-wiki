@@ -72,6 +72,19 @@ def _resolved(
     )
 
 
+def _merge_identity(
+    current: tuple[str, SourceKind] | None,
+    candidate: tuple[str, SourceKind],
+    chain: list[str],
+) -> tuple[str, SourceKind]:
+    if current is not None and current[0] != candidate[0]:
+        raise InvalidShareTextError(
+            "短链重定向中的作品 ID 不一致",
+            details={"redirect_chain": chain},
+        )
+    return candidate
+
+
 class DouyinShareResolver:
     def __init__(
         self, *, timeout_seconds: float = 15, transport: httpx.AsyncBaseTransport | None = None
@@ -95,6 +108,7 @@ class DouyinShareResolver:
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds, headers=headers, transport=self.transport
         ) as client:
+            identity: tuple[str, SourceKind] | None = None
             for _ in range(8):
                 try:
                     response = await client.get(current, follow_redirects=False)
@@ -102,16 +116,23 @@ class DouyinShareResolver:
                     raise InvalidShareTextError(
                         "无法解析抖音短链", details={"url": current, "cause": str(exc)}
                     ) from exc
+                if response_identity := extract_work_identity(str(response.url)):
+                    identity = _merge_identity(identity, response_identity, chain)
                 location = response.headers.get("location")
                 if location:
                     current = urljoin(current, location)
                     chain.append(current)
-                    if identity := extract_work_identity(current):
-                        return _resolved(original_url, identity, chain)
+                    if location_identity := extract_work_identity(current):
+                        identity = _merge_identity(identity, location_identity, chain)
                     continue
-                if identity := extract_work_identity(str(response.url)):
+                if identity:
                     return _resolved(original_url, identity, chain)
                 break
+            else:
+                raise InvalidShareTextError(
+                    "抖音短链重定向次数过多",
+                    details={"redirect_chain": chain},
+                )
         raise InvalidShareTextError(
             "短链已解析，但没有得到抖音作品 ID", details={"redirect_chain": chain}
         )
