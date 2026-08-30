@@ -137,8 +137,12 @@ uv run douyin-wiki capture \
 ```
 
 视频和图文使用同一个 `capture` 命令。视频 Cookie 失效、图文页面要求登录或出现验证码时，
-任务统一进入“需要登录授权”。状态检查同时覆盖视频、图文和博主主页；传入一个视频 URL 时，视频检查会让
-`yt-dlp` 执行只读模拟访问，不下载媒体：
+任务统一进入“需要登录授权”。本机 Worker 会先保存并解锁任务，再显示 macOS 系统弹框；选择
+“打开浏览器授权”后，抖库会打开对应浏览器、验证授权状态，并在验证成功后自动重试同一授权通道中仍处于
+“需要登录授权”的任务。选择“稍后处理”、等待超时或浏览器启动失败不会丢失任务，下面的手工命令始终可用。
+
+状态检查同时覆盖视频、图文和博主主页；传入一个视频 URL 时，视频检查会让 `yt-dlp` 执行只读模拟访问，
+不下载媒体：
 
 ```bash
 uv run douyin-wiki auth status
@@ -165,6 +169,20 @@ uv run douyin-wiki jobs retry JOB_ID
 最终服务器可用性仍会在实际下载时验证。专用浏览器目录与用户日常 Chrome Profile 完全分离。
 静态图文只执行图片下载和逐图 Vision OCR，不调用 yt-dlp、ffmpeg、Whisper 或逐字稿校正；
 背景音乐只保存曲名和作者元数据。
+
+自动授权引导默认启用，可在配置中调整最长等待时间和轮询间隔，或完全关闭：
+
+```toml
+[auth_guidance]
+enabled = true
+timeout_seconds = 600
+poll_seconds = 5
+```
+
+设为 `enabled = false` 只关闭系统弹框，不会禁用 `auth video`、`auth douyin` 或任务手工重试。
+选择“稍后处理”只保留任务暂停状态，不会在同一次失败中循环弹框。
+自动流程不会读取、复制或显示 Cookie 值、密码和 Local Storage。视频授权使用配置中的日常浏览器；
+图文与博主授权使用抖库专用 Playwright Profile。同一授权通道同时只显示一个引导窗口。
 
 ### 博主批量采集
 

@@ -126,11 +126,13 @@ OpenClaw 的 STDIO MCP server 配置示例：
 7. 每个事件成功处理或投递后调用 `acknowledge_job_event`。确认操作是幂等的。未确认的最新可操作
    事件会保留，可在 Gateway 重启后继续处理；同一任务已经过时的旧事件会自动标记为 superseded。
 
-“需要登录授权”表示视频浏览器 Cookie 失效，或图文专用浏览器需要登录/验证码。Gateway 先调用
-`get_auth_status`，再读取任务中的 `auth_scope`：`video` 提示用户在本机运行
-`uv run douyin-wiki auth video`，`image_note` 或 `creator` 提示运行
-`uv run douyin-wiki auth douyin`。
-登录成功后调用 `retry_job`，不得要求用户提供 Cookie；状态接口也不会返回 Cookie 值。
+“需要登录授权”表示视频浏览器 Cookie 失效，或图文专用浏览器需要登录/验证码。本机 Worker 通常已经
+显示 macOS 授权引导；用户完成登录后，抖库会验证授权并自动重试相同授权通道中仍然暂停的任务。
+Gateway 应先调用 `get_auth_status` 和 `get_job` 复核最新状态，不要反复打开浏览器或重复调用
+`retry_job`。若用户选择稍后处理、引导超时或本机弹框不可用，再按任务中的 `auth_scope` 提供手工兜底：
+`video` 使用 `uv run douyin-wiki auth video`，`image_note` 或 `creator` 使用
+`uv run douyin-wiki auth douyin`；确认授权成功后再调用 `retry_job`。
+不得要求用户提供 Cookie；状态接口也不会返回 Cookie 值。
 
 “等待用户确认”表示视频超过 30 分钟。Agent 必须说明继续将消耗当前 Gateway 模型
 token，获得用户明确同意后才能调用 `approve_job`。超过 2 小时仍默认拒绝，除非采集时显式
@@ -196,7 +198,8 @@ hermes cron runs --limit 10
 灵感必须逐字传递；capture 时保存当前 gateway/channel/conversation/message 路由。
 任务进入“待 AI 处理”后，视频先校正逐字稿，图文直接按返回的 schema 分析；
 不得改写灵感，不得把 AI 推断当作作品原话。“需要人工复核”和长视频必须询问用户；
-“需要登录授权”时先调用 get_auth_status，再根据授权范围提示用户运行 auth video 或 auth douyin。
+“需要登录授权”时先调用 get_auth_status 和 get_job，等待本机授权引导完成并复核最新状态；
+只有自动引导未完成时，才根据授权范围提示用户运行 auth video 或 auth douyin，授权成功后再重试。
 完成后把原作品链接、摘要、灵感关联、时间戳或图片编号证据和提醒候选发回原会话。
 成功处理每个 job event 后确认该事件。
 当用户要求保存某个博主时，调用 capture_douyin_creator，先展示清单并把用户的选择逐项写入；
