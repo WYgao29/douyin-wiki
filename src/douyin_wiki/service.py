@@ -34,6 +34,7 @@ from .adapters.media import (
 )
 from .adapters.reminders import MacOSReminderAdapter
 from .adapters.share import DouyinShareResolver
+from .auth_guidance import AuthGuidanceLauncher, NoopAuthGuidanceLauncher
 from .config import AppConfig
 from .database import Database
 from .errors import (
@@ -94,6 +95,7 @@ class DouyinWikiService:
         analysis: AnalysisProvider | None = None,
         embeddings: EmbeddingService | None = None,
         reminders: MacOSReminderAdapter | None = None,
+        auth_guidance_launcher: AuthGuidanceLauncher | None = None,
     ) -> None:
         self.config = config
         self.database = Database(config.database_path)
@@ -125,6 +127,7 @@ class DouyinWikiService:
         self.indexer = KnowledgeIndexer(self.database, self.embeddings)
         self.searcher = KnowledgeSearch(self.database, self.embeddings)
         self.reminders = reminders or MacOSReminderAdapter()
+        self.auth_guidance_launcher = auth_guidance_launcher or NoopAuthGuidanceLauncher()
         self.download_semaphore = asyncio.Semaphore(config.worker.download_concurrency)
         self.media_semaphore = asyncio.Semaphore(config.worker.media_concurrency)
         self.analysis_semaphore = asyncio.Semaphore(config.worker.analysis_concurrency)
@@ -1982,6 +1985,7 @@ class DouyinWikiService:
             is_video = isinstance(exc, CookieRequiredError)
             is_creator = job.kind == "creator_import"
             next_command = "douyin-wiki auth video" if is_video else "douyin-wiki auth douyin"
+            auth_scope = "video" if is_video else ("creator" if is_creator else "image_note")
             outcome = self.database.update_job(
                 job.id,
                 status=JobStatus.NEEDS_AUTH,
@@ -1989,15 +1993,18 @@ class DouyinWikiService:
                 error_message=str(exc),
                 result={
                     "reason": exc.code,
-                    "auth_scope": (
-                        "video" if is_video else ("creator" if is_creator else "image_note")
-                    ),
+                    "auth_scope": auth_scope,
                     "next_command": next_command,
                     "retry_command": f"douyin-wiki jobs retry {job.id}",
                     "details": exc.details,
                 },
                 unlock=True,
             )
+            with suppress(Exception):
+                self.auth_guidance_launcher.launch(
+                    scope=auth_scope,
+                    trigger_job_id=job.id,
+                )
         except DouyinWikiError as exc:
             outcome = self.database.update_job(
                 job.id,

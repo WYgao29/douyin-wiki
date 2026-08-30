@@ -48,6 +48,26 @@ class ScopedAuthAdapter:
         )
 
 
+class InspectingAuthGuidanceLauncher:
+    def __init__(self, database) -> None:
+        self.database = database
+        self.calls: list[tuple[str, str, JobStatus, dict]] = []
+
+    def launch(self, *, scope: str, trigger_job_id: str) -> bool:
+        persisted = self.database.get_job(trigger_job_id)
+        self.calls.append((scope, trigger_job_id, persisted.status, persisted.result))
+        return True
+
+
+class FailingAuthGuidanceLauncher:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def launch(self, *, scope: str, trigger_job_id: str) -> bool:
+        self.calls += 1
+        raise OSError("system dialog unavailable")
+
+
 class BrokenOCR:
     async def recognize(self, frames):
         raise ExternalToolError("synthetic OCR failure")
@@ -344,6 +364,8 @@ async def test_long_job_can_continue_from_checkpoint(service) -> None:
 
 @pytest.mark.asyncio
 async def test_video_cookie_failure_enters_needs_auth_and_can_retry(service) -> None:
+    launcher = InspectingAuthGuidanceLauncher(service.database)
+    service.auth_guidance_launcher = launcher
     service.downloader = CookieExpiredDownloader()
     job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
     paused = await Worker(service).run_once()
@@ -352,8 +374,31 @@ async def test_video_cookie_failure_enters_needs_auth_and_can_retry(service) -> 
     assert paused.result["auth_scope"] == "video"
     assert paused.result["next_command"] == "douyin-wiki auth video"
     assert paused.result["retry_command"].endswith(job.id)
+    assert launcher.calls == [("video", job.id, JobStatus.NEEDS_AUTH, paused.result)]
     service.downloader = FakeDownloader()
     assert service.retry_job(job.id).status == JobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_auth_guidance_launch_failure_preserves_paused_job(service) -> None:
+    launcher = FailingAuthGuidanceLauncher()
+    service.auth_guidance_launcher = launcher
+    service.downloader = CookieExpiredDownloader()
+    job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+
+    paused = await Worker(service).run_once()
+
+    assert paused.status == JobStatus.NEEDS_AUTH
+    assert paused.error_code == "cookie_required"
+    assert paused.result["auth_scope"] == "video"
+    assert paused.result["next_command"] == "douyin-wiki auth video"
+    assert launcher.calls == 1
+    with service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT locked_at, lock_owner FROM jobs WHERE id=?", (job.id,)
+        ).fetchone()
+    assert row["locked_at"] is None
+    assert row["lock_owner"] is None
 
 
 @pytest.mark.asyncio

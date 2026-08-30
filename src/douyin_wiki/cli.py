@@ -8,6 +8,7 @@ from typing import Annotated
 
 import typer
 
+from .auth_guidance import SubprocessAuthGuidanceLauncher
 from .config import AppConfig, default_config_path, llm_api_key_required, load_config
 from .errors import DouyinWikiError
 from .localization import (
@@ -73,7 +74,15 @@ app.add_typer(topic_app, name="topic")
 
 
 def _service(config_path: Path | None = None) -> DouyinWikiService:
-    service = DouyinWikiService(load_config(config_path))
+    resolved_config_path = config_path or default_config_path()
+    config = load_config(resolved_config_path)
+    service = DouyinWikiService(
+        config,
+        auth_guidance_launcher=SubprocessAuthGuidanceLauncher(
+            config_path=resolved_config_path,
+            settings=config.auth_guidance,
+        ),
+    )
     service.initialize_runtime()
     return service
 

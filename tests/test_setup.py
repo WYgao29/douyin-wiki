@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import douyin_wiki.cli as cli_module
+from douyin_wiki.auth_guidance import SubprocessAuthGuidanceLauncher
 from douyin_wiki.cli import app
 from douyin_wiki.config import AppConfig, load_config, render_default_config
 from douyin_wiki.models import AnalysisMode
@@ -40,6 +42,32 @@ def test_auth_guidance_defaults_round_trip_through_toml(tmp_path: Path) -> None:
     assert loaded.auth_guidance.timeout_seconds == 600
     assert loaded.auth_guidance.poll_seconds == 5
     assert "[auth_guidance]" in config_path.read_text(encoding="utf-8")
+
+
+def test_cli_service_injects_subprocess_auth_guidance_launcher(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(render_default_config(AppConfig()), encoding="utf-8")
+    captured: dict = {}
+
+    class FakeService:
+        def __init__(self, config, **kwargs) -> None:
+            captured["config"] = config
+            captured.update(kwargs)
+
+        def initialize_runtime(self) -> None:
+            captured["initialized"] = True
+
+    monkeypatch.setattr(cli_module, "DouyinWikiService", FakeService)
+
+    cli_module._service(config_path)
+
+    launcher = captured["auth_guidance_launcher"]
+    assert isinstance(launcher, SubprocessAuthGuidanceLauncher)
+    assert launcher.config_path == config_path
+    assert captured["initialized"] is True
 
 
 def test_config_round_trips_quoted_strings_and_is_written_atomically(tmp_path: Path) -> None:

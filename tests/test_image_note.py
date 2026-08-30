@@ -95,6 +95,17 @@ class NoteDownloader:
         )
 
 
+class InspectingAuthGuidanceLauncher:
+    def __init__(self, database) -> None:
+        self.database = database
+        self.calls: list[tuple[str, str, JobStatus]] = []
+
+    def launch(self, *, scope: str, trigger_job_id: str) -> bool:
+        persisted = self.database.get_job(trigger_job_id)
+        self.calls.append((scope, trigger_job_id, persisted.status))
+        return True
+
+
 class NoteOCR:
     def __init__(self, *, low_confidence: bool = False) -> None:
         self.low_confidence = low_confidence
@@ -305,10 +316,13 @@ async def test_duplicate_note_reuses_images_but_reacquires_missing_file(tmp_path
 async def test_image_note_auth_and_low_confidence_review(tmp_path: Path) -> None:
     auth_downloader = NoteDownloader(auth_error=True)
     service = make_service(tmp_path / "auth", note_downloader=auth_downloader)
+    launcher = InspectingAuthGuidanceLauncher(service.database)
+    service.auth_guidance_launcher = launcher
     job = service.capture_douyin("https://v.douyin.com/oH4K0gee_Ok/")
     paused = await Worker(service).run_once()
     assert paused.status == JobStatus.NEEDS_AUTH
     assert paused.result["next_command"] == "douyin-wiki auth douyin"
+    assert launcher.calls == [("image_note", job.id, JobStatus.NEEDS_AUTH)]
     auth_downloader.auth_error = False
     assert service.retry_job(job.id).status == JobStatus.QUEUED
     assert (await Worker(service).run_once()).status == JobStatus.COMPLETED
