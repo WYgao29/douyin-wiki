@@ -565,14 +565,20 @@ class Database:
             raise JobStateError(f"job not found: {job_id}")
         return self._job_from_row(row)
 
-    def list_jobs(self, status: JobStatus | None = None, limit: int = 50) -> list[JobRecord]:
+    def list_jobs(
+        self,
+        status: JobStatus | None = None,
+        limit: int | None = 50,
+    ) -> list[JobRecord]:
         query = "SELECT * FROM jobs"
         params: list[Any] = []
         if status:
             query += " WHERE status=?"
             params.append(status.value)
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY created_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         with self.connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._job_from_row(row) for row in rows]

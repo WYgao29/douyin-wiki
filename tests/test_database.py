@@ -27,6 +27,24 @@ def test_queue_claim_and_recovery(tmp_path: Path) -> None:
     assert database.claim_next_job() is not None
 
 
+def test_list_jobs_accepts_none_limit_for_all_matching_jobs(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    for index in range(55):
+        job = database.create_job(
+            CaptureRequest(share_text=f"https://v.douyin.com/test-{index}/")
+        )
+        database.update_job(
+            job.id,
+            status=JobStatus.NEEDS_AUTH,
+            result={"auth_scope": "video"},
+        )
+
+    jobs = database.list_jobs(status=JobStatus.NEEDS_AUTH, limit=None)
+
+    assert len(jobs) == 55
+
+
 def test_recovery_requeues_job_after_mid_stage_crash(tmp_path: Path) -> None:
     database = Database(tmp_path / "state.sqlite3")
     database.initialize()
