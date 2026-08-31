@@ -446,7 +446,7 @@ uv build
 
 ```bash
 python3.12 -m venv /tmp/douku-release-check
-/tmp/douku-release-check/bin/pip install dist/douyin_wiki-0.1.4-py3-none-any.whl
+/tmp/douku-release-check/bin/pip install dist/douyin_wiki-0.1.5-py3-none-any.whl
 /tmp/douku-release-check/bin/douyin-wiki --help
 ```
 
