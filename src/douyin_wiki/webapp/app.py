@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from watchfiles import awatch
 
+from ..adapters.share import extract_douyin_url
 from ..config import (
     AppConfig,
     LLMSettings,
@@ -38,7 +39,11 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.4"
+WEB_VERSION = "0.1.5"
+
+
+class CaptureSubmissionRequest(BaseModel):
+    share_text: str = Field(min_length=1, max_length=20_000)
 
 
 class CreateSessionRequest(BaseModel):
@@ -420,6 +425,15 @@ def create_app(
             "total": len(items),
             "version": catalog.version,
         }
+
+    @app.post("/api/captures", status_code=202)
+    async def create_capture(payload: CaptureSubmissionRequest):
+        try:
+            extract_douyin_url(payload.share_text)
+        except DouyinWikiError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        job = core.capture_douyin(payload.share_text)
+        return {"job_id": job.id, "status": job.status.value}
 
     @app.get("/api/articles/{entry_id}")
     async def article(entry_id: str):

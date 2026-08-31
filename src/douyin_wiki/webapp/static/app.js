@@ -1738,6 +1738,59 @@ async function saveInspiration() {
   }
 }
 
+function containsDouyinURL(value) {
+  const matches = value.match(/https?:\/\/[^\s<>\]\[)(]+/giu) || [];
+  return matches.some((raw) => {
+    const candidate = raw.replace(/[.,;:!?'"，。；：！？）]+$/u, "");
+    try {
+      const host = new URL(candidate).hostname.toLowerCase();
+      return ["douyin.com", "iesdouyin.com"].some(
+        (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+      );
+    } catch (_error) {
+      return false;
+    }
+  });
+}
+
+function openCaptureDialog() {
+  $("#capture-share-text").value = "";
+  $("#capture-error").classList.add("hidden");
+  $("#capture-dialog").showModal();
+  window.setTimeout(() => $("#capture-share-text").focus(), 0);
+}
+
+function setCaptureSubmitting(submitting) {
+  const button = $("#confirm-capture");
+  button.disabled = submitting;
+  button.textContent = submitting ? "正在加入…" : "加入写入队列";
+}
+
+async function queueCapture() {
+  const shareText = $("#capture-share-text").value.trim();
+  const errorNode = $("#capture-error");
+  errorNode.classList.add("hidden");
+  if (!containsDouyinURL(shareText)) {
+    errorNode.textContent = "请粘贴有效的抖音链接或分享文案";
+    errorNode.classList.remove("hidden");
+    return;
+  }
+  setCaptureSubmitting(true);
+  try {
+    await api("/api/captures", {
+      method: "POST",
+      body: JSON.stringify({share_text: shareText}),
+    });
+    $("#capture-dialog").close();
+    toast("已加入写入队列");
+  } catch (error) {
+    errorNode.textContent = error.message;
+    errorNode.classList.remove("hidden");
+  } finally {
+    setCaptureSubmitting(false);
+  }
+}
+
 function closeChatMenu() {
   $("#chat-menu").classList.add("hidden");
   $("#chat-menu-toggle").setAttribute("aria-expanded", "false");
@@ -1775,6 +1828,14 @@ function bindEvents() {
   }));
   $("#topics-nav").addEventListener("click", () => showTopics());
   $("#trash-nav").addEventListener("click", () => showTrash());
+  $("#capture-toggle").addEventListener("click", openCaptureDialog);
+  $("#confirm-capture").addEventListener("click", (event) => {
+    event.preventDefault();
+    if (!$("#capture-form").reportValidity()) return;
+    queueCapture();
+  });
+  $("#capture-share-text").addEventListener("input", () => $("#capture-error").classList.add("hidden"));
+  $("#capture-dialog").addEventListener("close", () => $("#capture-toggle").focus());
   $("#topic-select-toggle").addEventListener("click", () => {
     if (!state.topicSelectionMode) {
       state.topicSelectionMode = true;

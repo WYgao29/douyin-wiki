@@ -223,6 +223,9 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'id="trash-nav"' in page.text
         assert 'id="trash-view"' in page.text
         assert 'id="destructive-dialog"' in page.text
+        assert 'id="capture-toggle"' in page.text
+        assert 'id="capture-dialog"' in page.text
+        assert 'id="capture-share-text"' in page.text
         assert "/static/icons.svg#" in page.text
         assert "cdn." not in page.text
 
@@ -260,6 +263,44 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "删除文章" in script.text
         assert "彻底删除" in script.text
         assert "最近一次用量：${latestAssistant.total_tokens} token" in script.text
+
+
+@pytest.mark.parametrize(
+    "share_text",
+    [
+        "https://www.douyin.com/video/7659645255277039717",
+        (
+            "3.21 复制打开抖音，看看【测试作者的作品】实用技巧 "
+            "https://v.douyin.com/AbCdEfG/ 08/31"
+        ),
+    ],
+)
+def test_web_capture_queues_link_or_share_text(tmp_path: Path, share_text: str) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        response = client.post("/api/captures", json={"share_text": share_text})
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["status"] == "queued"
+    assert service.get_job(payload["job_id"]).request.share_text == share_text
+
+
+def test_web_capture_rejects_text_without_douyin_link(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/captures",
+            json={"share_text": "看看这个网页 https://example.com/video/123"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "分享文本中没有找到有效的抖音链接"
+    assert service.list_jobs() == []
 
 
 def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
@@ -591,7 +632,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.1.4" in page.text
+        assert "/static/model-settings.js?v=0.1.5" in page.text
         assert "settings-info-panel" not in page.text
 
 

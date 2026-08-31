@@ -1,4 +1,4 @@
-"""Local-only Web v0.1.4 for browsing the Vault and chatting with its knowledge."""
+"""Local-only Web v0.1.5 for capturing, browsing, and chatting with the Vault."""
 
 from .app import create_app, run_web
 

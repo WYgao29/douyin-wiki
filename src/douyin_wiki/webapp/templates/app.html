@@ -54,6 +54,7 @@
         <button class="icon-button sidebar-restore-button" id="sidebar-restore" type="button" aria-label="展开导航栏" title="展开导航栏"><svg aria-hidden="true"><use href="/static/icons.svg#panel-left"></use></svg></button>
         <label class="search-box" for="search-input"><svg aria-hidden="true"><use href="/static/icons.svg#search"></use></svg><input id="search-input" type="search" placeholder="搜索知识库" autocomplete="off"><kbd><svg aria-hidden="true"><use href="/static/icons.svg#command"></use></svg>K</kbd></label>
         <div class="toolbar-actions">
+          <button class="toolbar-button capture-toggle-button" id="capture-toggle" type="button" aria-haspopup="dialog" aria-controls="capture-dialog"><svg aria-hidden="true"><use href="/static/icons.svg#plus"></use></svg><span>写入链接</span></button>
           <div class="popover-anchor">
             <button class="toolbar-button" id="filter-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="filter-popover"><svg aria-hidden="true"><use href="/static/icons.svg#filter"></use></svg><span>筛选</span><span id="filter-count" class="control-count hidden"></span></button>
             <section class="filter-popover hidden" id="filter-popover" aria-label="筛选资料" tabindex="-1">
@@ -111,6 +112,16 @@
   <div class="drawer-backdrop hidden" id="drawer-backdrop"></div>
 
   <dialog id="command-dialog" class="command-dialog" aria-labelledby="command-title"><form method="dialog" class="command-shell"><h2 id="command-title" class="sr-only">搜索知识库</h2><label class="command-search" for="command-input"><svg aria-hidden="true"><use href="/static/icons.svg#search"></use></svg><input id="command-input" type="search" placeholder="搜索文章、博主、标签或灵感" autocomplete="off"><kbd>Esc</kbd></label><div id="command-results" class="command-results" role="listbox" aria-label="文章搜索结果"></div><p class="command-help">↑↓ 选择 · Enter 打开 · Esc 关闭</p></form></dialog>
+
+  <dialog id="capture-dialog" class="inspiration-dialog" aria-labelledby="capture-title" aria-describedby="capture-description">
+    <form method="dialog" id="capture-form">
+      <header><div><span class="dialog-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#plus"></use></svg>写入抖库</span><h2 id="capture-title">写入抖音链接</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭写入窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <p id="capture-description" class="dialog-description">粘贴单独的抖音链接，或从抖音复制的整段分享文案。提交后将由后台完成采集、分析和入库。</p>
+      <label for="capture-share-text">链接或分享文案<textarea id="capture-share-text" rows="5" maxlength="20000" required placeholder="https://v.douyin.com/…"></textarea></label>
+      <p id="capture-error" class="dialog-error hidden" role="alert"></p>
+      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-capture" class="primary-button" value="default" type="submit">加入写入队列</button></div>
+    </form>
+  </dialog>
 
   <dialog id="inspiration-dialog" class="inspiration-dialog" aria-labelledby="inspiration-title" aria-describedby="inspiration-description">
     <form method="dialog" id="inspiration-form">
