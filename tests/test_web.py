@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from douyin_wiki.config import AppConfig, load_config
 from douyin_wiki.errors import EntryNotFoundError
-from douyin_wiki.models import EntryRecord, InspirationInput, RetentionPolicy
+from douyin_wiki.models import EntryRecord, InspirationInput, JobStatus, RetentionPolicy
 from douyin_wiki.service import DouyinWikiService
 from douyin_wiki.webapp.app import create_app
 from douyin_wiki.webapp.chat import ChatChunk
@@ -255,6 +255,51 @@ def test_web_favorite_returns_404_for_missing_article(tmp_path: Path) -> None:
             "/api/articles/missing/favorite", json={"favorite": True}
         )
     assert response.status_code == 404
+
+
+def test_web_favorite_returns_committed_state_when_catalog_refresh_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+
+    def broken_refresh():
+        raise OSError("catalog unavailable")
+
+    monkeypatch.setattr(app.state.catalog, "refresh", broken_refresh)
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/articles/dy-123/favorite", json={"favorite": True}
+        )
+
+    assert response.status_code == 200
+    assert response.json()["item"]["favorite"] is True
+    assert response.json()["item"]["retention"] == "keep"
+    assert "目录刷新失败" in response.json()["warnings"][0]
+
+
+@pytest.mark.parametrize("status", [JobStatus.NEEDS_AUTH, JobStatus.FAILED])
+def test_web_can_retry_media_restore_job(tmp_path: Path, status: JobStatus) -> None:
+    config, service = _web_fixture(tmp_path)
+    entry = service.database.get_entry("dy-123").model_copy(
+        update={"media_status": "removed"}
+    )
+    service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
+    restore = service.set_entry_favorite(entry.id, True)["restore_job"]
+    service.database.update_job(
+        restore.id,
+        status=status,
+        error_code="auth" if status == JobStatus.NEEDS_AUTH else "download_failed",
+        error_message="需要重试",
+        unlock=True,
+    )
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/jobs/{restore.id}/retry")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
 
 
 def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:

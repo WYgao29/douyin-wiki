@@ -144,6 +144,29 @@ function toast(message) {
   toast.timer = window.setTimeout(() => node.classList.remove("show"), 2600);
 }
 
+function showRestoreRetry(jobId, message) {
+  const node = $("#toast");
+  const copy = document.createElement("span");
+  copy.textContent = message;
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "toast-action";
+  retry.textContent = "重试下载";
+  retry.addEventListener("click", async () => {
+    retry.disabled = true;
+    try {
+      await api(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {method: "POST"});
+      toast("已重新加入视频恢复队列");
+      await pollRestoreJob(jobId);
+    } catch (error) {
+      showRestoreRetry(jobId, error.message || "重试失败");
+    }
+  });
+  node.replaceChildren(copy, retry);
+  node.classList.add("show");
+  window.clearTimeout(toast.timer);
+}
+
 async function api(url, options = {}) {
   const response = await fetch(url, {
     headers: {"Content-Type": "application/json", ...(options.headers || {})},
@@ -464,9 +487,9 @@ async function pollRestoreJob(jobId) {
       toast(job.result?.skipped ? "已取消视频恢复" : "收藏视频已重新下载到本地");
       await loadLibrary({showLoading: false});
     } else if (job.status === "needs_auth") {
-      toast("已收藏；更新抖音登录后可重试下载");
+      showRestoreRetry(jobId, "已收藏；更新抖音登录后可重试下载");
     } else {
-      toast("已收藏；视频恢复失败，可稍后重试");
+      showRestoreRetry(jobId, "已收藏；视频恢复失败");
     }
     return;
   }

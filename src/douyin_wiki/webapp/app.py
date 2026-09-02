@@ -467,17 +467,27 @@ def create_app(
 
     @app.put("/api/articles/{entry_id}/favorite")
     async def set_article_favorite(entry_id: str, payload: SetFavoriteRequest):
+        existing_item = catalog.get(entry_id)
+        if existing_item is None:
+            raise HTTPException(status_code=404, detail="文章不存在")
         try:
             result = core.set_entry_favorite(entry_id, payload.favorite)
         except EntryNotFoundError as exc:
             raise HTTPException(status_code=404, detail="文章不存在") from exc
         mutation = await publish_mutation({})
-        item = catalog.get(entry_id)
-        if item is None:
-            raise HTTPException(status_code=404, detail="文章不存在")
+        item = catalog.get(entry_id) or existing_item
+        item_payload = _item_payload(item)
+        persisted = result["entry"]
+        item_payload.update(
+            {
+                "favorite": persisted.favorite,
+                "media_status": persisted.media_status,
+                "retention": persisted.retention.value,
+            }
+        )
         restore_job = result["restore_job"]
         response = {
-            "item": _item_payload(item),
+            "item": item_payload,
             "restore_job": _job_payload(restore_job) if restore_job else None,
             "warnings": mutation["warnings"],
         }
@@ -489,6 +499,17 @@ def create_app(
             return _job_payload(core.get_job(job_id))
         except JobStateError as exc:
             raise HTTPException(status_code=404, detail="任务不存在") from exc
+
+    @app.post("/api/jobs/{job_id}/retry", status_code=202)
+    async def retry_job(job_id: str):
+        try:
+            core.get_job(job_id)
+        except JobStateError as exc:
+            raise HTTPException(status_code=404, detail="任务不存在") from exc
+        try:
+            return _job_payload(core.retry_job(job_id))
+        except JobStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.delete("/api/articles/{entry_id}")
     async def trash_article(entry_id: str, payload: ConfirmDestructiveActionRequest):

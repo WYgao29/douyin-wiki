@@ -189,6 +189,31 @@ def test_entry_favorite_round_trips_through_database(tmp_path: Path) -> None:
     assert database.get_entry(entry.id).favorite is True
 
 
+def test_expired_media_query_never_returns_favorite_entry(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    now = datetime.now(UTC)
+    entry = EntryRecord(
+        id="dy-inconsistent",
+        video_id="inconsistent",
+        title="收藏保护",
+        original_url="https://example.com/inconsistent",
+        canonical_url="https://example.com/inconsistent",
+        raw_path="raw/inconsistent.md",
+        source_path="wiki/sources/inconsistent.md",
+        status="active",
+        media_status="present",
+        retention=RetentionPolicy.TEMPORARY,
+        favorite=True,
+        media_expires_at=now - timedelta(days=1),
+        created_at=now,
+        updated_at=now,
+    )
+    database.upsert_entry(entry, {})
+
+    assert database.entries_with_expired_media(now) == []
+
+
 def test_stale_worker_cannot_update_or_unlock_new_owner(tmp_path: Path) -> None:
     database = Database(tmp_path / "state.sqlite3")
     database.initialize()

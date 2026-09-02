@@ -2748,7 +2748,8 @@ class Database:
         timestamp = (now or utc_now()).isoformat()
         with self.connect() as conn:
             rows = conn.execute(
-                """SELECT * FROM entries WHERE retention='temporary' AND media_status='present'
+                """SELECT * FROM entries WHERE favorite=0
+                   AND retention='temporary' AND media_status='present'
                    AND media_expires_at IS NOT NULL AND media_expires_at <= ?""",
                 (timestamp,),
             ).fetchall()

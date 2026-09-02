@@ -380,7 +380,14 @@ async def test_database_rebuild_preserves_favorite_state(service) -> None:
     service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
     completed = await Worker(service).run_once()
     entry_id = completed.result["entry_id"]
-    service.set_entry_favorite(entry_id, True)
+    favorited = service.set_entry_favorite(entry_id, True)["entry"]
+    source = service.config.vault_path / favorited.source_path
+    source.write_text(
+        source.read_text(encoding="utf-8").replace(
+            "media_retention: 永久保留", "media_retention: 临时保留"
+        ),
+        encoding="utf-8",
+    )
 
     service.rebuild_database_from_vault(apply=True)
 
