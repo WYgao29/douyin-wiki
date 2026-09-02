@@ -662,6 +662,9 @@ class LibraryItem(BaseModel):
     published_at: datetime | None = None
     captured_at: datetime | None = None
     status: str = "已入库"
+    favorite: bool = False
+    media_status: str = "present"
+    retention: RetentionPolicy = RetentionPolicy.TEMPORARY
     source_kind: SourceKind = SourceKind.VIDEO
     source_path: str
     original_url: str = ""
@@ -816,6 +819,7 @@ class EntryRecord(BaseModel):
     status: str
     media_status: str
     retention: RetentionPolicy
+    favorite: bool = False
     media_expires_at: datetime | None = None
     summary: str = ""
     inspirations: list[InspirationInput] = Field(

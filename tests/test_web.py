@@ -198,6 +198,65 @@ def test_library_article_rendering_and_media_security(tmp_path: Path) -> None:
         assert rejected.status_code == 400
 
 
+def test_web_can_favorite_and_unfavorite_an_article(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        initial = client.get("/api/library").json()["items"][0]
+        assert initial["favorite"] is False
+
+        favorited = client.put(
+            "/api/articles/dy-123/favorite", json={"favorite": True}
+        )
+        assert favorited.status_code == 200
+        assert favorited.json()["item"]["favorite"] is True
+        assert favorited.json()["restore_job"] is None
+        assert service.database.get_entry("dy-123").retention == RetentionPolicy.KEEP
+
+        unfavorited = client.put(
+            "/api/articles/dy-123/favorite", json={"favorite": False}
+        )
+        assert unfavorited.status_code == 200
+        assert unfavorited.json()["item"]["favorite"] is False
+        assert service.database.get_entry("dy-123").retention == RetentionPolicy.TEMPORARY
+        assert client.get("/api/library").json()["items"][0]["favorite"] is False
+
+
+def test_web_favorite_queues_removed_media_restore_and_exposes_job(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    entry = service.database.get_entry("dy-123").model_copy(
+        update={"media_status": "removed"}
+    )
+    service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/articles/dy-123/favorite", json={"favorite": True}
+        )
+        assert response.status_code == 202
+        restore_job = response.json()["restore_job"]
+        assert restore_job["kind"] == "media_restore"
+        assert restore_job["status"] == "queued"
+
+        job = client.get(f"/api/jobs/{restore_job['id']}")
+        assert job.status_code == 200
+        assert job.json()["id"] == restore_job["id"]
+        assert job.json()["status"] == "queued"
+
+
+def test_web_favorite_returns_404_for_missing_article(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/articles/missing/favorite", json={"favorite": True}
+        )
+    assert response.status_code == 404
+
+
 def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(
@@ -214,6 +273,8 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'aria-label="抖库 AI 对话"' in page.text
         assert 'data-library-view="list"' in page.text
         assert 'data-library-view="gallery"' in page.text
+        assert 'data-section="favorite"' in page.text
+        assert "收藏" in page.text
         assert 'aria-label="专辑墙视图"' in page.text
         assert 'aria-label="画廊视图"' not in page.text
         assert "data-theme-select" in page.text
@@ -632,7 +693,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.1.5" in page.text
+        assert "/static/model-settings.js?v=0.1.6" in page.text
         assert "settings-info-panel" not in page.text
 
 

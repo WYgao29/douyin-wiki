@@ -8,7 +8,13 @@ import pytest
 
 from douyin_wiki.database import Database
 from douyin_wiki.errors import JobLeaseLostError
-from douyin_wiki.models import CaptureRequest, InspirationInput, JobStatus
+from douyin_wiki.models import (
+    CaptureRequest,
+    EntryRecord,
+    InspirationInput,
+    JobStatus,
+    RetentionPolicy,
+)
 
 
 def test_queue_claim_and_recovery(tmp_path: Path) -> None:
@@ -105,7 +111,82 @@ def test_initialize_migrates_chunks_with_image_index(tmp_path: Path) -> None:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(chunks)")}
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     assert "image_index" in columns
-    assert version == 9
+    assert version == 10
+
+
+def test_initialize_adds_favorite_to_existing_entries_table(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE entries (
+                id TEXT PRIMARY KEY,
+                video_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                original_url TEXT NOT NULL,
+                canonical_url TEXT NOT NULL,
+                raw_path TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                media_status TEXT NOT NULL DEFAULT 'present',
+                retention TEXT NOT NULL DEFAULT 'temporary',
+                media_expires_at TEXT,
+                summary TEXT NOT NULL DEFAULT '',
+                purposes_json TEXT NOT NULL DEFAULT '[]',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                data_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO entries (
+                id, video_id, title, original_url, canonical_url, raw_path, source_path,
+                created_at, updated_at
+            ) VALUES (
+                'dy-legacy', 'legacy', '旧资料', 'https://example.com/legacy',
+                'https://example.com/legacy', 'raw/legacy.md', 'wiki/sources/legacy.md',
+                '2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00'
+            );
+            PRAGMA user_version=9;
+            """
+        )
+    database = Database(path)
+    database.initialize()
+
+    with database.connect() as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(entries)")}
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        favorite = connection.execute(
+            "SELECT favorite FROM entries WHERE id='dy-legacy'"
+        ).fetchone()[0]
+
+    assert "favorite" in columns
+    assert version == 10
+    assert favorite == 0
+
+
+def test_entry_favorite_round_trips_through_database(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    now = datetime.now(UTC)
+    entry = EntryRecord(
+        id="dy-123456789012",
+        video_id="123456789012",
+        title="收藏测试",
+        original_url="https://www.douyin.com/video/123456789012",
+        canonical_url="https://www.douyin.com/video/123456789012",
+        raw_path="raw/收藏测试.md",
+        source_path="wiki/sources/收藏测试.md",
+        status="active",
+        media_status="present",
+        retention=RetentionPolicy.KEEP,
+        favorite=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+    database.upsert_entry(entry, {})
+
+    assert database.get_entry(entry.id).favorite is True
 
 
 def test_stale_worker_cannot_update_or_unlock_new_owner(tmp_path: Path) -> None:

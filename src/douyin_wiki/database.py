@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS entries (
     status TEXT NOT NULL DEFAULT 'active',
     media_status TEXT NOT NULL DEFAULT 'present',
     retention TEXT NOT NULL DEFAULT 'temporary',
+    favorite INTEGER NOT NULL DEFAULT 0,
     media_expires_at TEXT,
     summary TEXT NOT NULL DEFAULT '',
     purposes_json TEXT NOT NULL DEFAULT '[]',
@@ -374,10 +375,19 @@ class Database:
             }
             if "superseded_at" not in event_columns:
                 conn.execute("ALTER TABLE job_events ADD COLUMN superseded_at TEXT")
+            entry_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(entries)").fetchall()
+            }
+            if "favorite" not in entry_columns:
+                conn.execute("ALTER TABLE entries ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_entries_favorite "
+                "ON entries(favorite, updated_at DESC)"
+            )
             if previous_version < 9:
                 self._rebuild_fts_conn(conn)
             self._retire_undeliverable_events_conn(conn)
-            conn.execute("PRAGMA user_version=9")
+            conn.execute("PRAGMA user_version=10")
 
     @staticmethod
     def _rebuild_fts_conn(conn: sqlite3.Connection) -> None:
@@ -509,6 +519,52 @@ class Database:
                     max(0.0, min(1.0, progress)),
                     request.model_dump_json(),
                     json.dumps(artifacts or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_job(job_id)
+
+    def get_or_create_active_job(
+        self,
+        request: CaptureRequest,
+        *,
+        kind: str,
+        artifacts: dict[str, Any],
+        match_artifact: str,
+    ) -> JobRecord:
+        """Atomically reuse a matching unfinished job or create it."""
+        terminal_statuses = (
+            JobStatus.COMPLETED.value,
+            JobStatus.COMPLETED_WITH_WARNINGS.value,
+            JobStatus.FAILED.value,
+        )
+        job_id = uuid.uuid4().hex
+        now = iso_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT * FROM jobs
+                   WHERE kind=? AND status NOT IN (?, ?, ?)
+                   ORDER BY created_at DESC""",
+                (kind, *terminal_statuses),
+            ).fetchall()
+            expected = artifacts.get(match_artifact)
+            for row in rows:
+                existing_artifacts = json.loads(row["artifacts_json"])
+                if existing_artifacts.get(match_artifact) == expected:
+                    return self._job_from_row(row)
+            conn.execute(
+                """INSERT INTO jobs
+                   (id, kind, status, progress, request_json, artifacts_json, result_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, 0, ?, ?, '{}', ?, ?)""",
+                (
+                    job_id,
+                    kind,
+                    JobStatus.QUEUED.value,
+                    request.model_dump_json(),
+                    json.dumps(artifacts, ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -1673,6 +1729,7 @@ class Database:
             entry.status,
             entry.media_status,
             entry.retention.value,
+            int(entry.favorite),
             entry.media_expires_at.isoformat() if entry.media_expires_at else None,
             entry.summary,
             json.dumps(
@@ -1690,13 +1747,14 @@ class Database:
         conn.execute(
             """INSERT INTO entries
                 (id, video_id, title, original_url, canonical_url, raw_path, source_path, status,
-                 media_status, retention, media_expires_at, summary,
+                 media_status, retention, favorite, media_expires_at, summary,
                  purposes_json, tags_json, data_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   title=excluded.title, canonical_url=excluded.canonical_url,
                   status=excluded.status, media_status=excluded.media_status,
-                  retention=excluded.retention, media_expires_at=excluded.media_expires_at,
+                  retention=excluded.retention, favorite=excluded.favorite,
+                  media_expires_at=excluded.media_expires_at,
                   summary=excluded.summary,
                   purposes_json=excluded.purposes_json, tags_json=excluded.tags_json,
                   data_json=excluded.data_json, updated_at=excluded.updated_at""",
@@ -2795,6 +2853,7 @@ class Database:
             status=row["status"],
             media_status=row["media_status"],
             retention=RetentionPolicy(row["retention"]),
+            favorite=bool(row["favorite"]),
             media_expires_at=parse_datetime(row["media_expires_at"]),
             summary=row["summary"],
             inspirations=[

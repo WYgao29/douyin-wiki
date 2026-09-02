@@ -14,7 +14,7 @@ const VALID_DENSITIES = new Set(["comfortable", "compact"]);
 const VALID_SORTS = new Set([
   "captured_desc", "published_desc", "published_asc", "title_asc", "author_asc",
 ]);
-const VALID_SECTIONS = new Set(["all", "recent", "inspiration"]);
+const VALID_SECTIONS = new Set(["all", "recent", "favorite", "inspiration"]);
 
 const state = {
   items: [],
@@ -235,6 +235,7 @@ function filteredItems() {
       && (!state.tags.length || state.tags.some((tag) => (item.tags || []).includes(tag)))
       && (!state.sources.length || state.sources.includes(item.source_kind))
       && (!state.inspirationOnly || hasInspiration)
+      && (state.section !== "favorite" || item.favorite)
       && (state.section !== "inspiration" || hasInspiration);
   });
   items.sort((a, b) => {
@@ -438,6 +439,73 @@ function sourceLabel(item) {
   return item.source_kind === "image_note" ? "图文" : "视频";
 }
 
+function syncFavoriteItem(updated) {
+  const update = (item) => item.entry_id === updated.entry_id ? {...item, ...updated} : item;
+  state.items = state.items.map(update);
+  state.allItems = state.allItems.map(update);
+}
+
+function updateFavoriteButton(button, favorite) {
+  button.classList.toggle("active", favorite);
+  button.setAttribute("aria-pressed", String(favorite));
+  button.setAttribute("aria-label", favorite ? "取消收藏" : "收藏");
+  button.title = favorite ? "取消收藏" : "收藏";
+  const label = $("[data-favorite-label]", button);
+  if (label) label.textContent = favorite ? "取消收藏" : "收藏";
+}
+
+async function pollRestoreJob(jobId) {
+  const terminal = new Set(["completed", "completed_with_warnings", "failed", "needs_auth"]);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (!terminal.has(job.status)) continue;
+    if (job.status === "completed" || job.status === "completed_with_warnings") {
+      toast(job.result?.skipped ? "已取消视频恢复" : "收藏视频已重新下载到本地");
+      await loadLibrary({showLoading: false});
+    } else if (job.status === "needs_auth") {
+      toast("已收藏；更新抖音登录后可重试下载");
+    } else {
+      toast("已收藏；视频恢复失败，可稍后重试");
+    }
+    return;
+  }
+  toast("已收藏；视频仍在后台恢复");
+}
+
+function makeFavoriteButton(item, className = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `favorite-button ${className}`.trim();
+  button.append(svgIcon("bookmark"));
+  updateFavoriteButton(button, Boolean(item.favorite));
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const favorite = !button.classList.contains("active");
+    button.disabled = true;
+    try {
+      const response = await api(`/api/articles/${encodeURIComponent(item.entry_id)}/favorite`, {
+        method: "PUT",
+        body: JSON.stringify({favorite}),
+      });
+      Object.assign(item, response.item);
+      syncFavoriteItem(response.item);
+      updateFavoriteButton(button, response.item.favorite);
+      toast(response.item.favorite ? "已收藏，视频会永久保留在本地" : "已取消收藏");
+      if (!$("#library-view").classList.contains("hidden")) renderLibrary();
+      if (response.restore_job) pollRestoreJob(response.restore_job.id).catch(() => {
+        toast("已收藏；暂时无法读取视频恢复进度");
+      });
+    } catch (error) {
+      toast(error.message || "收藏操作失败");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
 function stableHash(value) {
   let hash = 2166136261;
   for (const character of String(value || "抖库")) {
@@ -502,6 +570,7 @@ function makeListItem(item) {
   });
   link.append(makeCover(item, "item-thumbnail"), copy, tags);
   article.append(link);
+  article.append(makeFavoriteButton(item, "card-favorite-button"));
   article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
   if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
   return article;
@@ -564,6 +633,7 @@ function makeGalleryCard(item, index, animateNew) {
   });
   link.append(cover, copy);
   article.append(link);
+  article.append(makeFavoriteButton(item, "card-favorite-button"));
   article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
   if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
   return article;
@@ -591,10 +661,11 @@ function renderLibraryEmptyState(items) {
 
 function renderLibrary() {
   const items = filteredItems();
-  const titles = {all: "资料库", recent: "最近加入", inspiration: "灵感"};
+  const titles = {all: "资料库", recent: "最近加入", favorite: "收藏", inspiration: "灵感"};
   const summaries = {
     all: "整理并检索已经入库的抖音知识",
     recent: "最近采集和更新的知识资料",
+    favorite: "永久保留在本地的收藏资料",
     inspiration: "带有你原始灵感的文章",
   };
   $("#view-title").textContent = titles[state.section];
@@ -1039,6 +1110,12 @@ function makeArticleHeader(item) {
   }
   const actions = document.createElement("div");
   actions.className = "article-actions";
+  const favorite = makeFavoriteButton(item, "article-favorite-button");
+  const favoriteLabel = document.createElement("span");
+  favoriteLabel.dataset.favoriteLabel = "";
+  favoriteLabel.textContent = item.favorite ? "取消收藏" : "收藏";
+  favorite.append(favoriteLabel);
+  actions.append(favorite);
   if (item.original_url) {
     const source = document.createElement("a");
     source.className = "article-source-link";

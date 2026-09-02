@@ -19,6 +19,7 @@ from douyin_wiki.models import (
     GatewayContext,
     InspirationInput,
     JobStatus,
+    RetentionPolicy,
     TranscriptCorrection,
 )
 from douyin_wiki.worker import Worker
@@ -233,6 +234,160 @@ async def test_duplicate_video_appends_inspiration_without_redownload(service) -
     assert downloader.calls == 1
     entry = service.database.get_entry(first.result["entry_id"])
     assert [item.text for item in entry.inspirations] == ["灵感一", "灵感二"]
+
+
+@pytest.mark.asyncio
+async def test_favorite_keeps_media_and_unfavorite_restarts_retention_window(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+
+    favorited = service.set_entry_favorite(entry_id, True)
+
+    assert favorited["restore_job"] is None
+    assert favorited["entry"].favorite is True
+    assert favorited["entry"].retention == RetentionPolicy.KEEP
+    assert favorited["entry"].media_expires_at is None
+    assert service.database.entries_with_expired_media() == []
+    source = service.config.vault_path / favorited["entry"].source_path
+    assert "favorite: true" in source.read_text(encoding="utf-8")
+
+    before = datetime.now(UTC) + timedelta(days=29, hours=23)
+    unfavorited = service.set_entry_favorite(entry_id, False)
+
+    assert unfavorited["restore_job"] is None
+    assert unfavorited["entry"].favorite is False
+    assert unfavorited["entry"].retention == RetentionPolicy.TEMPORARY
+    assert unfavorited["entry"].media_expires_at is not None
+    assert unfavorited["entry"].media_expires_at > before
+    assert "favorite: false" in source.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_favorite_restores_removed_media_without_reanalysis(service, monkeypatch) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+    entry = service.database.get_entry(entry_id)
+    original_analysis = copy.deepcopy(service.database.get_entry_data(entry_id)["analysis"])
+    assets = service.config.vault_path / "raw" / "assets" / entry.video_id
+    shutil.rmtree(assets)
+    service.database.mark_media_removed(entry_id)
+
+    async def unexpected_transcription(*_args, **_kwargs):
+        raise AssertionError("media restoration must not transcribe or analyze")
+
+    monkeypatch.setattr(service.transcriber, "transcribe", unexpected_transcription)
+
+    favorited = service.set_entry_favorite(entry_id, True)
+
+    assert favorited["entry"].favorite is True
+    assert favorited["entry"].retention == RetentionPolicy.KEEP
+    assert favorited["restore_job"].kind == "media_restore"
+    restored = await Worker(service).run_once()
+
+    assert restored.status == JobStatus.COMPLETED
+    assert restored.result == {"entry_id": entry_id, "media_restored": True}
+    refreshed = service.database.get_entry(entry_id)
+    assert refreshed.favorite is True
+    assert refreshed.media_status == "present"
+    assert refreshed.retention == RetentionPolicy.KEEP
+    assert (assets / "original.mp4").is_file()
+    assert service.downloader.calls == 2
+    assert service.database.get_entry_data(entry_id)["analysis"] == original_analysis
+
+
+@pytest.mark.asyncio
+async def test_repeated_favorite_reuses_pending_media_restore_job(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+    service.database.mark_media_removed(entry_id)
+
+    first = service.set_entry_favorite(entry_id, True)
+    second = service.set_entry_favorite(entry_id, True)
+
+    assert second["restore_job"].id == first["restore_job"].id
+    assert [job.kind for job in service.list_jobs() if job.kind == "media_restore"] == [
+        "media_restore"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unfavorite_skips_queued_media_restore(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+    service.database.mark_media_removed(entry_id)
+    service.set_entry_favorite(entry_id, True)
+
+    service.set_entry_favorite(entry_id, False)
+    skipped = await Worker(service).run_once()
+
+    assert skipped.result["skipped"] is True
+    assert service.downloader.calls == 1
+    entry = service.database.get_entry(entry_id)
+    assert entry.favorite is False
+    assert entry.retention == RetentionPolicy.TEMPORARY
+
+
+@pytest.mark.asyncio
+async def test_media_restore_auth_failure_keeps_favorite_and_can_retry(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+    service.database.mark_media_removed(entry_id)
+    service.downloader = CookieExpiredDownloader()
+    favorited = service.set_entry_favorite(entry_id, True)
+
+    paused = await Worker(service).run_once()
+
+    assert paused.id == favorited["restore_job"].id
+    assert paused.status == JobStatus.NEEDS_AUTH
+    assert paused.result["auth_scope"] == "video"
+    entry = service.database.get_entry(entry_id)
+    assert entry.favorite is True
+    assert entry.retention == RetentionPolicy.KEEP
+    assert service.retry_job(paused.id).status == JobStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_image_note_favorite_is_organizational_and_does_not_queue_video_restore(
+    service,
+) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry = service.database.get_entry(completed.result["entry_id"]).model_copy(
+        update={"media_status": "removed"}
+    )
+    data = service.database.get_entry_data(entry.id)
+    data["metadata"]["source_kind"] = "image_note"
+    service.database.upsert_entry(entry, data)
+
+    favorited = service.set_entry_favorite(entry.id, True)
+    assert favorited["entry"].favorite is True
+    assert favorited["entry"].retention == RetentionPolicy.KEEP
+    assert favorited["restore_job"] is None
+
+    unfavorited = service.set_entry_favorite(entry.id, False)
+    assert unfavorited["entry"].favorite is False
+    assert unfavorited["entry"].retention == RetentionPolicy.KEEP
+    assert unfavorited["entry"].media_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_database_rebuild_preserves_favorite_state(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry_id = completed.result["entry_id"]
+    service.set_entry_favorite(entry_id, True)
+
+    service.rebuild_database_from_vault(apply=True)
+
+    rebuilt = service.database.get_entry(entry_id)
+    assert rebuilt.favorite is True
+    assert rebuilt.retention == RetentionPolicy.KEEP
+    assert rebuilt.media_expires_at is None
 
 
 @pytest.mark.asyncio

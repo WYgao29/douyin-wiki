@@ -245,6 +245,13 @@ class LibraryCatalog:
             published_at=parse_datetime(published),
             captured_at=parse_datetime(captured),
             status=str(frontmatter.get("status") or "已入库"),
+            favorite=entry.favorite if entry else bool(frontmatter.get("favorite", False)),
+            media_status=entry.media_status if entry else "present",
+            retention=(
+                entry.retention
+                if entry
+                else "temporary"
+            ),
             source_kind=source_kind,
             source_path=str(path.relative_to(self.vault_path)),
             original_url=original_url,

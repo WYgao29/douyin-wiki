@@ -917,6 +917,7 @@ class VaultWriter:
                 str(source_frontmatter.get("media_status") or "present")
             ),
             retention=retention,
+            favorite=bool(source_frontmatter.get("favorite", False)),
             media_expires_at=parse_datetime(source_frontmatter.get("media_expires_at")),
             summary=analysis.one_liner,
             inspirations=inspirations,
@@ -1134,6 +1135,7 @@ class VaultWriter:
             "canonical_url": entry.canonical_url,
             "media_status": label_media_status(entry.media_status),
             "media_retention": label_retention(entry.retention),
+            "favorite": entry.favorite,
             "media_expires_at": beijing_iso(entry.media_expires_at)
             if entry.media_expires_at
             else None,
