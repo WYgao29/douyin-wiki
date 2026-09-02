@@ -2,6 +2,7 @@
 .env
 .obsidian/
 .venv/
+.worktrees/
 .pytest_cache/
 .ruff_cache/
 .coverage

@@ -685,6 +685,10 @@ class DouyinWikiService:
     def retry_job(self, job_id: str) -> JobRecord:
         """Retry a failed job from its last persisted stage checkpoint."""
         job = self.database.get_job(job_id)
+        if job.kind == "media_restore":
+            return self.database.requeue_job_deduplicated(
+                job_id, match_artifact="entry_id"
+            )
         if job.status not in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}:
             raise JobStateError("只有“失败”或“需要登录授权”的任务可以重试")
         return self.database.requeue_job(job_id)
@@ -739,6 +743,57 @@ class DouyinWikiService:
     def add_purpose(self, entry_id: str, purpose: InspirationInput) -> EntryRecord:
         """Deprecated compatibility alias; use add_inspiration."""
         return self.add_inspiration(entry_id, purpose)
+
+    def set_entry_favorite(self, entry_id: str, favorite: bool) -> dict[str, Any]:
+        with self.vault.entry_operations_locked():
+            entry = self.database.get_entry(entry_id)
+            data = self.database.get_entry_data(entry_id)
+            source_kind = data.get("metadata", {}).get(
+                "source_kind", SourceKind.VIDEO.value
+            )
+            now = utc_now()
+            if favorite or source_kind == SourceKind.IMAGE_NOTE.value:
+                retention = RetentionPolicy.KEEP
+                expires_at = None
+            else:
+                retention = RetentionPolicy.TEMPORARY
+                expires_at = now + timedelta(days=self.config.media.retention_days)
+            updated = entry.model_copy(
+                update={
+                    "favorite": favorite,
+                    "retention": retention,
+                    "media_expires_at": expires_at,
+                    "updated_at": now,
+                }
+            )
+            self._write_entry_documents(
+                updated,
+                data,
+                action="favorite",
+                log_summary="收藏资料" if favorite else "取消收藏",
+                commit_message=(
+                    f"favorite: {entry.video_id} {entry.title}"
+                    if favorite
+                    else f"unfavorite: {entry.video_id} {entry.title}"
+                ),
+            )
+            persisted = self.database.upsert_entry(updated, data)
+            restore_job = None
+            if (
+                favorite
+                and source_kind == SourceKind.VIDEO.value
+                and persisted.media_status == "removed"
+            ):
+                restore_job = self.database.get_or_create_active_job(
+                    CaptureRequest(
+                        share_text=persisted.original_url,
+                        options=CaptureOptions(retention=RetentionPolicy.KEEP),
+                    ),
+                    kind="media_restore",
+                    artifacts={"entry_id": persisted.id},
+                    match_artifact="entry_id",
+                )
+            return {"entry": persisted, "restore_job": restore_job}
 
     def submit_analysis(
         self,
@@ -1977,6 +2032,8 @@ class DouyinWikiService:
                 outcome = await self._process_creator_import(job)
             elif job.kind == "reanalyze":
                 outcome = await self._process_reanalysis(job)
+            elif job.kind == "media_restore":
+                outcome = await self._process_media_restore(job)
             else:
                 outcome = await self._process_capture(job)
         except JobLeaseLostError:
@@ -2037,6 +2094,63 @@ class DouyinWikiService:
                     )
             self._refresh_creator_parent(str(creator_context.get("parent_job_id") or ""))
         return outcome
+
+    async def _process_media_restore(self, job: JobRecord) -> JobRecord:
+        entry_id = str(job.artifacts.get("entry_id") or "")
+        entry = self.database.get_entry(entry_id)
+        if not entry.favorite:
+            return self.database.update_job(
+                job.id,
+                status=JobStatus.COMPLETED,
+                progress=1,
+                result={"entry_id": entry.id, "media_restored": False, "skipped": True},
+                unlock=True,
+            )
+        data = self.database.get_entry_data(entry.id)
+        raw_parent = Path(entry.raw_path).parent
+        raw_root = raw_parent.parent if raw_parent.name == "records" else raw_parent
+        assets_dir = self.config.vault_path / raw_root / "assets" / entry.video_id
+        self.database.update_job(job.id, status=JobStatus.DOWNLOADING, progress=0.2)
+        async with self.download_semaphore:
+            metadata = await self.downloader.download(
+                entry.canonical_url,
+                entry.video_id,
+                assets_dir,
+            )
+        data["metadata"] = metadata.model_dump(mode="json")
+        with self.vault.entry_operations_locked():
+            current = self.database.get_entry(entry.id)
+            now = utc_now()
+            keep = current.favorite
+            updated = current.model_copy(
+                update={
+                    "media_status": "present",
+                    "retention": (
+                        RetentionPolicy.KEEP if keep else RetentionPolicy.TEMPORARY
+                    ),
+                    "media_expires_at": (
+                        None
+                        if keep
+                        else now + timedelta(days=self.config.media.retention_days)
+                    ),
+                    "updated_at": now,
+                }
+            )
+            self._write_entry_documents(
+                updated,
+                data,
+                action="media_restore",
+                log_summary="恢复收藏视频媒体",
+                commit_message=f"media: restore {entry.video_id} {entry.title}",
+            )
+            self.database.upsert_entry(updated, data)
+        return self.database.update_job(
+            job.id,
+            status=JobStatus.COMPLETED,
+            progress=1,
+            result={"entry_id": entry.id, "media_restored": True},
+            unlock=True,
+        )
 
     async def _process_creator_import(self, job: JobRecord) -> JobRecord:
         artifacts = dict(job.artifacts)

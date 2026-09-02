@@ -28,7 +28,7 @@ from ..config import (
     llm_api_key_required,
     load_config,
 )
-from ..errors import DouyinWikiError, EntryNotFoundError
+from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
 from ..localization import label_entry_status
 from ..models import InspirationDraft, InspirationInput, TopicArtifactKind
 from ..secrets import get_secret, store_secret
@@ -39,7 +39,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.5"
+WEB_VERSION = "0.1.6"
 
 
 class CaptureSubmissionRequest(BaseModel):
@@ -84,6 +84,10 @@ class SaveTopicNoteRequest(BaseModel):
 
 class ConfirmDestructiveActionRequest(BaseModel):
     confirmed: bool = False
+
+
+class SetFavoriteRequest(BaseModel):
+    favorite: bool
 
 
 class ModelSettingsRequest(BaseModel):
@@ -148,6 +152,18 @@ def _item_payload(item: Any) -> dict[str, Any]:
     payload["captured_display"] = format_beijing(item.captured_at)
     payload["inspirations"] = [value.model_dump(mode="json") for value in item.inspirations]
     return payload
+
+
+def _job_payload(job: Any) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "kind": job.kind,
+        "status": job.status.value,
+        "progress": job.progress,
+        "result": job.result,
+        "error_code": job.error_code,
+        "error_message": job.error_message,
+    }
 
 
 def _event(name: str, payload: Any) -> str:
@@ -448,6 +464,52 @@ def create_app(
                 catalog=catalog,
             ),
         }
+
+    @app.put("/api/articles/{entry_id}/favorite")
+    async def set_article_favorite(entry_id: str, payload: SetFavoriteRequest):
+        existing_item = catalog.get(entry_id)
+        if existing_item is None:
+            raise HTTPException(status_code=404, detail="文章不存在")
+        try:
+            result = core.set_entry_favorite(entry_id, payload.favorite)
+        except EntryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="文章不存在") from exc
+        mutation = await publish_mutation({})
+        item = catalog.get(entry_id) or existing_item
+        item_payload = _item_payload(item)
+        persisted = result["entry"]
+        item_payload.update(
+            {
+                "favorite": persisted.favorite,
+                "media_status": persisted.media_status,
+                "retention": persisted.retention.value,
+            }
+        )
+        restore_job = result["restore_job"]
+        response = {
+            "item": item_payload,
+            "restore_job": _job_payload(restore_job) if restore_job else None,
+            "warnings": mutation["warnings"],
+        }
+        return JSONResponse(response, status_code=202 if restore_job else 200)
+
+    @app.get("/api/jobs/{job_id}")
+    async def job_status(job_id: str):
+        try:
+            return _job_payload(core.get_job(job_id))
+        except JobStateError as exc:
+            raise HTTPException(status_code=404, detail="任务不存在") from exc
+
+    @app.post("/api/jobs/{job_id}/retry", status_code=202)
+    async def retry_job(job_id: str):
+        try:
+            core.get_job(job_id)
+        except JobStateError as exc:
+            raise HTTPException(status_code=404, detail="任务不存在") from exc
+        try:
+            return _job_payload(core.retry_job(job_id))
+        except JobStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.delete("/api/articles/{entry_id}")
     async def trash_article(entry_id: str, payload: ConfirmDestructiveActionRequest):

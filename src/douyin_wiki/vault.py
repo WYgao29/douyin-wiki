@@ -901,9 +901,12 @@ class VaultWriter:
             InspirationInput.model_validate(item)
             for item in source_frontmatter.get("inspirations", [])
         ]
+        favorite = bool(source_frontmatter.get("favorite", False))
         retention = parse_retention(
             str(source_frontmatter.get("media_retention", RetentionPolicy.TEMPORARY.value))
         )
+        if favorite:
+            retention = RetentionPolicy.KEEP
         entry = EntryRecord(
             id=f"dy-{source_frontmatter['video_id']}",
             video_id=str(source_frontmatter["video_id"]),
@@ -917,7 +920,12 @@ class VaultWriter:
                 str(source_frontmatter.get("media_status") or "present")
             ),
             retention=retention,
-            media_expires_at=parse_datetime(source_frontmatter.get("media_expires_at")),
+            favorite=favorite,
+            media_expires_at=(
+                None
+                if favorite
+                else parse_datetime(source_frontmatter.get("media_expires_at"))
+            ),
             summary=analysis.one_liner,
             inspirations=inspirations,
             tags=[str(item) for item in source_frontmatter.get("tags", [])],
@@ -1134,6 +1142,7 @@ class VaultWriter:
             "canonical_url": entry.canonical_url,
             "media_status": label_media_status(entry.media_status),
             "media_retention": label_retention(entry.retention),
+            "favorite": entry.favorite,
             "media_expires_at": beijing_iso(entry.media_expires_at)
             if entry.media_expires_at
             else None,
