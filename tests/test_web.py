@@ -297,9 +297,43 @@ def test_web_can_retry_media_restore_job(tmp_path: Path, status: JobStatus) -> N
 
     with TestClient(app) as client:
         response = client.post(f"/api/jobs/{restore.id}/retry")
+        repeated = client.post(f"/api/jobs/{restore.id}/retry")
 
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
+    assert repeated.status_code == 202
+    assert repeated.json()["id"] == restore.id
+
+
+def test_web_retry_reuses_replacement_media_restore_job(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    entry = service.database.get_entry("dy-123").model_copy(
+        update={"media_status": "removed"}
+    )
+    service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
+    failed = service.set_entry_favorite(entry.id, True)["restore_job"]
+    service.database.update_job(
+        failed.id,
+        status=JobStatus.FAILED,
+        error_code="download_failed",
+        error_message="需要重试",
+        unlock=True,
+    )
+    replacement = service.set_entry_favorite(entry.id, True)["restore_job"]
+    assert replacement.id != failed.id
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/jobs/{failed.id}/retry")
+
+    assert response.status_code == 202
+    assert response.json()["id"] == replacement.id
+    active = [
+        job
+        for job in service.list_jobs()
+        if job.kind == "media_restore" and job.status == JobStatus.QUEUED
+    ]
+    assert [job.id for job in active] == [replacement.id]
 
 
 def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:

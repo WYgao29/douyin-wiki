@@ -834,6 +834,52 @@ class Database:
             unlock=True,
         )
 
+    def requeue_job_deduplicated(
+        self, job_id: str, *, match_artifact: str
+    ) -> JobRecord:
+        """Atomically retry a job unless an equivalent active job already exists."""
+        terminal_statuses = {
+            JobStatus.COMPLETED,
+            JobStatus.COMPLETED_WITH_WARNINGS,
+            JobStatus.FAILED,
+        }
+        retryable_statuses = {JobStatus.FAILED, JobStatus.NEEDS_AUTH}
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if current_row is None:
+                raise JobStateError(f"job not found: {job_id}")
+            current = self._job_from_row(current_row)
+            if current.status not in retryable_statuses:
+                if current.status not in terminal_statuses:
+                    return current
+                raise JobStateError(f"任务 {job_id} 当前状态不允许重新排队")
+            expected = current.artifacts.get(match_artifact)
+            rows = conn.execute(
+                """SELECT * FROM jobs
+                   WHERE id<>? AND kind=? AND status NOT IN (?, ?, ?)
+                   ORDER BY created_at DESC""",
+                (
+                    job_id,
+                    current.kind,
+                    JobStatus.COMPLETED.value,
+                    JobStatus.COMPLETED_WITH_WARNINGS.value,
+                    JobStatus.FAILED.value,
+                ),
+            ).fetchall()
+            for row in rows:
+                if json.loads(row["artifacts_json"]).get(match_artifact) == expected:
+                    return self._job_from_row(row)
+            conn.execute(
+                """UPDATE jobs
+                   SET status=?, error_code='', error_message='', locked_at=NULL,
+                       lock_owner=NULL, lease_expires_at=NULL, updated_at=?
+                   WHERE id=?""",
+                (JobStatus.QUEUED.value, iso_now(), job_id),
+            )
+            updated = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return self._job_from_row(updated)
+
     def list_job_events(
         self,
         *,

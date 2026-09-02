@@ -685,6 +685,10 @@ class DouyinWikiService:
     def retry_job(self, job_id: str) -> JobRecord:
         """Retry a failed job from its last persisted stage checkpoint."""
         job = self.database.get_job(job_id)
+        if job.kind == "media_restore":
+            return self.database.requeue_job_deduplicated(
+                job_id, match_artifact="entry_id"
+            )
         if job.status not in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}:
             raise JobStateError("只有“失败”或“需要登录授权”的任务可以重试")
         return self.database.requeue_job(job_id)
