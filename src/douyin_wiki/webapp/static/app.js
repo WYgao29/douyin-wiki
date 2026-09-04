@@ -31,6 +31,7 @@ const state = {
   inspirationOnly: false,
   query: "",
   currentEntry: document.body.dataset.entryId || "",
+  currentArticleItem: null,
   currentTopic: document.body.dataset.topicId || "",
   topics: [],
   trashItems: [],
@@ -466,11 +467,15 @@ function syncFavoriteItem(updated) {
   const update = (item) => item.entry_id === updated.entry_id ? {...item, ...updated} : item;
   state.items = state.items.map(update);
   state.allItems = state.allItems.map(update);
+  if (state.currentArticleItem?.entry_id === updated.entry_id) {
+    state.currentArticleItem = {...state.currentArticleItem, ...updated};
+  }
 }
 
 function findLibraryItem(entryId) {
   return state.items.find((item) => item.entry_id === entryId)
     || state.allItems.find((item) => item.entry_id === entryId)
+    || (state.currentArticleItem?.entry_id === entryId ? state.currentArticleItem : null)
     || null;
 }
 
@@ -728,13 +733,17 @@ function renderLibrary() {
 
 function updateTopicSelectionButton() {
   const button = $("#topic-select-toggle");
-  const hasManagedItems = [...state.items, ...state.allItems].some(isDatabaseManaged);
+  const hasManagedItems = [...state.items, ...state.allItems, state.currentArticleItem]
+    .some(isDatabaseManaged);
   if (!hasManagedItems) {
     state.topicSelectionMode = false;
     state.selectedEntryIds.clear();
   }
   button.disabled = !hasManagedItems;
   button.classList.toggle("hidden", !hasManagedItems);
+  const topicsCreateButton = $("#topics-create-button");
+  topicsCreateButton.disabled = !hasManagedItems;
+  topicsCreateButton.classList.toggle("hidden", !hasManagedItems);
   button.setAttribute("aria-pressed", String(state.topicSelectionMode));
   const label = $("span", button);
   label.textContent = state.topicSelectionMode
@@ -798,6 +807,7 @@ function clearSearchAndFilters() {
 
 function showLibrary(push = true) {
   state.currentEntry = "";
+  state.currentArticleItem = null;
   state.currentTopic = "";
   $("#article-view").classList.add("hidden");
   $("#topics-view").classList.add("hidden");
@@ -854,6 +864,7 @@ function renderTopicsList() {
 
 async function showTopics(push = true) {
   state.currentEntry = "";
+  state.currentArticleItem = null;
   state.currentTopic = "";
   state.topicSelectionMode = false;
   $("#library-view").classList.add("hidden");
@@ -866,6 +877,7 @@ async function showTopics(push = true) {
   $("#trash-nav").classList.remove("active");
   if (push) history.pushState({}, "", "/topics");
   document.title = "专题 · 抖库";
+  updateTopicSelectionButton();
   await loadTopics();
   updateChatContext();
   closeDrawers();
@@ -953,6 +965,7 @@ function renderTrash() {
 
 async function showTrash(push = true) {
   state.currentEntry = "";
+  state.currentArticleItem = null;
   state.currentTopic = "";
   state.topicSelectionMode = false;
   $("#library-view").classList.add("hidden");
@@ -964,6 +977,7 @@ async function showTrash(push = true) {
   $("#trash-nav").classList.add("active");
   if (push) history.pushState({}, "", "/trash");
   document.title = "废纸篓 · 抖库";
+  updateTopicSelectionButton();
   await loadTrash();
   updateChatContext();
   closeDrawers();
@@ -1213,6 +1227,7 @@ function prefersReducedMotion() {
 function renderArticleData(data, entryId, push) {
   const root = $("#article-content");
   state.currentEntry = entryId;
+  state.currentArticleItem = data.item;
   state.currentTopic = "";
   const body = document.createElement("div");
   body.className = "article-body";
@@ -1269,6 +1284,7 @@ function showArticleFallbackEntry() {
 function renderArticleError(error) {
   const root = $("#article-content");
   state.currentEntry = "";
+  state.currentArticleItem = null;
   $("#library-view").classList.add("hidden");
   $("#article-view").classList.remove("hidden");
   const empty = document.createElement("section");
@@ -1995,6 +2011,9 @@ function bindEvents() {
     }
   });
   $("#topics-create-button").addEventListener("click", () => {
+    const hasManagedItems = [...state.items, ...state.allItems, state.currentArticleItem]
+      .some(isDatabaseManaged);
+    if (!hasManagedItems) return;
     state.topicSelectionMode = true;
     state.selectedEntryIds.clear();
     showLibrary();

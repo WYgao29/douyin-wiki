@@ -497,6 +497,11 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "const articleChatEnabled = isDatabaseManaged(articleItem);" in script.text
         assert "只读 Markdown，发送时使用全库对话" in script.text
         assert "只读 Markdown 文章不能保存灵感" in script.text
+        assert "currentArticleItem: null" in script.text
+        assert "state.currentArticleItem = data.item;" in script.text
+        assert "state.currentArticleItem?.entry_id === entryId" in script.text
+        assert 'const topicsCreateButton = $("#topics-create-button");' in script.text
+        assert "topicsCreateButton.classList.toggle(\"hidden\", !hasManagedItems);" in script.text
 
 
 @pytest.mark.parametrize(
