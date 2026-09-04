@@ -248,6 +248,7 @@ class LibraryCatalog:
         )
         return LibraryItem(
             entry_id=entry_id,
+            database_managed=entry is not None,
             work_id=work_id,
             title=title,
             author=author,

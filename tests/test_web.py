@@ -224,6 +224,66 @@ def test_library_article_rendering_and_media_security(tmp_path: Path) -> None:
         assert rejected.status_code == 400
 
 
+def test_unmanaged_markdown_is_readable_but_not_database_managed(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    asset_dir = config.vault_path / "raw" / "assets" / "456"
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "example.webp").write_bytes(b"RIFFfakeWEBP")
+    source = config.vault_path / "wiki" / "sources" / "只读文章_456.md"
+    source.write_text(
+        """---
+type: source
+video_id: '456'
+author: 只读作者
+source_kind: image_note
+content_type: explanation
+---
+# 只读文章
+
+## 一句话
+
+这是一篇没有数据库记录的 Markdown 文章。
+
+![示例图](../../raw/assets/456/example.webp)
+""",
+        encoding="utf-8",
+    )
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        library = client.get("/api/library")
+        assert library.status_code == 200
+        item = next(
+            item for item in library.json()["items"] if item["entry_id"] == "dy-456"
+        )
+        assert item["database_managed"] is False
+
+        article = client.get("/api/articles/dy-456")
+        assert article.status_code == 200
+        assert article.json()["item"]["database_managed"] is False
+        assert "只读文章" in article.json()["html"]
+        assert client.get("/media/raw/assets/456/example.webp").status_code == 200
+
+        rejected = client.post(
+            "/api/chat/sessions",
+            json={"scope": "entry", "context_entry_id": "dy-456"},
+        )
+        assert rejected.status_code == 409
+        assert "只读" in rejected.json()["detail"]
+        assert service.database.list_chat_sessions() == []
+
+        managed = next(
+            item for item in library.json()["items"] if item["entry_id"] == "dy-123"
+        )
+        assert managed["database_managed"] is True
+        created = client.post(
+            "/api/chat/sessions",
+            json={"scope": "entry", "context_entry_id": "dy-123"},
+        )
+        assert created.status_code == 201
+        assert created.json()["scope"] == "entry"
+
+
 def test_web_can_favorite_and_unfavorite_an_article(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
@@ -429,6 +489,14 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "删除文章" in script.text
         assert "彻底删除" in script.text
         assert "最近一次用量：${latestAssistant.total_tokens} token" in script.text
+        assert "function isDatabaseManaged(item)" in script.text
+        assert "if (!isDatabaseManaged(item)) return null;" in script.text
+        assert "if (state.topicSelectionMode && isDatabaseManaged(item))" in script.text
+        assert "if (!isDatabaseManaged(findLibraryItem(entryId))) return;" in script.text
+        assert ".filter(isDatabaseManaged)" in script.text
+        assert "const articleChatEnabled = isDatabaseManaged(articleItem);" in script.text
+        assert "只读 Markdown，发送时使用全库对话" in script.text
+        assert "只读 Markdown 文章不能保存灵感" in script.text
 
 
 @pytest.mark.parametrize(

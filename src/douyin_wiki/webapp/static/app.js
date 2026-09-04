@@ -468,6 +468,20 @@ function syncFavoriteItem(updated) {
   state.allItems = state.allItems.map(update);
 }
 
+function findLibraryItem(entryId) {
+  return state.items.find((item) => item.entry_id === entryId)
+    || state.allItems.find((item) => item.entry_id === entryId)
+    || null;
+}
+
+function isDatabaseManaged(item) {
+  return Boolean(item?.database_managed);
+}
+
+function currentEntryItem() {
+  return state.currentEntry ? findLibraryItem(state.currentEntry) : null;
+}
+
 function updateFavoriteButton(button, favorite) {
   button.classList.toggle("active", favorite);
   button.setAttribute("aria-pressed", String(favorite));
@@ -497,6 +511,7 @@ async function pollRestoreJob(jobId) {
 }
 
 function makeFavoriteButton(item, className = "") {
+  if (!isDatabaseManaged(item)) return null;
   const button = document.createElement("button");
   button.type = "button";
   button.className = `favorite-button ${className}`.trim();
@@ -569,7 +584,7 @@ function makeListItem(item) {
   link.addEventListener("click", (event) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
-    if (state.topicSelectionMode) {
+    if (state.topicSelectionMode && isDatabaseManaged(item)) {
       toggleTopicEntry(item.entry_id);
       return;
     }
@@ -593,9 +608,11 @@ function makeListItem(item) {
   });
   link.append(makeCover(item, "item-thumbnail"), copy, tags);
   article.append(link);
-  article.append(makeFavoriteButton(item, "card-favorite-button"));
-  article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
-  if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
+  if (isDatabaseManaged(item)) {
+    article.append(makeFavoriteButton(item, "card-favorite-button"));
+    article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
+    if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
+  }
   return article;
 }
 
@@ -608,6 +625,7 @@ function makeSelectionIndicator(entryId) {
 }
 
 function toggleTopicEntry(entryId) {
+  if (!isDatabaseManaged(findLibraryItem(entryId))) return;
   if (state.selectedEntryIds.has(entryId)) state.selectedEntryIds.delete(entryId);
   else state.selectedEntryIds.add(entryId);
   renderLibrary();
@@ -644,7 +662,7 @@ function makeGalleryCard(item, index, animateNew) {
   const openFromAlbumWall = (event) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
-    if (state.topicSelectionMode) {
+    if (state.topicSelectionMode && isDatabaseManaged(item)) {
       toggleTopicEntry(item.entry_id);
       return;
     }
@@ -656,9 +674,11 @@ function makeGalleryCard(item, index, animateNew) {
   });
   link.append(cover, copy);
   article.append(link);
-  article.append(makeFavoriteButton(item, "card-favorite-button"));
-  article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
-  if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
+  if (isDatabaseManaged(item)) {
+    article.append(makeFavoriteButton(item, "card-favorite-button"));
+    article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
+    if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
+  }
   return article;
 }
 
@@ -708,6 +728,13 @@ function renderLibrary() {
 
 function updateTopicSelectionButton() {
   const button = $("#topic-select-toggle");
+  const hasManagedItems = [...state.items, ...state.allItems].some(isDatabaseManaged);
+  if (!hasManagedItems) {
+    state.topicSelectionMode = false;
+    state.selectedEntryIds.clear();
+  }
+  button.disabled = !hasManagedItems;
+  button.classList.toggle("hidden", !hasManagedItems);
   button.setAttribute("aria-pressed", String(state.topicSelectionMode));
   const label = $("span", button);
   label.textContent = state.topicSelectionMode
@@ -733,6 +760,7 @@ function openTopicDialog() {
 async function createTopicFromSelection() {
   if (!$("#topic-form").reportValidity()) return;
   const orderedIds = filteredItems()
+    .filter(isDatabaseManaged)
     .map((item) => item.entry_id)
     .filter((entryId) => state.selectedEntryIds.has(entryId));
   const payload = {
@@ -1133,12 +1161,14 @@ function makeArticleHeader(item) {
   }
   const actions = document.createElement("div");
   actions.className = "article-actions";
-  const favorite = makeFavoriteButton(item, "article-favorite-button");
-  const favoriteLabel = document.createElement("span");
-  favoriteLabel.dataset.favoriteLabel = "";
-  favoriteLabel.textContent = item.favorite ? "取消收藏" : "收藏";
-  favorite.append(favoriteLabel);
-  actions.append(favorite);
+  if (isDatabaseManaged(item)) {
+    const favorite = makeFavoriteButton(item, "article-favorite-button");
+    const favoriteLabel = document.createElement("span");
+    favoriteLabel.dataset.favoriteLabel = "";
+    favoriteLabel.textContent = item.favorite ? "取消收藏" : "收藏";
+    favorite.append(favoriteLabel);
+    actions.append(favorite);
+  }
   if (item.original_url) {
     const source = document.createElement("a");
     source.className = "article-source-link";
@@ -1148,28 +1178,30 @@ function makeArticleHeader(item) {
     source.append(document.createTextNode("打开原作品"), svgIcon("external-link"));
     actions.append(source);
   }
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "danger-text-button article-delete-button";
-  remove.append(svgIcon("trash-2"), document.createTextNode("删除文章"));
-  remove.addEventListener("click", () => openDestructiveDialog({
-    title: "删除整条资料？",
-    description: `《${item.title}》的文章、原始记录、机器数据、视频、图片和封面将移入抖库废纸篓，并从检索与专题中移除。`,
-    confirmLabel: "移到废纸篓",
-    action: async () => {
-      return api(`/api/articles/${encodeURIComponent(item.entry_id)}`, {
-        method: "DELETE", body: JSON.stringify({confirmed: true}),
-      });
-    },
-    successMessage: "资料已移到废纸篓",
-    onSuccess: async () => {
-      state.currentEntry = "";
-      await Promise.all([loadLibrary({showLoading: false}), loadTopics(), loadTrash()]);
-      showLibrary();
-    },
-  }));
-  actions.append(remove);
-  copy.append(actions);
+  if (isDatabaseManaged(item)) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger-text-button article-delete-button";
+    remove.append(svgIcon("trash-2"), document.createTextNode("删除文章"));
+    remove.addEventListener("click", () => openDestructiveDialog({
+      title: "删除整条资料？",
+      description: `《${item.title}》的文章、原始记录、机器数据、视频、图片和封面将移入抖库废纸篓，并从检索与专题中移除。`,
+      confirmLabel: "移到废纸篓",
+      action: async () => {
+        return api(`/api/articles/${encodeURIComponent(item.entry_id)}`, {
+          method: "DELETE", body: JSON.stringify({confirmed: true}),
+        });
+      },
+      successMessage: "资料已移到废纸篓",
+      onSuccess: async () => {
+        state.currentEntry = "";
+        await Promise.all([loadLibrary({showLoading: false}), loadTopics(), loadTrash()]);
+        showLibrary();
+      },
+    }));
+    actions.append(remove);
+  }
+  if (actions.childElementCount) copy.append(actions);
   hero.append(copy);
   return hero;
 }
@@ -1475,9 +1507,10 @@ async function loadSessions(preferNew = false) {
 }
 
 async function createSession() {
+  const item = currentEntryItem();
   const payload = state.currentTopic
     ? {scope: "topic", context_topic_id: state.currentTopic}
-    : state.currentEntry
+    : isDatabaseManaged(item)
       ? {scope: "entry", context_entry_id: state.currentEntry}
       : {scope: "library"};
   const session = await api("/api/chat/sessions", {method: "POST", body: JSON.stringify(payload)});
@@ -1512,14 +1545,15 @@ function setChatContext(iconName, text) {
 }
 
 function updateChatContext() {
-  const item = state.items.find((value) => value.entry_id === state.currentEntry)
-    || state.allItems.find((value) => value.entry_id === state.currentEntry);
+  const item = currentEntryItem();
   const session = state.sessions.find((value) => value.id === state.currentSession);
   const topicValue = state.topics.find((value) => value.topic.id === state.currentTopic);
   if (topicValue && session?.scope === "topic" && session.context_topic_id === state.currentTopic) {
     setChatContext("bookmark", `当前专题：${topicValue.topic.title}`);
   } else if (topicValue) {
     setChatContext("bookmark", `当前专题：${topicValue.topic.title} · 发送时会新建专题对话`);
+  } else if (item && !isDatabaseManaged(item)) {
+    setChatContext("file-text", `当前文章：${item.title} · 只读 Markdown，发送时使用全库对话`);
   } else if (item && session?.scope === "entry" && session.context_entry_id === item.entry_id) {
     setChatContext("file-text", `当前文章：${item.title}`);
   } else if (item) {
@@ -1634,12 +1668,15 @@ function makeMessage(role, content, html = "", citations = []) {
   if (role !== "system") {
     const actions = document.createElement("div");
     actions.className = "message-actions";
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "save-inspiration";
-    save.append(svgIcon("sparkles"), document.createTextNode("保存为灵感"));
-    save.addEventListener("click", () => openInspiration(content, save));
-    actions.append(save);
+    const currentItem = currentEntryItem();
+    if (!state.currentEntry || isDatabaseManaged(currentItem)) {
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "save-inspiration";
+      save.append(svgIcon("sparkles"), document.createTextNode("保存为灵感"));
+      save.addEventListener("click", () => openInspiration(content, save));
+      actions.append(save);
+    }
     if (state.currentTopic) {
       const note = document.createElement("button");
       note.type = "button";
@@ -1703,9 +1740,12 @@ function setSending(sending) {
 async function sendChat(text) {
   if (state.sending) return;
   const current = state.sessions.find((item) => item.id === state.currentSession);
-  const needsArticle = state.currentEntry && (current?.scope !== "entry" || current?.context_entry_id !== state.currentEntry);
+  const articleItem = currentEntryItem();
+  const articleChatEnabled = isDatabaseManaged(articleItem);
+  const needsArticle = articleChatEnabled
+    && (current?.scope !== "entry" || current?.context_entry_id !== state.currentEntry);
   const needsTopic = state.currentTopic && (current?.scope !== "topic" || current?.context_topic_id !== state.currentTopic);
-  const needsLibrary = !state.currentEntry && !state.currentTopic && current?.scope !== "library";
+  const needsLibrary = !state.currentTopic && !articleChatEnabled && current?.scope !== "library";
   try {
     if (!state.currentSession || needsArticle || needsTopic || needsLibrary) await createSession();
   } catch (error) {
@@ -1787,7 +1827,7 @@ function resizeChatInput() {
 }
 
 function fillInspirationTargets() {
-  const items = state.allItems.length ? state.allItems : state.items;
+  const items = (state.allItems.length ? state.allItems : state.items).filter(isDatabaseManaged);
   $("#inspiration-entry").replaceChildren(...items.map((item) => {
     const option = document.createElement("option");
     option.value = item.entry_id;
@@ -1797,7 +1837,11 @@ function fillInspirationTargets() {
 }
 
 function openInspiration(text, trigger) {
-  const items = state.allItems.length ? state.allItems : state.items;
+  if (state.currentEntry && !isDatabaseManaged(currentEntryItem())) {
+    toast("只读 Markdown 文章不能保存灵感");
+    return;
+  }
+  const items = (state.allItems.length ? state.allItems : state.items).filter(isDatabaseManaged);
   if (!items.length) {
     toast("资料库中还没有可保存的文章");
     return;

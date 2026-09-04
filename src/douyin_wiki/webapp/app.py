@@ -659,10 +659,17 @@ def create_app(
 
     @app.post("/api/chat/sessions", status_code=201)
     async def create_session(payload: CreateSessionRequest):
-        if payload.scope == "entry" and (
-            not payload.context_entry_id or catalog.get(payload.context_entry_id) is None
-        ):
-            raise HTTPException(status_code=400, detail="文章范围对话需要有效的目标文章")
+        if payload.scope == "entry":
+            if not payload.context_entry_id:
+                raise HTTPException(status_code=400, detail="文章范围对话需要有效的目标文章")
+            item = catalog.get(payload.context_entry_id)
+            if item is None:
+                raise HTTPException(status_code=400, detail="文章范围对话需要有效的目标文章")
+            if not item.database_managed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="该文章来自只读 Markdown，无法创建文章范围对话，请使用全库对话",
+                )
         if payload.scope == "topic":
             if not payload.context_topic_id:
                 raise HTTPException(status_code=400, detail="专题范围对话需要有效的目标专题")
