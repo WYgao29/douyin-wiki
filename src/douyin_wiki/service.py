@@ -2378,7 +2378,26 @@ class DouyinWikiService:
     @asynccontextmanager
     async def _work_capture_locked(self, work_id: str):
         lock = self.vault.work_capture_locked(work_id)
-        await asyncio.to_thread(lock.__enter__)
+        acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
+        try:
+            await asyncio.shield(acquisition)
+        except asyncio.CancelledError:
+            # Cancellation cannot stop the executor thread.  Wait for a
+            # blocked flock to finish, then release it before propagating the
+            # cancellation so a later capture cannot inherit a leaked lock.
+            while not acquisition.done():
+                try:
+                    await asyncio.shield(acquisition)
+                except asyncio.CancelledError:
+                    continue
+            if not acquisition.cancelled():
+                try:
+                    acquisition.result()
+                except BaseException:
+                    pass
+                else:
+                    await asyncio.to_thread(lock.__exit__, None, None, None)
+            raise
         try:
             yield
         except BaseException as exc:

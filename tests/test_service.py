@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import shutil
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -115,6 +116,28 @@ class CountingAnalysisProvider(FakeAnalysisProvider):
     async def analyze(self, segments, ocr, inspirations, metadata):
         self.calls += 1
         return await super().analyze(segments, ocr, inspirations, metadata)
+
+
+class GatedLockContext:
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.started = threading.Event()
+        self.acquired = threading.Event()
+        self.allow_return = threading.Event()
+        self.returned = threading.Event()
+        self.released = threading.Event()
+
+    def __enter__(self):
+        self.started.set()
+        result = self.inner.__enter__()
+        self.acquired.set()
+        self.allow_return.wait(timeout=5)
+        self.returned.set()
+        return result
+
+    def __exit__(self, *args):
+        self.released.set()
+        return self.inner.__exit__(*args)
 
 
 @pytest.mark.asyncio
@@ -327,6 +350,56 @@ async def test_concurrent_first_capture_serializes_video_pipeline_and_merges_ins
     entry = service.database.get_entry(first.result["entry_id"])
     assert {item.text for item in entry.inspirations} == {"一", "二"}
     assert any(job.result.get("duplicate") for job in (first, second))
+
+
+@pytest.mark.asyncio
+async def test_canceled_work_lock_waiter_does_not_leak_lock(service) -> None:
+    work_id = "7672717300746907078"
+    factory = service.vault.work_capture_locked
+    holder = factory(work_id)
+    await asyncio.to_thread(holder.__enter__)
+    try:
+        gated = GatedLockContext(factory(work_id))
+        used = False
+
+        def gated_factory(candidate_work_id: str):
+            nonlocal used
+            if not used:
+                used = True
+                return gated
+            return factory(candidate_work_id)
+
+        service.vault.work_capture_locked = gated_factory
+        waiter_context = service._work_capture_locked(work_id)
+        waiter = asyncio.create_task(waiter_context.__aenter__())
+        assert await asyncio.to_thread(gated.started.wait, 1)
+        ticks = 0
+        for _ in range(20):
+            await asyncio.sleep(0)
+            ticks += 1
+        assert ticks == 20
+        assert not waiter.done()
+
+        waiter.cancel()
+        await asyncio.to_thread(holder.__exit__, None, None, None)
+        assert await asyncio.to_thread(gated.acquired.wait, 1)
+        gated.allow_return.set()
+        assert await asyncio.to_thread(gated.returned.wait, 1)
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        third_context = service._work_capture_locked(work_id)
+        third = asyncio.create_task(third_context.__aenter__())
+        done, _ = await asyncio.wait({third}, timeout=1)
+        third_acquired = third in done
+        if not third_acquired and not gated.released.is_set():
+            await asyncio.to_thread(gated.inner.__exit__, None, None, None)
+            await third
+        assert third_acquired
+        await third_context.__aexit__(None, None, None)
+    finally:
+        if not waiter.done():
+            waiter.cancel()
 
 
 @pytest.mark.asyncio
