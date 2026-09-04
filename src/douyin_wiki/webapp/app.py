@@ -12,10 +12,11 @@ from typing import Any, Literal
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from watchfiles import awatch
 
@@ -91,6 +92,8 @@ class SetFavoriteRequest(BaseModel):
 
 
 class ModelSettingsRequest(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     base_url: str = Field(min_length=8, max_length=2048)
     model: str = Field(min_length=1, max_length=256)
     api_key: str | None = Field(default=None, max_length=8192)
@@ -277,6 +280,17 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        details = [
+            {key: value for key, value in error.items() if key not in {"input", "ctx"}}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": details})
+
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "testserver"],

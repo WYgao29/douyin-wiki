@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .models import AnalysisMode
 
@@ -24,7 +24,7 @@ def normalize_llm_base_url(value: str) -> str:
     parsed = urlsplit(candidate)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("模型接口必须是有效的 HTTP(S) URL")
-    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+    if parsed.username is not None or parsed.password is not None or "#" in candidate:
         raise ValueError("模型接口不能包含凭据或 URL 片段")
     loopback = parsed.hostname.lower() == "localhost"
     if not loopback:
@@ -38,6 +38,8 @@ def normalize_llm_base_url(value: str) -> str:
 
 
 class LLMSettings(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     enabled: bool = True
     base_url: str = "https://api.openai.com/v1"
     model: str = ""
@@ -99,6 +101,8 @@ class WebSettings(BaseModel):
 
 
 class AppConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     vault_path: Path = Path.home() / "Documents" / "Obsidian" / "抖库"
     timezone: str = "Asia/Shanghai"
     analysis_mode: AnalysisMode = AnalysisMode.GATEWAY

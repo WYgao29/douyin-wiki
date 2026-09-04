@@ -1000,6 +1000,34 @@ def test_model_settings_rejects_remote_http_before_secret_and_saves_loopback(
     assert secrets == {}
 
 
+def test_model_settings_validation_does_not_echo_credential_url(
+    tmp_path: Path,
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(
+        config,
+        service=service,
+        chat_provider=FakeChatProvider(),
+        start_watcher=False,
+    )
+    credential_url = "https://user:secret@models.example/v1"
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": credential_url,
+                "model": "remote-model",
+                "api_key": "body-secret",
+            },
+        )
+
+    assert rejected.status_code == 422
+    assert credential_url not in rejected.text
+    assert "user:secret" not in rejected.text
+    assert "body-secret" not in rejected.text
+
+
 def test_loopback_model_endpoint_does_not_require_api_key(tmp_path: Path, monkeypatch) -> None:
     config, service = _web_fixture(tmp_path)
     local_config = config.model_copy(
