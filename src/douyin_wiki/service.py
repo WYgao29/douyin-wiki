@@ -2294,45 +2294,54 @@ class DouyinWikiService:
             normalized.get("contradictions", []), entry.id
         )
         validated = AnalysisResult.model_validate(normalized)
-        data = dict(current_data)
-        data["analysis"] = validated.model_dump(mode="json")
-        data["provider"] = (
-            f"agent:{artifacts.get('analysis_producer', 'gateway')}"
-            if self.config.analysis_mode == AnalysisMode.GATEWAY
-            else self.analysis.name
-        )
-        data["model"] = (
-            artifacts.get("analysis_model", "agent")
-            if self.config.analysis_mode == AnalysisMode.GATEWAY
-            else self.analysis.model
-        )
-        data["prompt_version"] = (
-            f"external:{PROMPT_VERSION}"
-            if self.config.analysis_mode == AnalysisMode.GATEWAY
-            else PROMPT_VERSION
-        )
-        updated = entry.model_copy(
-            update={
-                "title": safe_filename(validated.title),
-                "summary": validated.one_liner,
-                "tags": validated.tags,
-                "updated_at": utc_now(),
-            }
-        )
-        chunks, relations, reminders = self._prepare_entry_bundle(updated, data)
-        self._persist_entry_documents_and_bundle(
-            updated,
-            data,
-            chunks,
-            relations,
-            reminders,
-            action="reanalyze-v2",
-            log_summary=f"复用现有逐字稿与 OCR，由 {data['provider']} 生成 v2 分析",
-            commit_message=f"reanalyze-v2: {updated.video_id} {updated.title}",
-            require_existing=True,
-        )
-        source_kind = current_data.get("metadata", {}).get("source_kind", SourceKind.VIDEO.value)
-        creator_folder = str(current_data.get("creator", {}).get("folder_path") or "")
+        with self.vault.entry_operations_locked():
+            # The model call intentionally happens before this lock. Reload both
+            # projections so concurrent user mutations are merged into the
+            # final analysis write instead of being overwritten by the snapshot
+            # captured before analysis started.
+            latest_entry = self.database.get_entry(entry_id)
+            latest_data = self.database.get_entry_data(entry_id)
+            latest_data["analysis"] = validated.model_dump(mode="json")
+            latest_data["provider"] = (
+                f"agent:{artifacts.get('analysis_producer', 'gateway')}"
+                if self.config.analysis_mode == AnalysisMode.GATEWAY
+                else self.analysis.name
+            )
+            latest_data["model"] = (
+                artifacts.get("analysis_model", "agent")
+                if self.config.analysis_mode == AnalysisMode.GATEWAY
+                else self.analysis.model
+            )
+            latest_data["prompt_version"] = (
+                f"external:{PROMPT_VERSION}"
+                if self.config.analysis_mode == AnalysisMode.GATEWAY
+                else PROMPT_VERSION
+            )
+            updated = latest_entry.model_copy(
+                update={
+                    "title": safe_filename(validated.title),
+                    "summary": validated.one_liner,
+                    "tags": validated.tags,
+                    "updated_at": utc_now(),
+                }
+            )
+            chunks, relations, reminders = self._prepare_entry_bundle(updated, latest_data)
+            self._persist_entry_documents_and_bundle_locked(
+                updated,
+                latest_data,
+                chunks,
+                relations,
+                reminders,
+                action="reanalyze-v2",
+                log_summary=(
+                    f"复用现有逐字稿与 OCR，由 {latest_data['provider']} 生成 v2 分析"
+                ),
+                commit_message=f"reanalyze-v2: {updated.video_id} {updated.title}",
+            )
+            source_kind = latest_data.get("metadata", {}).get(
+                "source_kind", SourceKind.VIDEO.value
+            )
+            creator_folder = str(latest_data.get("creator", {}).get("folder_path") or "")
         return self.database.update_job(
             job.id,
             status=JobStatus.COMPLETED,
@@ -3299,18 +3308,42 @@ class DouyinWikiService:
     ) -> EntryRecord:
         """Commit one entry mutation under the cross-process operation lock."""
         with self.vault.entry_operations_locked():
-            if require_existing:
-                self.database.get_entry(entry.id)
-            self._write_entry_documents(
+            return self._persist_entry_documents_and_bundle_locked(
                 entry,
                 data,
+                chunks,
+                relations,
+                reminders,
                 action=action,
                 log_summary=log_summary,
                 commit_message=commit_message,
+                require_existing=require_existing,
             )
-            return self.database.persist_entry_bundle(
-                entry, data, chunks, relations, reminders
-            )
+
+    def _persist_entry_documents_and_bundle_locked(
+        self,
+        entry: EntryRecord,
+        data: dict[str, Any],
+        chunks: list[dict[str, Any]],
+        relations: list[dict[str, Any]],
+        reminders: list[ReminderCandidate],
+        *,
+        action: str,
+        log_summary: str,
+        commit_message: str,
+        require_existing: bool = False,
+    ) -> EntryRecord:
+        """Persist an entry while the caller already owns the operation lock."""
+        if require_existing:
+            self.database.get_entry(entry.id)
+        self._write_entry_documents(
+            entry,
+            data,
+            action=action,
+            log_summary=log_summary,
+            commit_message=commit_message,
+        )
+        return self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
 
     def _persist_creator_avatar(self, inventory: CreatorInventoryResult, folder_path: str):
         source_value = inventory.profile.avatar_path
