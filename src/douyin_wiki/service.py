@@ -8,7 +8,7 @@ import re
 import shutil
 import uuid
 import warnings
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from importlib.resources import files
 from pathlib import Path
@@ -2355,8 +2355,6 @@ class DouyinWikiService:
     async def _process_capture(self, job: JobRecord) -> JobRecord:
         request = job.request
         artifacts = dict(job.artifacts)
-        work_dir = self.config.work_dir / job.id
-        work_dir.mkdir(parents=True, exist_ok=True)
 
         if "resolved" not in artifacts:
             self.database.update_job(job.id, status=JobStatus.RESOLVING, progress=0.03)
@@ -2374,6 +2372,32 @@ class DouyinWikiService:
         resolved_data = artifacts["resolved"]
         video_id = resolved_data["video_id"]
 
+        async with self._work_capture_locked(video_id):
+            return await self._process_resolved_capture(job, artifacts, resolved_data)
+
+    @asynccontextmanager
+    async def _work_capture_locked(self, work_id: str):
+        lock = self.vault.work_capture_locked(work_id)
+        await asyncio.to_thread(lock.__enter__)
+        try:
+            yield
+        except BaseException as exc:
+            await asyncio.to_thread(lock.__exit__, type(exc), exc, exc.__traceback__)
+            raise
+        else:
+            await asyncio.to_thread(lock.__exit__, None, None, None)
+
+    async def _process_resolved_capture(
+        self,
+        job: JobRecord,
+        artifacts: dict[str, Any],
+        resolved_data: dict[str, Any],
+    ) -> JobRecord:
+        request = job.request
+        work_dir = self.config.work_dir / job.id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        video_id = resolved_data["video_id"]
+
         if not artifacts.get("creator_context"):
             known_creator = self.database.find_creator_for_work(video_id)
             if known_creator:
@@ -2387,27 +2411,30 @@ class DouyinWikiService:
         if resolved_data.get("source_kind", SourceKind.VIDEO.value) == SourceKind.IMAGE_NOTE.value:
             return await self._process_image_note_capture(job, artifacts, resolved_data)
 
-        existing = self.database.find_entry_by_video_id(video_id)
-        if existing:
-            for inspiration in request.inspirations:
-                existing = self.add_inspiration(existing.id, inspiration)
-            should_reacquire = (
-                existing.media_status == "removed"
-                and request.options.retention != RetentionPolicy.DISCARD
-            )
-            if not should_reacquire:
-                existing = self._repair_entry_if_needed(existing)
-                return self.database.update_job(
-                    job.id,
-                    status=JobStatus.COMPLETED,
-                    progress=1,
-                    result={
-                        "entry_id": existing.id,
-                        "duplicate": True,
-                        "source_path": existing.source_path,
-                    },
-                    unlock=True,
+        with self.vault.entry_operations_locked():
+            # Re-read after the work lock so a preceding capture can win the
+            # first-write race and its user data is never lost.
+            existing = self.database.find_entry_by_video_id(video_id)
+            if existing:
+                for inspiration in request.inspirations:
+                    existing = self._add_inspiration_locked(existing.id, inspiration)
+                should_reacquire = (
+                    existing.media_status == "removed"
+                    and request.options.retention != RetentionPolicy.DISCARD
                 )
+                if not should_reacquire:
+                    existing = self._repair_entry_if_needed_locked(existing)
+                    return self.database.update_job(
+                        job.id,
+                        status=JobStatus.COMPLETED,
+                        progress=1,
+                        result={
+                            "entry_id": existing.id,
+                            "duplicate": True,
+                            "source_path": existing.source_path,
+                        },
+                        unlock=True,
+                    )
         effective_inspirations = existing.inspirations if existing else request.inspirations
 
         creator_context = artifacts.get("creator_context") or {}
@@ -2800,25 +2827,27 @@ class DouyinWikiService:
         """Process a static image work without invoking any video-only adapter."""
         request = job.request
         work_id = str(resolved_data["video_id"])
-        existing = self.database.find_entry_by_video_id(work_id)
-        if existing:
-            for inspiration in request.inspirations:
-                existing = self.add_inspiration(existing.id, inspiration)
-            existing_data = self.database.get_entry_data(existing.id)
-            if self._image_note_files_intact(existing_data):
-                existing = self._repair_entry_if_needed(existing)
-                return self.database.update_job(
-                    job.id,
-                    status=JobStatus.COMPLETED,
-                    progress=1,
-                    result={
-                        "entry_id": existing.id,
-                        "duplicate": True,
-                        "source_kind": SourceKind.IMAGE_NOTE.value,
-                        "source_path": existing.source_path,
-                    },
-                    unlock=True,
-                )
+        with self.vault.entry_operations_locked():
+            # The work lock makes this re-read authoritative for a waiter.
+            existing = self.database.find_entry_by_video_id(work_id)
+            if existing:
+                for inspiration in request.inspirations:
+                    existing = self._add_inspiration_locked(existing.id, inspiration)
+                existing_data = self.database.get_entry_data(existing.id)
+                if self._image_note_files_intact(existing_data):
+                    existing = self._repair_entry_if_needed_locked(existing)
+                    return self.database.update_job(
+                        job.id,
+                        status=JobStatus.COMPLETED,
+                        progress=1,
+                        result={
+                            "entry_id": existing.id,
+                            "duplicate": True,
+                            "source_kind": SourceKind.IMAGE_NOTE.value,
+                            "source_path": existing.source_path,
+                        },
+                        unlock=True,
+                    )
         effective_inspirations = existing.inspirations if existing else request.inspirations
 
         creator_context = artifacts.get("creator_context") or {}

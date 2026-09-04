@@ -61,6 +61,8 @@ VAULT_AGENTS = """# 抖库维护规则
 - `log.md` 只追加，不改写历史记录。
 """
 
+_SAFE_WORK_ID = re.compile(r"[0-9]{10,}")
+
 
 @dataclass
 class WrittenEntry:
@@ -125,6 +127,28 @@ class VaultWriter:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    @contextmanager
+    def work_capture_locked(self, work_id: str) -> Iterator[None]:
+        """Serialize capture work for one stable Douyin work ID.
+
+        The ID is validated before it is used to construct a filesystem path so
+        that callers cannot escape the per-work lock directory.  ``flock`` is
+        process-safe; callers that need to keep the event loop responsive should
+        enter this context from a worker thread.
+        """
+        if not isinstance(work_id, str) or _SAFE_WORK_ID.fullmatch(work_id) is None:
+            raise ValueError("work_id must be a numeric Douyin work ID")
+        lock_path = (
+            self.vault_path / ".douyin-wiki" / "locks" / "works" / f"{work_id}.lock"
+        )
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def initialize(self, *, initialize_git: bool = True) -> list[Path]:
         directories = [
             ".obsidian",
@@ -140,6 +164,7 @@ class VaultWriter:
             "creators",
             "topics",
             ".douyin-wiki/work",
+            ".douyin-wiki/locks/works",
         ]
         for relative in directories:
             (self.vault_path / relative).mkdir(parents=True, exist_ok=True)
