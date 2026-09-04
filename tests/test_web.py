@@ -168,6 +168,32 @@ inspirations:
     return config, service
 
 
+def test_catalog_skips_bad_date_and_keeps_valid_articles(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    bad = config.vault_path / "wiki" / "sources" / "坏日期_456.md"
+    bad.write_text(
+        "---\ntype: source\nvideo_id: '456'\ncaptured_at: not-a-date\n---\n# 坏日期",
+        encoding="utf-8",
+    )
+    app = create_app(config, service=service, start_watcher=False)
+    with TestClient(app) as client:
+        response = client.get("/api/library")
+        assert response.status_code == 200
+        assert {item["entry_id"] for item in response.json()["items"]} == {"dy-123"}
+    assert app.state.catalog.load_errors[0]["path"] == "wiki/sources/坏日期_456.md"
+    bad.write_text(
+        "---\n"
+        "type: source\n"
+        "video_id: '456'\n"
+        "captured_at: '2026-08-24T09:00:00+08:00'\n"
+        "---\n# 修复日期",
+        encoding="utf-8",
+    )
+    items = app.state.catalog.refresh()
+    assert {item.entry_id for item in items} == {"dy-123", "dy-456"}
+    assert app.state.catalog.load_errors == []
+
+
 def test_library_article_rendering_and_media_security(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(
