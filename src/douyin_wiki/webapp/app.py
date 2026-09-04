@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager, suppress
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -27,6 +26,7 @@ from ..config import (
     default_config_path,
     llm_api_key_required,
     load_config,
+    normalize_llm_base_url,
 )
 from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
 from ..localization import label_entry_status
@@ -98,18 +98,7 @@ class ModelSettingsRequest(BaseModel):
     @field_validator("base_url")
     @classmethod
     def validate_base_url(cls, value: str) -> str:
-        normalized = value.strip().rstrip("/")
-        parsed = urlsplit(normalized)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-        ):
-            raise ValueError("接口地址必须是有效的 http 或 https 地址，且不能包含账号密码")
-        if any(character in normalized for character in {'"', "\\", "\r", "\n"}):
-            raise ValueError("接口地址包含不支持的字符")
-        return normalized
+        return normalize_llm_base_url(value)
 
     @field_validator("model")
     @classmethod

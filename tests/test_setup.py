@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 import douyin_wiki.cli as cli_module
 from douyin_wiki.auth_guidance import SubprocessAuthGuidanceLauncher
 from douyin_wiki.cli import app
-from douyin_wiki.config import AppConfig, load_config, render_default_config
+from douyin_wiki.config import AppConfig, LLMSettings, load_config, render_default_config
 from douyin_wiki.models import AnalysisMode
 from douyin_wiki.setup import (
     VaultSetupMode,
@@ -86,6 +86,33 @@ def test_config_round_trips_quoted_strings_and_is_written_atomically(tmp_path: P
     assert loaded.llm.model == 'provider/model"quoted'
     assert loaded.media.browser_profile == 'Profile "Work"'
     assert not list(tmp_path.glob(".config.toml.*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://models.example/v1",
+        "ftp://models.example/v1",
+        "https://user:secret@models.example/v1",
+        "https://models.example/v1#fragment",
+    ],
+)
+def test_llm_settings_reject_unsafe_endpoints(url: str) -> None:
+    with pytest.raises(ValueError):
+        LLMSettings(base_url=url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434/v1/",
+        "http://127.0.0.1:1234/v1/",
+        "http://[::1]:1234/v1/",
+        "https://models.example/v1/",
+    ],
+)
+def test_llm_settings_normalize_safe_endpoints(url: str) -> None:
+    assert not LLMSettings(base_url=url).base_url.endswith("/")
 
 
 def test_config_patch_preserves_comments_and_unknown_keys(tmp_path: Path) -> None:
@@ -169,6 +196,36 @@ def test_configure_model_allows_loopback_endpoint_without_api_key(
     configured = load_config(config_path)
     assert configured.analysis_mode == AnalysisMode.PROVIDER
     assert configured.llm.model == "local-model"
+
+
+def test_configure_model_rejects_remote_http_before_storing_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(render_default_config(AppConfig()), encoding="utf-8")
+    stored: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "douyin_wiki.cli.store_secret",
+        lambda account, value: stored.append((account, value)),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "configure-model",
+            "--model",
+            "remote-model",
+            "--base-url",
+            "http://models.example/v1",
+            "--config-path",
+            str(config_path),
+        ],
+        input="remote-secret\nremote-secret\n",
+    )
+
+    assert result.exit_code != 0
+    assert "非本机模型接口必须使用 HTTPS" in result.output
+    assert stored == []
 
 
 def test_configure_model_does_not_expose_api_key_option() -> None:

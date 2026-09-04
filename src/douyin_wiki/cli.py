@@ -9,7 +9,13 @@ from typing import Annotated
 import typer
 
 from .auth_guidance import SubprocessAuthGuidanceLauncher
-from .config import AppConfig, default_config_path, llm_api_key_required, load_config
+from .config import (
+    AppConfig,
+    default_config_path,
+    llm_api_key_required,
+    load_config,
+    normalize_llm_base_url,
+)
 from .errors import DouyinWikiError
 from .localization import (
     localize_for_user,
@@ -233,7 +239,10 @@ def configure_model(
 ) -> None:
     target = config_path or default_config_path()
     config = load_config(target)
-    resolved_base_url = base_url or config.llm.base_url
+    try:
+        resolved_base_url = normalize_llm_base_url(base_url or config.llm.base_url)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--base-url") from exc
     api_key: str | None = None
     if llm_api_key_required(resolved_base_url):
         api_key = typer.prompt(

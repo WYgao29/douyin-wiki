@@ -952,6 +952,54 @@ def test_model_settings_save_to_keychain_without_changing_gateway_mode(
         assert tested.json()["usage"]["total_tokens"] == 7
 
 
+def test_model_settings_rejects_remote_http_before_secret_and_saves_loopback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    config_path = tmp_path / "config.toml"
+    secrets: dict[str, str] = {}
+    monkeypatch.setattr(
+        "douyin_wiki.webapp.app.get_secret",
+        lambda account: secrets.get(account, ""),
+    )
+    monkeypatch.setattr(
+        "douyin_wiki.webapp.app.store_secret",
+        lambda account, value: secrets.__setitem__(account, value),
+    )
+    app = create_app(
+        config,
+        config_path=config_path,
+        service=service,
+        chat_provider_factory=lambda settings: ConfigurableFakeProvider(settings.model, True),
+        start_watcher=False,
+    )
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": "http://models.example/v1",
+                "model": "remote-model",
+                "api_key": "remote-secret",
+            },
+        )
+        assert rejected.status_code == 422
+        assert secrets == {}
+
+        saved = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": "http://127.0.0.1:1234/v1/",
+                "model": "local-model",
+                "api_key": None,
+            },
+        )
+        assert saved.status_code == 200
+
+    assert load_config(config_path).llm.base_url == "http://127.0.0.1:1234/v1"
+    assert secrets == {}
+
+
 def test_loopback_model_endpoint_does_not_require_api_key(tmp_path: Path, monkeypatch) -> None:
     config, service = _web_fixture(tmp_path)
     local_config = config.model_copy(
