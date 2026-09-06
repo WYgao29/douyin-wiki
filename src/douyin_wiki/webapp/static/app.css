@@ -458,7 +458,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--color-primary); 
 .chat-composer button:hover { background: var(--color-primary-hover); }
 .composer-hint { position: absolute; bottom: var(--space-2); left: var(--space-3); color: var(--color-text-disabled); font-size: var(--text-xs); }
 .privacy-note { margin: var(--space-2) var(--space-4) var(--space-3); color: var(--color-text-tertiary); font-size: var(--text-xs); line-height: var(--leading-sm); }
-.chat-restore-button { position: fixed; z-index: 30; right: var(--space-4); bottom: var(--space-4); display: inline-flex; min-height: 40px; align-items: center; gap: var(--space-2); border: 1px solid var(--color-border-default); border-radius: var(--radius-pill); background: var(--color-surface); color: var(--color-primary-text); padding: var(--space-2) var(--space-4); box-shadow: var(--shadow-popover); }
+.chat-restore-button { position: fixed; z-index: 30; right: var(--space-4); bottom: var(--space-4); display: inline-flex; min-height: 44px; align-items: center; gap: var(--space-2); border: 0; border-radius: var(--radius-pill); background: linear-gradient(180deg, #c96ef6, #a83ae6); box-shadow: 0 8px 24px color-mix(in srgb, #a83ae6 42%, transparent), inset 0 1px 0 rgba(255, 255, 255, .3); color: #ffffff; padding: var(--space-2) var(--space-4); font-size: var(--text-ui); font-weight: 600; transition: transform var(--duration-fast) var(--ease-standard), filter var(--duration-fast) var(--ease-standard), box-shadow var(--duration-fast) var(--ease-standard); }
+.chat-restore-button:hover { transform: translateY(-2px) scale(1.03); filter: brightness(1.06); box-shadow: 0 12px 32px color-mix(in srgb, #a83ae6 50%, transparent), inset 0 1px 0 rgba(255, 255, 255, .3); }
+.chat-restore-button:active { transform: scale(.94); }
+.chat-restore-button svg { width: 18px; height: 18px; }
+.chat-restore-button:not(.hidden) { animation: fab-enter 320ms var(--ease-spring) both; }
+@keyframes fab-enter { from { opacity: 0; transform: translateY(10px) scale(.7); } to { opacity: 1; transform: translateY(0) scale(1); } }
 
 /* Dialogs and notices */
 dialog { padding: 0; border: 1px solid var(--color-border-default); color: var(--color-text-primary); background: var(--color-surface); box-shadow: var(--shadow-dialog); }
