@@ -909,7 +909,7 @@ function renderTrash() {
     const row = document.createElement("article");
     row.className = "trash-item";
     const icon = document.createElement("span");
-    icon.className = "trash-item-icon";
+    icon.className = `trash-item-icon ${item.source_kind === "image_note" ? "is-image" : "is-video"}`;
     icon.append(svgIcon(item.source_kind === "image_note" ? "image" : "video"));
     const copy = document.createElement("div");
     copy.className = "trash-item-copy";
@@ -1304,6 +1304,19 @@ function renderArticleError(error) {
   showArticleFallbackEntry();
 }
 
+function hideCardOverlays(source) {
+  const card = source.closest(".gallery-card");
+  if (!card) return () => {};
+  const hidden = [];
+  card.querySelectorAll(".card-favorite-button, .topic-selection-indicator").forEach((node) => {
+    hidden.push(node);
+    node.style.visibility = "hidden";
+  });
+  return () => {
+    hidden.forEach((node) => { node.style.visibility = ""; });
+  };
+}
+
 async function openArticle(entryId, push = true, transitionSource = null, citation = null) {
   const root = $("#article-content");
   const sourceIsUsable = transitionSource?.isConnected && !$("#library-view").classList.contains("hidden");
@@ -1325,11 +1338,13 @@ async function openArticle(entryId, push = true, transitionSource = null, citati
       && !prefersReducedMotion();
     if (canTransition) {
       transitionSource.style.viewTransitionName = "active-album-cover";
+      const restoreOverlays = hideCardOverlays(transitionSource);
       let transitionTarget = null;
       let rendered = false;
       const cleanTransitionNames = () => {
         transitionSource.style.viewTransitionName = "";
         if (transitionTarget) transitionTarget.style.viewTransitionName = "";
+        restoreOverlays();
       };
       try {
         const transition = document.startViewTransition(() => {
