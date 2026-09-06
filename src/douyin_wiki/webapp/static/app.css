@@ -643,12 +643,13 @@ dialog[open] { animation: dialog-enter 280ms var(--ease-standard) both; }
 }
 
 @keyframes vt-fade-in { from { opacity: 0; } to { opacity: 1; } }
-::view-transition-old(root) { animation: none; mix-blend-mode: normal; }
+@keyframes vt-fade-out { from { opacity: 1; } to { opacity: 0; } }
+::view-transition-old(root) { animation: 240ms var(--ease-standard) both vt-fade-out; mix-blend-mode: normal; }
 ::view-transition-new(root) { animation: 240ms var(--ease-standard) both vt-fade-in; mix-blend-mode: normal; }
 ::view-transition-group(active-album-cover) { animation-duration: 560ms; animation-timing-function: var(--ease-standard); }
 ::view-transition-old(active-album-cover), ::view-transition-new(active-album-cover) { height: 100%; object-fit: cover; overflow: clip; }
-::view-transition-old(active-album-cover) { mix-blend-mode: normal; }
-::view-transition-new(active-album-cover) { mix-blend-mode: normal; }
+::view-transition-old(active-album-cover) { animation: 200ms var(--ease-standard) both vt-fade-out; mix-blend-mode: normal; }
+::view-transition-new(active-album-cover) { animation: 560ms var(--ease-standard) both vt-fade-in; mix-blend-mode: normal; }
 
 .gallery-card, .library-item { position: relative; }
 .topic-selection-indicator { position: absolute; z-index: 3; top: 10px; right: 10px; display: grid; width: 30px; height: 30px; place-items: center; border: 2px solid var(--color-surface); border-radius: 999px; background: color-mix(in srgb, var(--color-surface) 92%, transparent); color: var(--color-text-secondary); box-shadow: var(--shadow-popover); pointer-events: none; }
