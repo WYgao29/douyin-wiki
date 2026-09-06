@@ -1621,7 +1621,7 @@ function makeWelcome() {
   root.className = "chat-welcome";
   const mark = document.createElement("span");
   mark.className = "ai-mark";
-  mark.append(svgIcon("sparkles"));
+  mark.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><g fill="currentColor" stroke="none"><path d="M12 2c.6 4.8 3.2 7.4 8 8-4.8.6-7.4 3.2-8 8-.6-4.8-3.2-7.4-8-8 4.8-.6 7.4-3.2 8-8Z"/><path d="M18.7 3c.25 2.05 1.35 3.2 3.3 3.45-1.95.25-3.05 1.4-3.3 3.45-.25-2.05-1.35-3.2-3.3-3.45 1.95-.25 3.05-1.4 3.3-3.45Z" opacity=".45"/></g></svg>';
   const title = document.createElement("h3");
   title.textContent = "问问你的知识库";
   const copy = document.createElement("p");
