@@ -98,6 +98,9 @@ class VaultWriter:
     def __init__(self, vault_path: Path) -> None:
         self.vault_path = vault_path
         self.last_entry_load_errors: list[dict[str, str]] = []
+        self.last_creator_load_errors: list[dict[str, str]] = []
+        self.last_topic_load_errors: list[dict[str, str]] = []
+        self.last_artifact_load_errors: list[dict[str, str]] = []
 
     @contextmanager
     def locked(self) -> Iterator[None]:
@@ -890,34 +893,74 @@ class VaultWriter:
         for machine_path in sorted(machine_paths):
             try:
                 loaded = self._load_entry(machine_path)
-            except Exception as exc:  # A user-edited sidecar must not block all rebuilds.
-                self.last_entry_load_errors.append(
-                    {
-                        "path": str(machine_path.relative_to(self.vault_path)),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+            except Exception as exc:
+                self._append_load_error(self.last_entry_load_errors, machine_path, exc)
                 continue
             if loaded is not None:
                 results.append(loaded)
         return results
 
     def _load_entry(self, machine_path: Path) -> tuple[EntryRecord, dict[str, Any]]:
-        machine_frontmatter, machine_body = self._parse_document(machine_path)
+        machine_frontmatter, machine_body = self._parse_document_strict(machine_path)
         payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
         if not payload_match:
             raise ValueError("机器侧车缺少 YAML 数据块")
-        payload = yaml.safe_load(payload_match.group("payload")) or {}
+        payload = yaml.safe_load(payload_match.group("payload"))
         if not isinstance(payload, dict):
             raise ValueError("机器侧车 YAML 顶层必须是对象")
         source_page = machine_frontmatter.get("source_page")
         if not source_page:
             raise ValueError("机器侧车缺少 source_page")
-        source_path = self.vault_path / str(source_page)
+        source_page = self._safe_relative_path(source_page, field="source_page")
+        machine_relative = machine_path.relative_to(self.vault_path).parts
+        if len(machine_relative) < 3 or machine_relative[-3:-1] != (".data", "sources"):
+            raise ValueError("机器侧车路径不是受支持的 sources 目录")
+        expected_source_dir = Path(*machine_relative[:-3], "sources")
+        source_page_path = Path(source_page)
+        if source_page_path.parent != expected_source_dir:
+            raise ValueError("source_page 与机器侧车路径不一致")
+        source_path = self.vault_path / source_page
         if not source_path.is_file():
             raise FileNotFoundError(f"资料页不存在：{source_page}")
-        source_frontmatter, source_body = self._parse_document(source_path)
-        analysis = AnalysisResult.model_validate(payload.get("analysis", {}))
+        source_frontmatter, source_body = self._parse_document_strict(source_path)
+        video_id = self._safe_id(source_frontmatter.get("video_id"), field="video_id")
+        machine_video_id = self._safe_id(machine_path.stem, field="machine.filename")
+        if machine_video_id != video_id:
+            raise ValueError("机器侧车文件名与资料页 video_id 不一致")
+        frontmatter_video_id = machine_frontmatter.get("video_id")
+        if frontmatter_video_id is not None:
+            self._safe_id(frontmatter_video_id, field="machine.video_id")
+            if frontmatter_video_id != video_id:
+                raise ValueError("机器侧车 video_id 与资料页不一致")
+        raw_path = self._safe_relative_path(
+            source_frontmatter.get("source_path"), field="source_path"
+        )
+        source_kind = machine_frontmatter.get("source_kind", SourceKind.VIDEO.value)
+        if source_kind not in {item.value for item in SourceKind}:
+            raise ValueError(f"source_kind 无效：{source_kind}")
+        machine_data_path = source_frontmatter.get("machine_data_path")
+        if machine_data_path is not None:
+            machine_data_path = self._safe_relative_path(
+                machine_data_path, field="machine_data_path"
+            )
+            expected_machine_path = Path(*machine_relative).as_posix()
+            if machine_data_path != expected_machine_path:
+                raise ValueError("machine_data_path 与机器侧车路径不一致")
+            if not (
+                source_page_path.stem == video_id
+                or source_page_path.stem.endswith(f"_{video_id}")
+            ):
+                raise ValueError("source_page 文件名与 video_id 不一致")
+        source_frontmatter_kind = source_frontmatter.get("source_kind")
+        if source_frontmatter_kind is not None and source_frontmatter_kind != source_kind:
+            raise ValueError("资料页 source_kind 与机器侧车不一致")
+        raw_file = self.vault_path / raw_path
+        if not raw_file.is_file():
+            raise FileNotFoundError(f"原始记录不存在：{raw_path}")
+        analysis_payload = payload.get("analysis")
+        if not isinstance(analysis_payload, dict):
+            raise ValueError("机器侧车缺少 analysis 模型")
+        analysis = AnalysisResult.model_validate(analysis_payload)
         title_match = re.search(r"^#\s+(.+)$", source_body, re.M)
         title = title_match.group(1).strip() if title_match else analysis.title
         captured_at = parse_datetime(source_frontmatter.get("captured_at")) or utc_now()
@@ -933,13 +976,13 @@ class VaultWriter:
         if favorite:
             retention = RetentionPolicy.KEEP
         entry = EntryRecord(
-            id=f"dy-{source_frontmatter['video_id']}",
-            video_id=str(source_frontmatter["video_id"]),
+            id=f"dy-{video_id}",
+            video_id=video_id,
             title=title,
             original_url=str(source_frontmatter.get("source_url") or ""),
             canonical_url=str(source_frontmatter.get("canonical_url") or ""),
-            raw_path=str(source_frontmatter.get("source_path") or ""),
-            source_path=str(source_page),
+            raw_path=raw_path,
+            source_path=source_page,
             status=parse_entry_status(str(source_frontmatter.get("status") or "active")),
             media_status=parse_media_status(
                 str(source_frontmatter.get("media_status") or "present")
@@ -958,47 +1001,111 @@ class VaultWriter:
             updated_at=updated_at,
         )
         provenance = payload.get("model_provenance", {})
+        if not isinstance(provenance, dict):
+            raise ValueError("model_provenance 必须是对象")
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata 必须是对象")
+        for field in ("ocr", "review_issues", "relations", "reminder_states"):
+            if not isinstance(payload.get(field, []), list):
+                raise ValueError(f"{field} 必须是数组")
+        creator_payload = payload.get("creator", {})
+        if not isinstance(creator_payload, dict):
+            raise ValueError("creator 必须是对象")
+        if creator_payload:
+            self._safe_id(creator_payload.get("id"), field="creator.id")
+            self._safe_relative_path(
+                creator_payload.get("folder_path"), field="creator.folder_path"
+            )
+        cover_path = source_frontmatter.get("cover_image")
+        if cover_path:
+            cover_path = self._safe_relative_path(cover_path, field="cover_image")
         data = {
             "share_text": payload.get("share_text", ""),
             "inspirations": [item.model_dump(mode="json") for item in inspirations],
-            "metadata": payload.get("metadata", {}),
+            "metadata": metadata,
             "ocr": payload.get("ocr", []),
             "review_issues": payload.get("review_issues", []),
             "relations": payload.get("relations", []),
-            "creator": payload.get("creator", {}),
+            "creator": creator_payload,
             "analysis": analysis.model_dump(mode="json"),
             "provider": provenance.get("provider"),
             "model": provenance.get("model"),
             "prompt_version": provenance.get("prompt_version"),
-            "cover_path": source_frontmatter.get("cover_image"),
+            "cover_path": cover_path,
             "cover_kind": source_frontmatter.get("cover_kind"),
             "reminder_states": payload.get("reminder_states", []),
         }
-        if machine_frontmatter.get("source_kind") == SourceKind.VIDEO.value:
+        if source_kind == SourceKind.VIDEO.value:
             data["transcript_raw"] = payload.get("transcript_raw", [])
             data["transcript_corrected"] = payload.get("transcript_corrected", [])
+        for relation in data["relations"]:
+            if not isinstance(relation, dict):
+                raise ValueError("relations 中每项必须是对象")
+            self._safe_id(relation.get("target_entry_id"), field="relation.target_entry_id")
         return entry, data
 
     def load_creators(self) -> list[tuple[CreatorRecord, list[CreatorWorkRecord]]]:
         """Load creator decisions from the tracked hidden creator sidecars."""
         results: list[tuple[CreatorRecord, list[CreatorWorkRecord]]] = []
+        self.last_creator_load_errors = []
         machine_paths = sorted((self.vault_path / "creators").glob("*/.data/creator.md"))
+        seen_ids: set[str] = set()
         for machine_path in machine_paths:
-            _, machine_body = self._parse_document(machine_path)
-            payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
-            if not payload_match:
-                continue
-            payload = yaml.safe_load(payload_match.group("payload")) or {}
-            if not isinstance(payload, dict) or not isinstance(payload.get("creator"), dict):
-                continue
             try:
+                machine_frontmatter, machine_body = self._parse_document_strict(machine_path)
+                payload_match = re.search(
+                    r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S
+                )
+                if not payload_match:
+                    raise ValueError("博主机器侧车缺少 YAML 数据块")
+                payload = yaml.safe_load(payload_match.group("payload"))
+                if not isinstance(payload, dict):
+                    raise ValueError("博主机器侧车 YAML 顶层必须是对象")
+                if not isinstance(payload.get("creator"), dict):
+                    raise ValueError("博主机器侧车缺少 creator 模型")
+                if not isinstance(payload.get("works"), list):
+                    raise ValueError("博主机器侧车缺少 works 数组")
                 creator = CreatorRecord.model_validate(payload["creator"])
-                works = [
-                    CreatorWorkRecord.model_validate(item)
-                    for item in payload.get("works", [])
-                    if isinstance(item, dict)
-                ]
-            except (TypeError, ValueError):
+                self._safe_id(creator.id, field="creator.id")
+                self._safe_id(creator.sec_uid, field="creator.sec_uid")
+                folder_path = self._safe_relative_path(
+                    creator.folder_path, field="creator.folder_path"
+                )
+                if not Path(folder_path).parts or Path(folder_path).parts[0] != "creators":
+                    raise ValueError("creator.folder_path 必须位于 creators/ 下")
+                expected_path = self.vault_path / folder_path / ".data" / "creator.md"
+                if expected_path != machine_path:
+                    raise ValueError("creator.folder_path 与机器侧车路径不一致")
+                frontmatter_creator_id = machine_frontmatter.get("creator_id")
+                if frontmatter_creator_id is not None and frontmatter_creator_id != creator.id:
+                    raise ValueError("creator_id 与 creator.id 不一致")
+                if creator.id in seen_ids:
+                    raise ValueError(f"重复 creator.id：{creator.id}")
+                seen_ids.add(creator.id)
+                if creator.avatar_path:
+                    self._safe_relative_path(creator.avatar_path, field="creator.avatar_path")
+                works: list[CreatorWorkRecord] = []
+                work_ids: set[str] = set()
+                for item in payload["works"]:
+                    if not isinstance(item, dict):
+                        raise ValueError("works 中每项必须是对象")
+                    work = CreatorWorkRecord.model_validate(item)
+                    self._safe_id(work.work_id, field="work.work_id")
+                    if work.creator_id != creator.id:
+                        raise ValueError("work.creator_id 与 creator.id 不一致")
+                    if work.work_id in work_ids:
+                        raise ValueError(f"重复 work_id：{work.work_id}")
+                    work_ids.add(work.work_id)
+                    if work.entry_id:
+                        self._safe_id(work.entry_id, field="work.entry_id")
+                    if work.last_job_id:
+                        self._safe_id(work.last_job_id, field="work.last_job_id")
+                    if work.thumbnail_path:
+                        self._safe_relative_path(work.thumbnail_path, field="work.thumbnail_path")
+                    works.append(work)
+            except Exception as exc:
+                self._append_load_error(self.last_creator_load_errors, machine_path, exc)
                 continue
             results.append((creator, works))
         return results
@@ -1006,34 +1113,180 @@ class VaultWriter:
     def load_topics(self) -> list[tuple[ResearchTopic, list[TopicArtifact]]]:
         """Load research topics and versioned artifacts from tracked Markdown."""
         results: list[tuple[ResearchTopic, list[TopicArtifact]]] = []
+        self.last_topic_load_errors = []
+        self.last_artifact_load_errors = []
         machine_paths = sorted((self.vault_path / "topics").glob("*/.data/topic.md"))
+        seen_ids: set[str] = set()
         for machine_path in machine_paths:
-            frontmatter, _ = self._parse_document(machine_path)
             try:
+                frontmatter, _ = self._parse_document_strict(machine_path)
                 topic = ResearchTopic.model_validate(frontmatter)
-            except (TypeError, ValueError):
+                self._safe_id(topic.id, field="topic.id")
+                expected_path = self.vault_path / "topics" / topic.id / ".data" / "topic.md"
+                if expected_path != machine_path:
+                    raise ValueError("topic.id 与机器侧车路径不一致")
+                frontmatter_topic_id = frontmatter.get("topic_id")
+                if frontmatter_topic_id is not None and frontmatter_topic_id != topic.id:
+                    raise ValueError("topic_id 与 topic.id 不一致")
+                if topic.id in seen_ids:
+                    raise ValueError(f"重复 topic.id：{topic.id}")
+                seen_ids.add(topic.id)
+                source_ids: set[str] = set()
+                positions: set[int] = set()
+                for source in topic.sources:
+                    self._safe_id(source.entry_id, field="topic.source.entry_id")
+                    if source.entry_id in source_ids:
+                        raise ValueError(f"专题来源重复：{source.entry_id}")
+                    if source.position in positions:
+                        raise ValueError(f"专题来源位置重复：{source.position}")
+                    source_ids.add(source.entry_id)
+                    positions.add(source.position)
+            except Exception as exc:
+                self._append_load_error(self.last_topic_load_errors, machine_path, exc)
                 continue
             artifacts: list[TopicArtifact] = []
-            for metadata in frontmatter.get("artifacts", []):
-                if not isinstance(metadata, dict) or not metadata.get("id"):
-                    continue
-                artifact_path = (
-                    machine_path.parent.parent
-                    / "artifacts"
-                    / f"{metadata['id']}.md"
+            artifact_metadata = frontmatter.get("artifacts", [])
+            if not isinstance(artifact_metadata, list):
+                self._append_load_error(
+                    self.last_artifact_load_errors,
+                    machine_path,
+                    ValueError("专题 artifacts 必须是数组"),
                 )
-                if not artifact_path.is_file():
-                    continue
-                _, body = self._parse_document(artifact_path)
-                content = re.sub(r"^\s*#\s+.*?\n+", "", body, count=1).rstrip()
+                artifact_metadata = []
+            seen_artifact_ids: set[str] = set()
+            referenced_artifact_paths: set[Path] = set()
+            for metadata in artifact_metadata:
+                artifact_path: Path | None = None
                 try:
-                    artifacts.append(
-                        TopicArtifact.model_validate(
-                            {**metadata, "content_markdown": content}
-                        )
+                    if not isinstance(metadata, dict):
+                        raise ValueError("artifact 元数据必须是对象")
+                    artifact_id = self._safe_id(metadata.get("id"), field="artifact.id")
+                    if artifact_id in seen_artifact_ids:
+                        raise ValueError(f"重复 artifact.id：{artifact_id}")
+                    seen_artifact_ids.add(artifact_id)
+                    artifact_path = (
+                        machine_path.parent.parent / "artifacts" / f"{artifact_id}.md"
                     )
-                except (TypeError, ValueError):
-                    continue
+                    referenced_artifact_paths.add(artifact_path)
+                    if not artifact_path.is_file():
+                        raise FileNotFoundError(f"专题成果文件不存在：{artifact_path.name}")
+                    artifact_frontmatter, body = self._parse_document_strict(artifact_path)
+                    for field in (
+                        "type",
+                        "topic_id",
+                        "artifact_id",
+                        "artifact_kind",
+                        "title",
+                        "status",
+                        "source_revision",
+                        "source_revisions",
+                        "created_at",
+                        "updated_at",
+                    ):
+                        if field not in artifact_frontmatter:
+                            raise ValueError(f"artifact frontmatter 缺少 {field}")
+                    if artifact_frontmatter.get("topic_id") != topic.id:
+                        raise ValueError("artifact.topic_id 与 topic.id 不一致")
+                    if artifact_frontmatter.get("artifact_id") != artifact_id:
+                        raise ValueError("artifact_id 与元数据不一致")
+                    if artifact_frontmatter.get("artifact_kind") != metadata.get("kind"):
+                        raise ValueError("artifact_kind 与元数据不一致")
+                    if artifact_frontmatter.get("title") != metadata.get("title"):
+                        raise ValueError("artifact.title 与元数据不一致")
+                    if artifact_frontmatter.get("source_revision") != metadata.get(
+                        "source_revision"
+                    ):
+                        raise ValueError("artifact.source_revision 与元数据不一致")
+                    expected_status = {
+                        "current": "当前版本",
+                        "needs_update": "需要更新",
+                    }.get(metadata.get("status"))
+                    if artifact_frontmatter.get("status") not in {
+                        expected_status,
+                        metadata.get("status"),
+                    }:
+                        raise ValueError("artifact.status 与元数据不一致")
+                    content = re.sub(r"^\s*#\s+.*?\n+", "", body, count=1).rstrip()
+                    artifact = TopicArtifact.model_validate(
+                        {**metadata, "content_markdown": content}
+                    )
+                    expected_type = "topic_note" if artifact.user_authored else "topic_artifact"
+                    if artifact_frontmatter.get("type") != expected_type:
+                        raise ValueError("artifact.type 与 user_authored 不一致")
+                    status_value = artifact_frontmatter.get("status")
+                    status_map = {
+                        "当前版本": "current",
+                        "需要更新": "needs_update",
+                    }
+                    normalized_status = status_map.get(status_value, status_value)
+                    token_usage = artifact_frontmatter.get("token_usage", {})
+                    if not isinstance(token_usage, dict):
+                        raise ValueError("artifact token_usage 必须是对象")
+                    file_artifact = TopicArtifact.model_validate(
+                        {
+                            "id": artifact_frontmatter.get("artifact_id"),
+                            "topic_id": artifact_frontmatter.get("topic_id"),
+                            "kind": artifact_frontmatter.get("artifact_kind"),
+                            "title": artifact_frontmatter.get("title"),
+                            "content_markdown": content,
+                            "source_revision": artifact_frontmatter.get("source_revision"),
+                            "source_revisions": artifact_frontmatter.get("source_revisions"),
+                            "status": normalized_status,
+                            "model": artifact_frontmatter.get("model"),
+                            "prompt_version": artifact_frontmatter.get("prompt_version"),
+                            "prompt_tokens": token_usage.get("prompt"),
+                            "completion_tokens": token_usage.get("completion"),
+                            "total_tokens": token_usage.get("total"),
+                            "user_authored": artifact_frontmatter.get("user_authored"),
+                            "created_at": artifact_frontmatter.get("created_at"),
+                            "updated_at": artifact_frontmatter.get("updated_at"),
+                        }
+                    )
+                    for field in (
+                        "id",
+                        "topic_id",
+                        "kind",
+                        "title",
+                        "source_revision",
+                        "source_revisions",
+                        "status",
+                        "model",
+                        "prompt_version",
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "total_tokens",
+                        "user_authored",
+                        "created_at",
+                        "updated_at",
+                    ):
+                        if getattr(file_artifact, field) != getattr(artifact, field):
+                            raise ValueError(f"artifact {field} 与元数据不一致")
+                    for revision in artifact.source_revisions:
+                        self._safe_id(revision.entry_id, field="artifact.source_revision.entry_id")
+                    artifacts.append(artifact)
+                except Exception as exc:
+                    self._append_load_error(
+                        self.last_artifact_load_errors,
+                        artifact_path or machine_path,
+                        exc,
+                    )
+            artifact_root = machine_path.parent.parent / "artifacts"
+            if artifact_root.is_dir():
+                for artifact_path in sorted(artifact_root.glob("*.md")):
+                    if artifact_path in referenced_artifact_paths:
+                        continue
+                    try:
+                        self._parse_document_strict(artifact_path)
+                    except Exception as exc:
+                        self._append_load_error(
+                            self.last_artifact_load_errors, artifact_path, exc
+                        )
+                    else:
+                        self._append_load_error(
+                            self.last_artifact_load_errors,
+                            artifact_path,
+                            ValueError("专题成果未被 topic sidecar 引用"),
+                        )
             results.append((topic, artifacts))
         return results
 
@@ -1500,6 +1753,61 @@ class VaultWriter:
         if not match:
             return {}, content
         frontmatter = yaml.safe_load(match.group("frontmatter")) or {}
+        return frontmatter, match.group("body")
+
+    def _append_load_error(
+        self, collection: list[dict[str, str]], path: Path, error: BaseException
+    ) -> None:
+        try:
+            relative_path = path.resolve().relative_to(self.vault_path.resolve()).as_posix()
+        except ValueError:
+            relative_path = path.as_posix()
+        collection.append(
+            {
+                "path": relative_path,
+                "error": f"{type(error).__name__}: {error}",
+            }
+        )
+
+    def _safe_relative_path(self, value: Any, *, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} 必须是非空相对路径")
+        if "\\" in value or "\x00" in value:
+            raise ValueError(f"{field} 包含不安全路径字符")
+        path = Path(value)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError(f"{field} 必须是安全相对路径")
+        root = self.vault_path.resolve()
+        resolved = (root / path).resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(f"{field} 超出 Vault 范围")
+        return path.as_posix()
+
+    @staticmethod
+    def _safe_id(value: Any, *, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} 必须是非空 ID")
+        if (
+            value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or "\x00" in value
+            or any(ord(char) < 32 for char in value)
+        ):
+            raise ValueError(f"{field} 包含不安全 ID")
+        return value
+
+    @staticmethod
+    def _parse_document_strict(path: Path) -> tuple[dict[str, Any], str]:
+        content = path.read_text(encoding="utf-8")
+        match = re.match(
+            r"^---\s*\n(?P<frontmatter>.*?)\n---\s*\n(?P<body>.*)$", content, re.S
+        )
+        if not match:
+            raise ValueError("文档缺少 YAML frontmatter")
+        frontmatter = yaml.safe_load(match.group("frontmatter"))
+        if not isinstance(frontmatter, dict):
+            raise ValueError("YAML frontmatter 顶层必须是对象")
         return frontmatter, match.group("body")
 
     @staticmethod

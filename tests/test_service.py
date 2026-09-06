@@ -38,6 +38,15 @@ from .conftest import (
 )
 
 
+def test_vault_writer_load_error_collections_start_empty(tmp_path: Path) -> None:
+    vault = VaultWriter(tmp_path)
+
+    assert vault.last_entry_load_errors == []
+    assert vault.last_creator_load_errors == []
+    assert vault.last_topic_load_errors == []
+    assert vault.last_artifact_load_errors == []
+
+
 class CookieExpiredDownloader:
     async def download(self, url: str, video_id: str, target_dir: Path):
         raise CookieRequiredError("需要更新浏览器 cookie")
@@ -951,6 +960,30 @@ async def test_rebuild_reports_bad_entry_without_clearing_database(service) -> N
     with pytest.raises(JobStateError, match="entry_errors"):
         service.rebuild_database_from_vault(apply=True)
     assert service.database.get_entry(entry_id).id == entry_id
+
+
+@pytest.mark.asyncio
+async def test_rebuild_rejects_entry_machine_source_path_mismatch(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry = service.database.get_entry(completed.result["entry_id"])
+    machine = service.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+    source = service.config.vault_path / entry.source_path
+    duplicate = service.config.vault_path / "wiki" / "sources" / "copied-source.md"
+    duplicate.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    machine.write_text(
+        machine.read_text(encoding="utf-8").replace(
+            f"source_page: {entry.source_path}", "source_page: wiki/sources/copied-source.md"
+        ),
+        encoding="utf-8",
+    )
+
+    report = service.rebuild_database_from_vault(apply=False)
+
+    assert any(
+        item["path"] == str(machine.relative_to(service.config.vault_path))
+        for item in report["entry_errors"]
+    )
 
 
 @pytest.mark.asyncio

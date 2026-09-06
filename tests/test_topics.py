@@ -257,6 +257,93 @@ async def test_topic_artifact_provenance_staleness_and_literal_note(service) -> 
     assert (service.config.vault_path / "topics" / topic_id / ".data" / "topic.md").exists()
 
 
+def test_rebuild_reports_invalid_topic_sidecar_without_clearing_database(service) -> None:
+    entry = _add_entry(service, "dy-topic-rebuild", "专题来源", "专题来源内容")
+    topic_id = service.create_topic("专题预检", [entry.id])["topic"]["id"]
+    topic_path = service.config.vault_path / "topics" / topic_id / ".data" / "topic.md"
+    topic_path.write_text(
+        "---\n"
+        "type: research_topic_data\n"
+        "id: [invalid]\n"
+        "title: 专题预检\n"
+        "source_revision: broken\n"
+        "created_at: 2026-09-01T00:00:00+00:00\n"
+        "updated_at: 2026-09-01T00:00:00+00:00\n"
+        "sources: []\n"
+        "---\n\n# 专题机器数据\n",
+        encoding="utf-8",
+    )
+
+    report = service.rebuild_database_from_vault(apply=False)
+    relative_path = str(topic_path.relative_to(service.config.vault_path))
+    assert any(item["path"] == relative_path for item in report["topic_errors"])
+    with pytest.raises(Exception, match="topic_errors"):
+        service.rebuild_database_from_vault(apply=True)
+    assert service.database.get_entry(entry.id).id == entry.id
+    assert service.database.get_topic(topic_id).id == topic_id
+
+
+@pytest.mark.asyncio
+async def test_rebuild_reports_missing_topic_artifact_without_clearing_database(service) -> None:
+    entry = _add_entry(service, "dy-artifact-rebuild", "成果来源", "成果来源内容")
+    topic_id = service.create_topic("成果预检", [entry.id])["topic"]["id"]
+    artifact = await service.generate_topic_artifact(
+        topic_id, "decision_brief", provider=TopicProvider(entry.id)
+    )
+    artifact_path = (
+        service.config.vault_path
+        / "topics"
+        / topic_id
+        / "artifacts"
+        / f"{artifact['id']}.md"
+    )
+    artifact_path.unlink()
+
+    report = service.rebuild_database_from_vault(apply=False)
+    relative_path = str(artifact_path.relative_to(service.config.vault_path))
+    assert any(item["path"] == relative_path for item in report["artifact_errors"])
+    with pytest.raises(Exception, match="artifact_errors"):
+        service.rebuild_database_from_vault(apply=True)
+    assert service.database.get_entry(entry.id).id == entry.id
+    assert service.database.get_topic(topic_id).id == topic_id
+
+
+@pytest.mark.asyncio
+async def test_rebuild_reports_invalid_topic_artifact_frontmatter_without_clearing_database(
+    service,
+) -> None:
+    entry = _add_entry(service, "dy-artifact-frontmatter", "成果元数据来源", "成果元数据内容")
+    entry_data = service.database.get_entry_data(entry.id)
+    entry_data["metadata"] = {"source_kind": "video"}
+    service.vault.write_entry(entry, entry_data)
+    topic_id = service.create_topic("成果元数据预检", [entry.id])["topic"]["id"]
+    artifact = await service.generate_topic_artifact(
+        topic_id, "decision_brief", provider=TopicProvider(entry.id)
+    )
+    artifact_path = (
+        service.config.vault_path
+        / "topics"
+        / topic_id
+        / "artifacts"
+        / f"{artifact['id']}.md"
+    )
+    lines = artifact_path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("created_at:"):
+            lines[index] = "created_at: [invalid]"
+            break
+    artifact_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    report = service.rebuild_database_from_vault(apply=False)
+    relative_path = str(artifact_path.relative_to(service.config.vault_path))
+
+    assert any(item["path"] == relative_path for item in report["artifact_errors"])
+    with pytest.raises(Exception, match="artifact_errors"):
+        service.rebuild_database_from_vault(apply=True)
+    assert service.database.get_entry(entry.id).id == entry.id
+    assert service.database.get_topic(topic_id).id == topic_id
+
+
 @pytest.mark.asyncio
 async def test_source_changes_during_generation_mark_artifact_stale_and_keep_latest_topic(
     service,
