@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import shutil
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,9 +24,27 @@ from douyin_wiki.models import (
     RetentionPolicy,
     TranscriptCorrection,
 )
+from douyin_wiki.service import DouyinWikiService
+from douyin_wiki.vault import VaultWriter
 from douyin_wiki.worker import Worker
 
-from .conftest import FakeDownloader, FakeTranscriber
+from .conftest import (
+    FakeAnalysisProvider,
+    FakeDownloader,
+    FakeMediaProcessor,
+    FakeOCR,
+    FakeResolver,
+    FakeTranscriber,
+)
+
+
+def test_vault_writer_load_error_collections_start_empty(tmp_path: Path) -> None:
+    vault = VaultWriter(tmp_path)
+
+    assert vault.last_entry_load_errors == []
+    assert vault.last_creator_load_errors == []
+    assert vault.last_topic_load_errors == []
+    assert vault.last_artifact_load_errors == []
 
 
 class CookieExpiredDownloader:
@@ -72,6 +92,61 @@ class FailingAuthGuidanceLauncher:
 class BrokenOCR:
     async def recognize(self, frames):
         raise ExternalToolError("synthetic OCR failure")
+
+
+def test_work_capture_lock_rejects_unsafe_work_ids(tmp_path: Path) -> None:
+    vault = VaultWriter(tmp_path / "vault")
+
+    with pytest.raises(ValueError), vault.work_capture_locked("../../outside"):
+        pass
+
+    assert not (tmp_path / "vault" / ".douyin-wiki").exists()
+
+
+class BlockingDownloader(FakeDownloader):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def download(self, url: str, video_id: str, target_dir: Path):
+        self.entered += 1
+        if self.entered == 1:
+            self.started.set()
+            await self.release.wait()
+        return await super().download(url, video_id, target_dir)
+
+
+class CountingAnalysisProvider(FakeAnalysisProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def analyze(self, segments, ocr, inspirations, metadata):
+        self.calls += 1
+        return await super().analyze(segments, ocr, inspirations, metadata)
+
+
+class GatedLockContext:
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.started = threading.Event()
+        self.acquired = threading.Event()
+        self.allow_return = threading.Event()
+        self.returned = threading.Event()
+        self.released = threading.Event()
+
+    def __enter__(self):
+        self.started.set()
+        result = self.inner.__enter__()
+        self.acquired.set()
+        self.allow_return.wait(timeout=5)
+        self.returned.set()
+        return result
+
+    def __exit__(self, *args):
+        self.released.set()
+        return self.inner.__exit__(*args)
 
 
 @pytest.mark.asyncio
@@ -234,6 +309,106 @@ async def test_duplicate_video_appends_inspiration_without_redownload(service) -
     assert downloader.calls == 1
     entry = service.database.get_entry(first.result["entry_id"])
     assert [item.text for item in entry.inspirations] == ["灵感一", "灵感二"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_capture_serializes_video_pipeline_and_merges_inspirations(
+    config, fake_reminders
+) -> None:
+    downloader = BlockingDownloader()
+    analysis = CountingAnalysisProvider()
+    service = DouyinWikiService(
+        config,
+        resolver=FakeResolver(),
+        downloader=downloader,
+        media=FakeMediaProcessor(),
+        transcriber=FakeTranscriber(),
+        ocr=FakeOCR(),
+        analysis=analysis,
+        embeddings=EmbeddingService(config.embeddings),
+        reminders=fake_reminders,
+    )
+    service.initialize(initialize_git=False)
+    first_job = service.capture_douyin(
+        "https://v.douyin.com/uvHsRpXIn8s/", [InspirationInput(text="一")]
+    )
+    second_job = service.capture_douyin(
+        "https://v.douyin.com/uvHsRpXIn8s/", [InspirationInput(text="二")]
+    )
+    first_claimed = service.database.claim_next_job(worker_id="worker-one")
+    second_claimed = service.database.claim_next_job(worker_id="worker-two")
+    assert first_claimed and first_claimed.id == first_job.id
+    assert second_claimed and second_claimed.id == second_job.id
+
+    first_task = asyncio.create_task(service.process_claimed_job(first_claimed))
+    await downloader.started.wait()
+    second_task = asyncio.create_task(service.process_claimed_job(second_claimed))
+    ticks = 0
+    for _ in range(20):
+        await asyncio.sleep(0)
+        ticks += 1
+    assert ticks > 0
+    assert downloader.entered == 1
+    downloader.release.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first.status == JobStatus.COMPLETED
+    assert second.status == JobStatus.COMPLETED
+    assert downloader.calls == 1
+    assert analysis.calls == 1
+    entry = service.database.get_entry(first.result["entry_id"])
+    assert {item.text for item in entry.inspirations} == {"一", "二"}
+    assert any(job.result.get("duplicate") for job in (first, second))
+
+
+@pytest.mark.asyncio
+async def test_canceled_work_lock_waiter_does_not_leak_lock(service) -> None:
+    work_id = "7672717300746907078"
+    factory = service.vault.work_capture_locked
+    holder = factory(work_id)
+    await asyncio.to_thread(holder.__enter__)
+    try:
+        gated = GatedLockContext(factory(work_id))
+        used = False
+
+        def gated_factory(candidate_work_id: str):
+            nonlocal used
+            if not used:
+                used = True
+                return gated
+            return factory(candidate_work_id)
+
+        service.vault.work_capture_locked = gated_factory
+        waiter_context = service._work_capture_locked(work_id)
+        waiter = asyncio.create_task(waiter_context.__aenter__())
+        assert await asyncio.to_thread(gated.started.wait, 1)
+        ticks = 0
+        for _ in range(20):
+            await asyncio.sleep(0)
+            ticks += 1
+        assert ticks == 20
+        assert not waiter.done()
+
+        waiter.cancel()
+        await asyncio.to_thread(holder.__exit__, None, None, None)
+        assert await asyncio.to_thread(gated.acquired.wait, 1)
+        gated.allow_return.set()
+        assert await asyncio.to_thread(gated.returned.wait, 1)
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        third_context = service._work_capture_locked(work_id)
+        third = asyncio.create_task(third_context.__aenter__())
+        done, _ = await asyncio.wait({third}, timeout=1)
+        third_acquired = third in done
+        if not third_acquired and not gated.released.is_set():
+            await asyncio.to_thread(gated.inner.__exit__, None, None, None)
+            await third
+        assert third_acquired
+        await third_context.__aexit__(None, None, None)
+    finally:
+        if not waiter.done():
+            waiter.cancel()
 
 
 @pytest.mark.asyncio
@@ -785,6 +960,30 @@ async def test_rebuild_reports_bad_entry_without_clearing_database(service) -> N
     with pytest.raises(JobStateError, match="entry_errors"):
         service.rebuild_database_from_vault(apply=True)
     assert service.database.get_entry(entry_id).id == entry_id
+
+
+@pytest.mark.asyncio
+async def test_rebuild_rejects_entry_machine_source_path_mismatch(service) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry = service.database.get_entry(completed.result["entry_id"])
+    machine = service.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
+    source = service.config.vault_path / entry.source_path
+    duplicate = service.config.vault_path / "wiki" / "sources" / "copied-source.md"
+    duplicate.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    machine.write_text(
+        machine.read_text(encoding="utf-8").replace(
+            f"source_page: {entry.source_path}", "source_page: wiki/sources/copied-source.md"
+        ),
+        encoding="utf-8",
+    )
+
+    report = service.rebuild_database_from_vault(apply=False)
+
+    assert any(
+        item["path"] == str(machine.relative_to(service.config.vault_path))
+        for item in report["entry_errors"]
+    )
 
 
 @pytest.mark.asyncio

@@ -10,10 +10,19 @@ from douyin_wiki.database import Database
 from douyin_wiki.errors import JobLeaseLostError
 from douyin_wiki.models import (
     CaptureRequest,
+    CreatorRecord,
+    CreatorWorkAvailability,
+    CreatorWorkDecision,
+    CreatorWorkRecord,
     EntryRecord,
+    GatewayContext,
     InspirationInput,
     JobStatus,
+    ResearchTopic,
     RetentionPolicy,
+    SourceKind,
+    TopicArtifact,
+    TopicSource,
 )
 
 
@@ -31,6 +40,214 @@ def test_queue_claim_and_recovery(tmp_path: Path) -> None:
     assert database.claim_next_job() is None
     assert database.recover_expired_jobs(datetime.now(UTC) + timedelta(minutes=10)) == 1
     assert database.claim_next_job() is not None
+
+
+def test_replace_knowledge_cache_rolls_back_every_projection_on_restore_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    now = datetime.now(UTC)
+
+    old_entry = EntryRecord(
+        id="dy-111111111111",
+        video_id="111111111111",
+        title="旧资料",
+        original_url="https://www.douyin.com/video/111111111111",
+        canonical_url="https://www.douyin.com/video/111111111111",
+        raw_path="raw/old.md",
+        source_path="wiki/sources/old.md",
+        status="active",
+        media_status="present",
+        retention=RetentionPolicy.KEEP,
+        created_at=now,
+        updated_at=now,
+    )
+    old_data = {
+        "analysis": {
+            "analysis_version": 2,
+            "title": "旧资料",
+            "one_liner": "旧摘要",
+            "relevance_to_inspiration": "旧关联",
+            "takeaways": ["旧要点"],
+            "content_type": "other",
+            "content_card": {"kind": "other"},
+            "tags": [],
+        }
+    }
+    database.persist_entry_bundle(
+        old_entry,
+        old_data,
+        [{"id": "old-chunk", "kind": "summary", "text": "旧片段", "embedding": [1.0]}],
+        [],
+        [],
+    )
+    creator = CreatorRecord(
+        id="dyc-old",
+        sec_uid="old-sec-uid-123456",
+        canonical_url="https://www.douyin.com/user/old-sec-uid-123456",
+        original_url="https://v.douyin.com/old/",
+        nickname="旧博主",
+        folder_path="creators/旧博主",
+        created_at=now,
+        updated_at=now,
+    )
+    work = CreatorWorkRecord(
+        creator_id=creator.id,
+        work_id="111111111111",
+        source_kind=SourceKind.VIDEO,
+        canonical_url=old_entry.canonical_url,
+        original_url=old_entry.original_url,
+        title=old_entry.title,
+        decision=CreatorWorkDecision.IMPORTED,
+        availability=CreatorWorkAvailability.AVAILABLE,
+        entry_id=old_entry.id,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    database.restore_creator_bundle(creator, [work])
+    topic = ResearchTopic(
+        id="topic-old",
+        title="旧专题",
+        sources=[
+            TopicSource(
+                entry_id=old_entry.id,
+                position=1,
+                source_revision=now,
+            )
+        ],
+        source_revision="old-revision",
+        created_at=now,
+        updated_at=now,
+    )
+    artifact = TopicArtifact(
+        id="artifact-old",
+        topic_id=topic.id,
+        kind="note",
+        title="旧成果",
+        content_markdown="旧内容",
+        source_revision="old-revision",
+        created_at=now,
+        updated_at=now,
+        user_authored=True,
+    )
+    database.restore_topic_bundle(topic, [artifact])
+    database.set_index_metadata("embedding_signature", "old-signature")
+    job = database.create_job(
+        CaptureRequest(
+            share_text="https://www.douyin.com/video/111111111111",
+            gateway_context=GatewayContext(gateway="test"),
+        )
+    )
+    database.update_job(job.id, status=JobStatus.COMPLETED)
+    database.create_creator_run_items(job.id, creator.id, [work.work_id])
+    database.attach_creator_child_job(creator.id, work.work_id, job.id)
+    session = database.create_chat_session(
+        title="保留对话", scope="topic", context_topic_id=topic.id
+    )
+    database.add_chat_message(session.id, "user", "保留这条消息")
+    database.record_maintenance("weekly", {"status": "保留"})
+
+    with database.connect() as conn:
+        before = {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
+            for table in (
+                "entries",
+                "chunks",
+                "creators",
+                "creator_works",
+                "research_topics",
+                "topic_sources",
+                "topic_artifacts",
+                "index_metadata",
+                "jobs",
+                "job_events",
+                "creator_run_items",
+                "web_chat_sessions",
+                "web_chat_messages",
+                "maintenance_runs",
+            )
+        }
+
+    replacement = old_entry.model_copy(update={"id": "dy-222222222222", "video_id": "222222222222"})
+    replacement_data = {**old_data, "analysis": {**old_data["analysis"], "title": "新资料"}}
+    replacement_topic = topic.model_copy(
+        update={
+            "sources": [
+                TopicSource(
+                    entry_id=replacement.id,
+                    position=1,
+                    source_revision=now,
+                )
+            ]
+        }
+    )
+
+    def fail_restore(*args, **kwargs):
+        raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(database, "_restore_creator_bundle_conn", fail_restore)
+    with pytest.raises(RuntimeError, match="restore failed"):
+        database.replace_knowledge_cache(
+            entries=[
+                (
+                    replacement,
+                    replacement_data,
+                    [{"id": "new-chunk", "kind": "summary", "text": "新片段", "embedding": [1.0]}],
+                    [],
+                    [],
+                )
+            ],
+            creators=[(creator, [work])],
+            topics=[(replacement_topic, [artifact])],
+            embedding_signature="new-signature",
+        )
+
+    with database.connect() as conn:
+        after = {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
+            for table in before
+        }
+    assert after == before
+
+    monkeypatch.undo()
+    database.replace_knowledge_cache(
+        entries=[
+            (
+                replacement,
+                replacement_data,
+                [{"id": "new-chunk", "kind": "summary", "text": "新片段", "embedding": [1.0]}],
+                [],
+                [],
+            )
+        ],
+        creators=[(creator, [work])],
+        topics=[(replacement_topic, [artifact])],
+        embedding_signature="new-signature",
+    )
+    with database.connect() as conn:
+        preserved_after_success = {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
+            for table in (
+                "jobs",
+                "job_events",
+                "creator_run_items",
+                "web_chat_sessions",
+                "web_chat_messages",
+                "maintenance_runs",
+            )
+        }
+    assert preserved_after_success == {
+        table: before[table]
+        for table in preserved_after_success
+    }
+    with database.connect() as conn:
+        restored_work = conn.execute(
+            "SELECT entry_id, last_job_id FROM creator_works WHERE creator_id=? AND work_id=?",
+            (creator.id, work.work_id),
+        ).fetchone()
+    assert restored_work["entry_id"] is None
+    assert restored_work["last_job_id"] == job.id
 
 
 def test_list_jobs_accepts_none_limit_for_all_matching_jobs(tmp_path: Path) -> None:

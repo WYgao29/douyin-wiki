@@ -1427,92 +1427,94 @@ class Database:
     ) -> None:
         """Restore the rebuildable creator projection from a tracked sidecar."""
         with self.connect() as conn:
+            self._restore_creator_bundle_conn(conn, creator, works)
+
+    def _restore_creator_bundle_conn(
+        self,
+        conn: sqlite3.Connection,
+        creator: CreatorRecord,
+        works: list[CreatorWorkRecord],
+    ) -> None:
+        """Restore one creator and its works using the caller's connection."""
+        conn.execute(
+            """INSERT INTO creators
+               (id, sec_uid, canonical_url, original_url, nickname, folder_path, uid,
+                unique_id, signature, avatar_path, inspirations_json, reported_work_count,
+                last_synced_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 sec_uid=excluded.sec_uid, canonical_url=excluded.canonical_url,
+                 original_url=excluded.original_url, nickname=excluded.nickname,
+                 folder_path=excluded.folder_path, uid=excluded.uid,
+                 unique_id=excluded.unique_id, signature=excluded.signature,
+                 avatar_path=excluded.avatar_path,
+                 inspirations_json=excluded.inspirations_json,
+                 reported_work_count=excluded.reported_work_count,
+                 last_synced_at=excluded.last_synced_at, created_at=excluded.created_at,
+                 updated_at=excluded.updated_at""",
+            (
+                creator.id,
+                creator.sec_uid,
+                creator.canonical_url,
+                creator.original_url,
+                creator.nickname,
+                creator.folder_path,
+                creator.uid,
+                creator.unique_id,
+                creator.signature,
+                creator.avatar_path,
+                json.dumps(
+                    [item.model_dump(mode="json") for item in creator.inspirations],
+                    ensure_ascii=False,
+                ),
+                creator.reported_work_count,
+                creator.last_synced_at.isoformat() if creator.last_synced_at else None,
+                creator.created_at.isoformat(),
+                creator.updated_at.isoformat(),
+            ),
+        )
+        for work in works:
+            entry_id = work.entry_id
+            if (
+                entry_id
+                and not conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone()
+            ):
+                entry_id = None
             conn.execute(
-                """INSERT INTO creators
-                   (id, sec_uid, canonical_url, original_url, nickname, folder_path, uid,
-                    unique_id, signature, avatar_path, inspirations_json, reported_work_count,
-                    last_synced_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                     sec_uid=excluded.sec_uid, canonical_url=excluded.canonical_url,
-                     original_url=excluded.original_url, nickname=excluded.nickname,
-                     folder_path=excluded.folder_path, uid=excluded.uid,
-                     unique_id=excluded.unique_id, signature=excluded.signature,
-                     avatar_path=excluded.avatar_path,
-                     inspirations_json=excluded.inspirations_json,
-                     reported_work_count=excluded.reported_work_count,
-                     last_synced_at=excluded.last_synced_at,
-                     created_at=excluded.created_at, updated_at=excluded.updated_at""",
+                """INSERT INTO creator_works
+                   (creator_id, work_id, source_kind, canonical_url, original_url, title,
+                    published_at, duration_seconds, thumbnail_path, is_pinned, decision,
+                    availability, missing_sync_count, entry_id, last_job_id,
+                    first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                   ON CONFLICT(creator_id, work_id) DO UPDATE SET
+                     source_kind=excluded.source_kind, canonical_url=excluded.canonical_url,
+                     original_url=excluded.original_url, title=excluded.title,
+                     published_at=excluded.published_at, duration_seconds=excluded.duration_seconds,
+                     thumbnail_path=excluded.thumbnail_path, is_pinned=excluded.is_pinned,
+                     decision=excluded.decision, availability=excluded.availability,
+                     missing_sync_count=excluded.missing_sync_count, entry_id=excluded.entry_id,
+                     last_job_id=NULL, first_seen_at=excluded.first_seen_at,
+                     last_seen_at=excluded.last_seen_at""",
                 (
                     creator.id,
-                    creator.sec_uid,
-                    creator.canonical_url,
-                    creator.original_url,
-                    creator.nickname,
-                    creator.folder_path,
-                    creator.uid,
-                    creator.unique_id,
-                    creator.signature,
-                    creator.avatar_path,
-                    json.dumps(
-                        [item.model_dump(mode="json") for item in creator.inspirations],
-                        ensure_ascii=False,
-                    ),
-                    creator.reported_work_count,
-                    creator.last_synced_at.isoformat() if creator.last_synced_at else None,
-                    creator.created_at.isoformat(),
-                    creator.updated_at.isoformat(),
+                    work.work_id,
+                    work.source_kind.value,
+                    work.canonical_url,
+                    work.original_url,
+                    work.title,
+                    work.published_at.isoformat() if work.published_at else None,
+                    work.duration_seconds,
+                    work.thumbnail_path,
+                    int(work.is_pinned),
+                    work.decision.value,
+                    work.availability.value,
+                    work.missing_sync_count,
+                    entry_id,
+                    work.first_seen_at.isoformat(),
+                    work.last_seen_at.isoformat(),
                 ),
             )
-            for work in works:
-                entry_id = work.entry_id
-                if (
-                    entry_id
-                    and not conn.execute("SELECT 1 FROM entries WHERE id=?", (entry_id,)).fetchone()
-                ):
-                    entry_id = None
-                conn.execute(
-                    """INSERT INTO creator_works
-                       (creator_id, work_id, source_kind, canonical_url, original_url, title,
-                        published_at, duration_seconds, thumbnail_path, is_pinned, decision,
-                        availability, missing_sync_count, entry_id, last_job_id,
-                        first_seen_at, last_seen_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                       ON CONFLICT(creator_id, work_id) DO UPDATE SET
-                         source_kind=excluded.source_kind,
-                         canonical_url=excluded.canonical_url,
-                         original_url=excluded.original_url,
-                         title=excluded.title,
-                         published_at=excluded.published_at,
-                         duration_seconds=excluded.duration_seconds,
-                         thumbnail_path=excluded.thumbnail_path,
-                         is_pinned=excluded.is_pinned,
-                         decision=excluded.decision,
-                         availability=excluded.availability,
-                         missing_sync_count=excluded.missing_sync_count,
-                         entry_id=excluded.entry_id,
-                         last_job_id=NULL,
-                         first_seen_at=excluded.first_seen_at,
-                         last_seen_at=excluded.last_seen_at""",
-                    (
-                        creator.id,
-                        work.work_id,
-                        work.source_kind.value,
-                        work.canonical_url,
-                        work.original_url,
-                        work.title,
-                        work.published_at.isoformat() if work.published_at else None,
-                        work.duration_seconds,
-                        work.thumbnail_path,
-                        int(work.is_pinned),
-                        work.decision.value,
-                        work.availability.value,
-                        work.missing_sync_count,
-                        entry_id,
-                        work.first_seen_at.isoformat(),
-                        work.last_seen_at.isoformat(),
-                    ),
-                )
 
     def get_entry(self, entry_id: str) -> EntryRecord:
         with self.connect() as conn:
@@ -1816,112 +1818,213 @@ class Database:
         reminders: list[ReminderCandidate],
     ) -> EntryRecord:
         """Atomically replace one entry and every rebuildable SQLite projection."""
-        now = iso_now()
         with self.connect() as conn:
-            self._upsert_entry_conn(conn, self._entry_values(entry, data))
-            old_ids = [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM chunks WHERE entry_id=?", (entry.id,)
-                ).fetchall()
-            ]
-            if old_ids:
-                placeholders = ",".join("?" for _ in old_ids)
-                conn.execute(f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", old_ids)
-            conn.execute("DELETE FROM chunks WHERE entry_id=?", (entry.id,))
-            for chunk in chunks:
-                chunk_id = chunk.get("id") or uuid.uuid4().hex
-                embedding = chunk.get("embedding")
-                conn.execute(
-                    """INSERT INTO chunks
-                       (id, entry_id, kind, text, timestamp_ms, image_index,
-                        purposes_text, tags_text, embedding_json, stale, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        chunk_id,
-                        entry.id,
-                        chunk.get("kind", "text"),
-                        chunk["text"],
-                        chunk.get("timestamp_ms"),
-                        chunk.get("image_index"),
-                        chunk.get("purposes_text", ""),
-                        chunk.get("tags_text", ""),
-                        json.dumps(embedding) if embedding is not None else None,
-                        int(chunk.get("stale", False)),
-                        now,
-                    ),
-                )
-                conn.execute(
-                    """INSERT INTO chunks_fts(chunk_id, entry_id, text, purposes, tags)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        chunk_id,
-                        entry.id,
-                        lexical_document(chunk["text"]),
-                        lexical_document(chunk.get("purposes_text", "")),
-                        lexical_document(chunk.get("tags_text", "")),
-                    ),
-                )
-            conn.execute("DELETE FROM relations WHERE source_entry_id=?", (entry.id,))
-            conn.executemany(
-                """INSERT OR REPLACE INTO relations
-                   (source_entry_id, target_entry_id, relation_type, reason, confidence, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                [
-                    (
-                        entry.id,
-                        relation["target_entry_id"],
-                        relation.get("relation_type", "related"),
-                        relation.get("reason", "语义相关"),
-                        float(relation.get("confidence", 0)),
-                        now,
-                    )
-                    for relation in relations
-                ],
+            self._persist_entry_bundle_conn(conn, entry, data, chunks, relations, reminders)
+        return self.get_entry(entry.id)
+
+    def _persist_entry_bundle_conn(
+        self,
+        conn: sqlite3.Connection,
+        entry: EntryRecord,
+        data: dict[str, Any],
+        chunks: list[dict[str, Any]],
+        relations: list[dict[str, Any]],
+        reminders: list[ReminderCandidate],
+    ) -> None:
+        """Persist one complete entry projection using the caller's connection."""
+        now = iso_now()
+        self._upsert_entry_conn(conn, self._entry_values(entry, data))
+        old_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM chunks WHERE entry_id=?", (entry.id,)
+            ).fetchall()
+        ]
+        if old_ids:
+            placeholders = ",".join("?" for _ in old_ids)
+            conn.execute(f"DELETE FROM chunks_fts WHERE chunk_id IN ({placeholders})", old_ids)
+        conn.execute("DELETE FROM chunks WHERE entry_id=?", (entry.id,))
+        for chunk in chunks:
+            chunk_id = chunk.get("id") or uuid.uuid4().hex
+            embedding = chunk.get("embedding")
+            conn.execute(
+                """INSERT INTO chunks
+                   (id, entry_id, kind, text, timestamp_ms, image_index,
+                    purposes_text, tags_text, embedding_json, stale, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chunk_id,
+                    entry.id,
+                    chunk.get("kind", "text"),
+                    chunk["text"],
+                    chunk.get("timestamp_ms"),
+                    chunk.get("image_index"),
+                    chunk.get("purposes_text", ""),
+                    chunk.get("tags_text", ""),
+                    json.dumps(embedding) if embedding is not None else None,
+                    int(chunk.get("stale", False)),
+                    now,
+                ),
             )
             conn.execute(
-                "DELETE FROM reminders WHERE entry_id=? AND status='candidate'", (entry.id,)
+                """INSERT INTO chunks_fts(chunk_id, entry_id, text, purposes, tags)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    chunk_id,
+                    entry.id,
+                    lexical_document(chunk["text"]),
+                    lexical_document(chunk.get("purposes_text", "")),
+                    lexical_document(chunk.get("tags_text", "")),
+                ),
             )
-            created_ids = {
-                ReminderCandidate.model_validate_json(row["data_json"]).id
+        conn.execute("DELETE FROM relations WHERE source_entry_id=?", (entry.id,))
+        conn.executemany(
+            """INSERT OR REPLACE INTO relations
+               (source_entry_id, target_entry_id, relation_type, reason, confidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    entry.id,
+                    relation["target_entry_id"],
+                    relation.get("relation_type", "related"),
+                    relation.get("reason", "语义相关"),
+                    float(relation.get("confidence", 0)),
+                    now,
+                )
+                for relation in relations
+            ],
+        )
+        conn.execute("DELETE FROM reminders WHERE entry_id=? AND status='candidate'", (entry.id,))
+        created_ids = {
+            ReminderCandidate.model_validate_json(row["data_json"]).id
+            for row in conn.execute(
+                "SELECT data_json FROM reminders WHERE entry_id=? AND status='created'",
+                (entry.id,),
+            ).fetchall()
+        }
+        persisted_states = {
+            str(item.get("id")): item
+            for item in data.get("reminder_states", [])
+            if isinstance(item, dict) and item.get("status") == "created"
+        }
+        conn.executemany(
+            """INSERT INTO reminders
+               (id, entry_id, data_json, status, system_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    self._reminder_storage_id(entry.id, reminder.id),
+                    entry.id,
+                    reminder.model_dump_json(),
+                    "created" if reminder.id in persisted_states else "candidate",
+                    persisted_states.get(reminder.id, {}).get("system_id"),
+                    now,
+                )
+                for reminder in reminders
+                if reminder.id not in created_ids
+            ],
+        )
+
+    def replace_knowledge_cache(
+        self,
+        *,
+        entries: list[
+            tuple[
+                EntryRecord,
+                dict[str, Any],
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+                list[ReminderCandidate],
+            ]
+        ],
+        creators: list[tuple[CreatorRecord, list[CreatorWorkRecord]]],
+        topics: list[tuple[ResearchTopic, list[TopicArtifact]]],
+        embedding_signature: str,
+    ) -> None:
+        """Replace every rebuildable projection in one SQLite transaction."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_items = [
+                dict(row) for row in conn.execute("SELECT * FROM creator_run_items").fetchall()
+            ]
+            last_job_links = [
+                dict(row)
                 for row in conn.execute(
-                    "SELECT data_json FROM reminders WHERE entry_id=? AND status='created'",
-                    (entry.id,),
+                    """SELECT creator_id, work_id, last_job_id
+                       FROM creator_works WHERE last_job_id IS NOT NULL"""
                 ).fetchall()
-            }
-            persisted_states = {
-                str(item.get("id")): item
-                for item in data.get("reminder_states", [])
-                if isinstance(item, dict) and item.get("status") == "created"
-            }
-            conn.executemany(
-                """INSERT INTO reminders
-                   (id, entry_id, data_json, status, system_id, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                [
+            ]
+            self._clear_knowledge_cache_conn(conn, include_creators=True)
+            for entry, data, chunks, relations, reminders in entries:
+                self._persist_entry_bundle_conn(
+                    conn, entry, data, chunks, relations, reminders
+                )
+            for creator, works in creators:
+                self._restore_creator_bundle_conn(conn, creator, works)
+            for topic, artifacts in topics:
+                self._restore_topic_bundle_conn(conn, topic, artifacts)
+
+            for item in run_items:
+                valid = (
+                    conn.execute("SELECT 1 FROM jobs WHERE id=?", (item["job_id"],)).fetchone()
+                    and conn.execute(
+                        "SELECT 1 FROM creator_works WHERE creator_id=? AND work_id=?",
+                        (item["creator_id"], item["work_id"]),
+                    ).fetchone()
+                )
+                if not valid:
+                    continue
+                conn.execute(
+                    """INSERT INTO creator_run_items
+                       (job_id, creator_id, work_id, ordinal, is_new)
+                       VALUES (?, ?, ?, ?, ?)""",
                     (
-                        self._reminder_storage_id(entry.id, reminder.id),
-                        entry.id,
-                        reminder.model_dump_json(),
-                        "created" if reminder.id in persisted_states else "candidate",
-                        persisted_states.get(reminder.id, {}).get("system_id"),
-                        now,
-                    )
-                    for reminder in reminders
-                    if reminder.id not in created_ids
-                ],
-            )
-        return self.get_entry(entry.id)
+                        item["job_id"],
+                        item["creator_id"],
+                        item["work_id"],
+                        item["ordinal"],
+                        item["is_new"],
+                    ),
+                )
+            for item in last_job_links:
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM jobs WHERE id=?", (item["last_job_id"],)
+                    ).fetchone()
+                    is None
+                ):
+                    continue
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM creator_works WHERE creator_id=? AND work_id=?",
+                        (item["creator_id"], item["work_id"]),
+                    ).fetchone()
+                    is None
+                ):
+                    continue
+                conn.execute(
+                    """UPDATE creator_works SET last_job_id=?
+                       WHERE creator_id=? AND work_id=?""",
+                    (item["last_job_id"], item["creator_id"], item["work_id"]),
+                )
+            self._set_index_metadata_conn(conn, "embedding_signature", embedding_signature)
 
     def clear_knowledge_cache(self, *, include_creators: bool = False) -> None:
         """Remove only rebuildable knowledge projections; keep jobs and maintenance history."""
         with self.connect() as conn:
-            conn.execute("DELETE FROM chunks_fts")
-            conn.execute("DELETE FROM research_topics")
-            if include_creators:
-                conn.execute("DELETE FROM creators")
-            conn.execute("DELETE FROM entries")
-            conn.execute("DELETE FROM index_metadata")
+            self._clear_knowledge_cache_conn(conn, include_creators=include_creators)
+
+    @staticmethod
+    def _clear_knowledge_cache_conn(
+        conn: sqlite3.Connection, *, include_creators: bool = False
+    ) -> None:
+        conn.execute("DELETE FROM chunks_fts")
+        conn.execute("DELETE FROM topic_artifacts")
+        conn.execute("DELETE FROM research_topics")
+        conn.execute("DELETE FROM entries")
+        if include_creators:
+            conn.execute("DELETE FROM creators")
+        conn.execute("DELETE FROM index_metadata")
 
     def get_index_metadata(self, key: str) -> str | None:
         with self.connect() as conn:
@@ -1930,12 +2033,18 @@ class Database:
 
     def set_index_metadata(self, key: str, value: str) -> None:
         with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO index_metadata(key, value, updated_at) VALUES (?, ?, ?)
-                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,
-                   updated_at=excluded.updated_at""",
-                (key, value, iso_now()),
-            )
+            self._set_index_metadata_conn(conn, key, value)
+
+    @staticmethod
+    def _set_index_metadata_conn(
+        conn: sqlite3.Connection, key: str, value: str
+    ) -> None:
+        conn.execute(
+            """INSERT INTO index_metadata(key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+               updated_at=excluded.updated_at""",
+            (key, value, iso_now()),
+        )
 
     def add_inspiration(self, entry_id: str, inspiration: InspirationInput) -> EntryRecord:
         entry = self.get_entry(entry_id)
@@ -2559,94 +2668,109 @@ class Database:
 
     def save_topic_artifact(self, artifact: TopicArtifact) -> TopicArtifact:
         with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO topic_artifacts
-                   (id, topic_id, kind, title, content_markdown, source_revision,
-                    source_revisions_json, status, model, prompt_version, prompt_tokens,
-                    completion_tokens, total_tokens, user_authored, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                    title=excluded.title, content_markdown=excluded.content_markdown,
-                    source_revision=excluded.source_revision,
-                    source_revisions_json=excluded.source_revisions_json,
-                    status=excluded.status, model=excluded.model,
-                    prompt_version=excluded.prompt_version,
-                    prompt_tokens=excluded.prompt_tokens,
-                    completion_tokens=excluded.completion_tokens,
-                    total_tokens=excluded.total_tokens, updated_at=excluded.updated_at""",
-                (
-                    artifact.id,
-                    artifact.topic_id,
-                    artifact.kind,
-                    artifact.title,
-                    artifact.content_markdown,
-                    artifact.source_revision,
-                    json.dumps(
-                        [item.model_dump(mode="json") for item in artifact.source_revisions],
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                    artifact.status,
-                    artifact.model,
-                    artifact.prompt_version,
-                    artifact.prompt_tokens,
-                    artifact.completion_tokens,
-                    artifact.total_tokens,
-                    int(artifact.user_authored),
-                    artifact.created_at.isoformat(),
-                    artifact.updated_at.isoformat(),
-                ),
-            )
+            self._save_topic_artifact_conn(conn, artifact)
         return self.get_topic_artifact(artifact.id)
+
+    @staticmethod
+    def _save_topic_artifact_conn(
+        conn: sqlite3.Connection, artifact: TopicArtifact
+    ) -> None:
+        conn.execute(
+            """INSERT INTO topic_artifacts
+               (id, topic_id, kind, title, content_markdown, source_revision,
+                source_revisions_json, status, model, prompt_version, prompt_tokens,
+                completion_tokens, total_tokens, user_authored, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title, content_markdown=excluded.content_markdown,
+                source_revision=excluded.source_revision,
+                source_revisions_json=excluded.source_revisions_json,
+                status=excluded.status, model=excluded.model,
+                prompt_version=excluded.prompt_version,
+                prompt_tokens=excluded.prompt_tokens,
+                completion_tokens=excluded.completion_tokens,
+                total_tokens=excluded.total_tokens, updated_at=excluded.updated_at""",
+            (
+                artifact.id,
+                artifact.topic_id,
+                artifact.kind,
+                artifact.title,
+                artifact.content_markdown,
+                artifact.source_revision,
+                json.dumps(
+                    [item.model_dump(mode="json") for item in artifact.source_revisions],
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                artifact.status,
+                artifact.model,
+                artifact.prompt_version,
+                artifact.prompt_tokens,
+                artifact.completion_tokens,
+                artifact.total_tokens,
+                int(artifact.user_authored),
+                artifact.created_at.isoformat(),
+                artifact.updated_at.isoformat(),
+            ),
+        )
 
     def restore_topic_bundle(
         self, topic: ResearchTopic, artifacts: list[TopicArtifact]
     ) -> ResearchTopic:
         """Restore a topic projection after its entry rows have been rebuilt."""
         with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO research_topics
-                   (id, title, goal, instructions, source_revision, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET title=excluded.title, goal=excluded.goal,
-                   instructions=excluded.instructions, source_revision=excluded.source_revision,
-                   created_at=excluded.created_at, updated_at=excluded.updated_at""",
+            self._restore_topic_bundle_conn(conn, topic, artifacts)
+        return self.get_topic(topic.id)
+
+    def _restore_topic_bundle_conn(
+        self,
+        conn: sqlite3.Connection,
+        topic: ResearchTopic,
+        artifacts: list[TopicArtifact],
+    ) -> None:
+        """Restore one topic, its sources, and artifacts using one connection."""
+        conn.execute(
+            """INSERT INTO research_topics
+               (id, title, goal, instructions, source_revision, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET title=excluded.title, goal=excluded.goal,
+               instructions=excluded.instructions, source_revision=excluded.source_revision,
+               created_at=excluded.created_at, updated_at=excluded.updated_at""",
+            (
+                topic.id,
+                topic.title,
+                topic.goal,
+                topic.instructions,
+                topic.source_revision,
+                topic.created_at.isoformat(),
+                topic.updated_at.isoformat(),
+            ),
+        )
+        conn.execute("DELETE FROM topic_sources WHERE topic_id=?", (topic.id,))
+        valid_sources = [
+            source
+            for source in topic.sources
+            if conn.execute(
+                "SELECT 1 FROM entries WHERE id=?", (source.entry_id,)
+            ).fetchone()
+        ]
+        conn.executemany(
+            """INSERT INTO topic_sources
+               (topic_id, entry_id, position, enabled, source_revision)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
                 (
                     topic.id,
-                    topic.title,
-                    topic.goal,
-                    topic.instructions,
-                    topic.source_revision,
-                    topic.created_at.isoformat(),
-                    topic.updated_at.isoformat(),
-                ),
-            )
-            conn.execute("DELETE FROM topic_sources WHERE topic_id=?", (topic.id,))
-            valid_sources = [
-                source
-                for source in topic.sources
-                if conn.execute(
-                    "SELECT 1 FROM entries WHERE id=?", (source.entry_id,)
-                ).fetchone()
-            ]
-            conn.executemany(
-                """INSERT INTO topic_sources
-                   (topic_id, entry_id, position, enabled, source_revision)
-                   VALUES (?, ?, ?, ?, ?)""",
-                [
-                    (
-                        topic.id,
-                        source.entry_id,
-                        position,
-                        int(source.enabled),
-                        source.source_revision.isoformat(),
-                    )
-                    for position, source in enumerate(valid_sources, start=1)
-                ],
-            )
+                    source.entry_id,
+                    position,
+                    int(source.enabled),
+                    source.source_revision.isoformat(),
+                )
+                for position, source in enumerate(valid_sources, start=1)
+            ],
+        )
         for artifact in artifacts:
-            self.save_topic_artifact(artifact)
-        return self.get_topic(topic.id)
+            self._save_topic_artifact_conn(conn, artifact)
 
     def get_topic_artifact(self, artifact_id: str) -> TopicArtifact:
         with self.connect() as conn:

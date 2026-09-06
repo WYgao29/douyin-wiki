@@ -168,6 +168,32 @@ inspirations:
     return config, service
 
 
+def test_catalog_skips_bad_date_and_keeps_valid_articles(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    bad = config.vault_path / "wiki" / "sources" / "坏日期_456.md"
+    bad.write_text(
+        "---\ntype: source\nvideo_id: '456'\ncaptured_at: not-a-date\n---\n# 坏日期",
+        encoding="utf-8",
+    )
+    app = create_app(config, service=service, start_watcher=False)
+    with TestClient(app) as client:
+        response = client.get("/api/library")
+        assert response.status_code == 200
+        assert {item["entry_id"] for item in response.json()["items"]} == {"dy-123"}
+    assert app.state.catalog.load_errors[0]["path"] == "wiki/sources/坏日期_456.md"
+    bad.write_text(
+        "---\n"
+        "type: source\n"
+        "video_id: '456'\n"
+        "captured_at: '2026-08-24T09:00:00+08:00'\n"
+        "---\n# 修复日期",
+        encoding="utf-8",
+    )
+    items = app.state.catalog.refresh()
+    assert {item.entry_id for item in items} == {"dy-123", "dy-456"}
+    assert app.state.catalog.load_errors == []
+
+
 def test_library_article_rendering_and_media_security(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(
@@ -196,6 +222,66 @@ def test_library_article_rendering_and_media_security(tmp_path: Path) -> None:
             json={"entry_id": "dy-123", "text": "网页灵感", "confirmed": False},
         )
         assert rejected.status_code == 400
+
+
+def test_unmanaged_markdown_is_readable_but_not_database_managed(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    asset_dir = config.vault_path / "raw" / "assets" / "456"
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "example.webp").write_bytes(b"RIFFfakeWEBP")
+    source = config.vault_path / "wiki" / "sources" / "只读文章_456.md"
+    source.write_text(
+        """---
+type: source
+video_id: '456'
+author: 只读作者
+source_kind: image_note
+content_type: explanation
+---
+# 只读文章
+
+## 一句话
+
+这是一篇没有数据库记录的 Markdown 文章。
+
+![示例图](../../raw/assets/456/example.webp)
+""",
+        encoding="utf-8",
+    )
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        library = client.get("/api/library")
+        assert library.status_code == 200
+        item = next(
+            item for item in library.json()["items"] if item["entry_id"] == "dy-456"
+        )
+        assert item["database_managed"] is False
+
+        article = client.get("/api/articles/dy-456")
+        assert article.status_code == 200
+        assert article.json()["item"]["database_managed"] is False
+        assert "只读文章" in article.json()["html"]
+        assert client.get("/media/raw/assets/456/example.webp").status_code == 200
+
+        rejected = client.post(
+            "/api/chat/sessions",
+            json={"scope": "entry", "context_entry_id": "dy-456"},
+        )
+        assert rejected.status_code == 409
+        assert "只读" in rejected.json()["detail"]
+        assert service.database.list_chat_sessions() == []
+
+        managed = next(
+            item for item in library.json()["items"] if item["entry_id"] == "dy-123"
+        )
+        assert managed["database_managed"] is True
+        created = client.post(
+            "/api/chat/sessions",
+            json={"scope": "entry", "context_entry_id": "dy-123"},
+        )
+        assert created.status_code == 201
+        assert created.json()["scope"] == "entry"
 
 
 def test_web_can_favorite_and_unfavorite_an_article(tmp_path: Path) -> None:
@@ -403,6 +489,19 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "删除文章" in script.text
         assert "彻底删除" in script.text
         assert "最近一次用量：${latestAssistant.total_tokens} token" in script.text
+        assert "function isDatabaseManaged(item)" in script.text
+        assert "if (!isDatabaseManaged(item)) return null;" in script.text
+        assert "if (state.topicSelectionMode && isDatabaseManaged(item))" in script.text
+        assert "if (!isDatabaseManaged(findLibraryItem(entryId))) return;" in script.text
+        assert ".filter(isDatabaseManaged)" in script.text
+        assert "const articleChatEnabled = isDatabaseManaged(articleItem);" in script.text
+        assert "只读 Markdown，发送时使用全库对话" in script.text
+        assert "只读 Markdown 文章不能保存灵感" in script.text
+        assert "currentArticleItem: null" in script.text
+        assert "state.currentArticleItem = data.item;" in script.text
+        assert "state.currentArticleItem?.entry_id === entryId" in script.text
+        assert 'const topicsCreateButton = $("#topics-create-button");' in script.text
+        assert "topicsCreateButton.classList.toggle(\"hidden\", !hasManagedItems);" in script.text
 
 
 @pytest.mark.parametrize(
@@ -950,6 +1049,82 @@ def test_model_settings_save_to_keychain_without_changing_gateway_mode(
         tested = client.post("/api/settings/model/test", json={})
         assert tested.status_code == 200
         assert tested.json()["usage"]["total_tokens"] == 7
+
+
+def test_model_settings_rejects_remote_http_before_secret_and_saves_loopback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    config_path = tmp_path / "config.toml"
+    secrets: dict[str, str] = {}
+    monkeypatch.setattr(
+        "douyin_wiki.webapp.app.get_secret",
+        lambda account: secrets.get(account, ""),
+    )
+    monkeypatch.setattr(
+        "douyin_wiki.webapp.app.store_secret",
+        lambda account, value: secrets.__setitem__(account, value),
+    )
+    app = create_app(
+        config,
+        config_path=config_path,
+        service=service,
+        chat_provider_factory=lambda settings: ConfigurableFakeProvider(settings.model, True),
+        start_watcher=False,
+    )
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": "http://models.example/v1",
+                "model": "remote-model",
+                "api_key": "remote-secret",
+            },
+        )
+        assert rejected.status_code == 422
+        assert secrets == {}
+
+        saved = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": "http://127.0.0.1:1234/v1/",
+                "model": "local-model",
+                "api_key": None,
+            },
+        )
+        assert saved.status_code == 200
+
+    assert load_config(config_path).llm.base_url == "http://127.0.0.1:1234/v1"
+    assert secrets == {}
+
+
+def test_model_settings_validation_does_not_echo_credential_url(
+    tmp_path: Path,
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(
+        config,
+        service=service,
+        chat_provider=FakeChatProvider(),
+        start_watcher=False,
+    )
+    credential_url = "https://user:secret@models.example/v1"
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": credential_url,
+                "model": "remote-model",
+                "api_key": "body-secret",
+            },
+        )
+
+    assert rejected.status_code == 422
+    assert credential_url not in rejected.text
+    assert "user:secret" not in rejected.text
+    assert "body-secret" not in rejected.text
 
 
 def test_loopback_model_endpoint_does_not_require_api_key(tmp_path: Path, monkeypatch) -> None:

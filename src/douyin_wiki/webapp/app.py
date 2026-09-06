@@ -8,15 +8,15 @@ from contextlib import asynccontextmanager, suppress
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from watchfiles import awatch
 
@@ -27,6 +27,7 @@ from ..config import (
     default_config_path,
     llm_api_key_required,
     load_config,
+    normalize_llm_base_url,
 )
 from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
 from ..localization import label_entry_status
@@ -91,6 +92,8 @@ class SetFavoriteRequest(BaseModel):
 
 
 class ModelSettingsRequest(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     base_url: str = Field(min_length=8, max_length=2048)
     model: str = Field(min_length=1, max_length=256)
     api_key: str | None = Field(default=None, max_length=8192)
@@ -98,18 +101,7 @@ class ModelSettingsRequest(BaseModel):
     @field_validator("base_url")
     @classmethod
     def validate_base_url(cls, value: str) -> str:
-        normalized = value.strip().rstrip("/")
-        parsed = urlsplit(normalized)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-        ):
-            raise ValueError("接口地址必须是有效的 http 或 https 地址，且不能包含账号密码")
-        if any(character in normalized for character in {'"', "\\", "\r", "\n"}):
-            raise ValueError("接口地址包含不支持的字符")
-        return normalized
+        return normalize_llm_base_url(value)
 
     @field_validator("model")
     @classmethod
@@ -288,6 +280,17 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation_error(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        details = [
+            {key: value for key, value in error.items() if key not in {"input", "ctx"}}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": details})
+
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "testserver"],
@@ -656,10 +659,17 @@ def create_app(
 
     @app.post("/api/chat/sessions", status_code=201)
     async def create_session(payload: CreateSessionRequest):
-        if payload.scope == "entry" and (
-            not payload.context_entry_id or catalog.get(payload.context_entry_id) is None
-        ):
-            raise HTTPException(status_code=400, detail="文章范围对话需要有效的目标文章")
+        if payload.scope == "entry":
+            if not payload.context_entry_id:
+                raise HTTPException(status_code=400, detail="文章范围对话需要有效的目标文章")
+            item = catalog.get(payload.context_entry_id)
+            if item is None:
+                raise HTTPException(status_code=400, detail="文章范围对话需要有效的目标文章")
+            if not item.database_managed:
+                raise HTTPException(
+                    status_code=409,
+                    detail="该文章来自只读 Markdown，无法创建文章范围对话，请使用全库对话",
+                )
         if payload.scope == "topic":
             if not payload.context_topic_id:
                 raise HTTPException(status_code=400, detail="专题范围对话需要有效的目标专题")

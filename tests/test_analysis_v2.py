@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 
 import pytest
 
-from douyin_wiki.errors import JobStateError
-from douyin_wiki.models import AnalysisMode, AnalysisResult, JobStatus
+from douyin_wiki.errors import EntryNotFoundError, JobStateError
+from douyin_wiki.models import (
+    AnalysisMode,
+    AnalysisResult,
+    InspirationInput,
+    JobStatus,
+    RetentionPolicy,
+)
 from douyin_wiki.vault import encode_markdown_path
 from douyin_wiki.worker import Worker
 
@@ -263,6 +270,95 @@ async def test_reanalysis_reuses_evidence_and_is_idempotent(service, monkeypatch
     batch = service.reanalyze_all()
     assert batch["queued_job_ids"] == []
     assert entry.id in batch["skipped_entry_ids"]
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_preserves_concurrent_user_state(service, monkeypatch) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry = service.database.get_entry(completed.result["entry_id"])
+    data = service.database.get_entry_data(entry.id)
+    data["analysis"].pop("analysis_version", None)
+    service.database.upsert_entry(entry, data)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    captured_inspirations: list[str] = []
+
+    async def blocking_analyze(segments, ocr, inspirations, metadata):
+        captured_inspirations.extend(item.text for item in inspirations)
+        started.set()
+        await release.wait()
+        return AnalysisResult.model_validate(
+            analysis_payload("tutorial", {"goal": "重分析后的最新结论"})
+        )
+
+    monkeypatch.setattr(service.analysis, "analyze", blocking_analyze)
+    job = service.reanalyze_entry(entry.id)
+    processing = asyncio.create_task(Worker(service).run_once())
+    await asyncio.wait_for(started.wait(), timeout=3)
+    assert captured_inspirations == []
+
+    inspiration = InspirationInput(text="重分析期间新增的灵感")
+    service.add_inspiration(entry.id, inspiration)
+    service.set_entry_favorite(entry.id, True)
+    release.set()
+    result = await asyncio.wait_for(processing, timeout=3)
+
+    assert result.id == job.id
+    assert result.status == JobStatus.COMPLETED
+    final_entry = service.database.get_entry(entry.id)
+    final_data = service.database.get_entry_data(entry.id)
+    assert final_entry.title == "tutorial 示例"
+    assert final_entry.summary == "这是一条用于验证自适应视频知识卡片的简短摘要。"
+    assert final_entry.tags == ["测试", "tutorial"]
+    assert final_entry.inspirations == [inspiration]
+    assert final_entry.favorite is True
+    assert final_entry.retention == RetentionPolicy.KEEP
+    assert final_data["inspirations"] == [inspiration.model_dump(mode="json")]
+    assert final_data["analysis"]["content_card"]["goal"] == "重分析后的最新结论"
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_does_not_recreate_deleted_entry(service, monkeypatch) -> None:
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+    entry = service.database.get_entry(completed.result["entry_id"])
+    data = service.database.get_entry_data(entry.id)
+    data["analysis"].pop("analysis_version", None)
+    service.database.upsert_entry(entry, data)
+    source_path = service.config.vault_path / entry.source_path
+    machine_path = (
+        service.config.vault_path
+        / "wiki"
+        / ".data"
+        / "sources"
+        / f"{entry.video_id}.md"
+    )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_analyze(segments, ocr, inspirations, metadata):
+        started.set()
+        await release.wait()
+        return AnalysisResult.model_validate(
+            analysis_payload("tutorial", {"goal": "删除后不应写入"})
+        )
+
+    monkeypatch.setattr(service.analysis, "analyze", blocking_analyze)
+    job = service.reanalyze_entry(entry.id)
+    processing = asyncio.create_task(service._process_reanalysis(job))
+    await asyncio.wait_for(started.wait(), timeout=3)
+    service.trash_entry(entry.id, confirmed=True)
+    release.set()
+
+    with pytest.raises(EntryNotFoundError):
+        await asyncio.wait_for(processing, timeout=3)
+    with pytest.raises(EntryNotFoundError):
+        service.database.get_entry(entry.id)
+    assert not source_path.exists()
+    assert not machine_path.exists()
 
 
 @pytest.mark.asyncio

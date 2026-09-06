@@ -223,6 +223,39 @@ async def test_creator_inventory_selection_and_isolated_vault(creator_service) -
 
 
 @pytest.mark.asyncio
+async def test_rebuild_reports_invalid_creator_sidecar_without_clearing_database(
+    creator_service,
+) -> None:
+    service, _, _ = creator_service
+    job = service.capture_douyin_creator("https://v.douyin.com/rrcucI9W-e8/")
+    await service.process_claimed_job(service.database.claim_next_job())
+    service.set_creator_work_selection(job.id, CreatorWorkDecision.SELECTED, ordinals=[1])
+    service.set_creator_work_selection(job.id, CreatorWorkDecision.SKIPPED, ordinals=[2])
+    service.confirm_creator_import(job.id)
+    child = service.database.claim_next_job()
+    completed = await service.process_claimed_job(child)
+
+    creator = service.list_creators()[0]
+    creator_path = service.config.vault_path / creator["folder_path"] / ".data" / "creator.md"
+    creator_path.write_text(
+        "---\ntype: creator-machine-data\n---\n\n"
+        "# Machine Data\n\n```yaml\ncreator: invalid\nworks: []\n```\n",
+        encoding="utf-8",
+    )
+
+    report = service.rebuild_database_from_vault(apply=False)
+    relative_path = str(creator_path.relative_to(service.config.vault_path))
+    assert any(item["path"] == relative_path for item in report["creator_errors"])
+    with pytest.raises(Exception, match="creator_errors"):
+        service.rebuild_database_from_vault(apply=True)
+
+    assert service.database.get_entry(completed.result["entry_id"]).id == completed.result[
+        "entry_id"
+    ]
+    assert service.database.get_creator(creator["id"]).id == creator["id"]
+
+
+@pytest.mark.asyncio
 async def test_creator_inventory_returns_all_works_by_default(creator_service) -> None:
     service, adapter, _ = creator_service
     work_ids = [str(7_677_000_000_000_000_000 + index) for index in range(12)]
