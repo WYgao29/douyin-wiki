@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
@@ -137,6 +139,39 @@ class EntryRevisionChangingTopicProvider(TopicProvider):
         self.service.database.upsert_entry(changed, data)
         async for chunk in super().stream(messages):
             yield chunk
+
+
+def _start_topic_mutation_after_artifact_save(
+    service,
+    mutation,
+    original_save,
+):
+    started = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_mutation() -> None:
+        started.set()
+        try:
+            mutation()
+        except BaseException as exc:  # pragma: no cover - surfaced by the test below
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=run_mutation)
+
+    def save_with_mutation(artifact):
+        worker.start()
+        assert started.wait(timeout=2)
+        # The old implementation has no entry-operation fence here, so the
+        # mutation completes before the stale topic snapshot is persisted.
+        # The fixed implementation deliberately waits until finalization ends.
+        finished.wait(timeout=2)
+        return original_save(artifact)
+
+    service.database.save_topic_artifact = save_with_mutation
+    return worker, finished, errors
 
 
 def test_topic_search_is_filtered_before_ranking_and_source_disable_is_immediate(service) -> None:
@@ -277,6 +312,76 @@ async def test_entry_revision_changes_during_generation_mark_artifact_stale(
     assert artifact["source_revisions"][0]["updated_at"] == before["sources"][0][
         "source_revision"
     ]
+
+
+@pytest.mark.asyncio
+async def test_source_update_at_finalization_does_not_revert_vault_topic(service) -> None:
+    original = _add_entry(service, "dy-final-original", "最终化原始文章", "原始证据")
+    replacement = _add_entry(service, "dy-final-replacement", "最终化替换文章", "替换证据")
+    topic_id = service.create_topic("最终化交错专题", [original.id])["topic"]["id"]
+    original_save = service.database.save_topic_artifact
+
+    worker, finished, errors = _start_topic_mutation_after_artifact_save(
+        service,
+        lambda: service.set_topic_sources(
+            topic_id,
+            [{"entry_id": replacement.id, "enabled": True}],
+        ),
+        original_save,
+    )
+
+    artifact = await service.generate_topic_artifact(
+        topic_id,
+        "overview",
+        provider=TopicProvider(original.id),
+    )
+    worker.join(timeout=2)
+
+    assert finished.is_set()
+    assert errors == []
+    assert artifact["status"] == "current"
+    topic_index = (
+        service.config.vault_path / "topics" / topic_id / "index.md"
+    ).read_text(encoding="utf-8")
+    assert replacement.source_path.removesuffix(".md") in topic_index
+    assert original.source_path.removesuffix(".md") not in topic_index
+
+
+@pytest.mark.asyncio
+async def test_topic_delete_at_finalization_is_serialized_without_sqlite_error(service) -> None:
+    entry = _add_entry(service, "dy-final-delete", "最终化待删除专题来源", "专题证据")
+    topic_id = service.create_topic("最终化删除交错专题", [entry.id])["topic"]["id"]
+    topic_dir = service.config.vault_path / "topics" / topic_id
+    original_save = service.database.save_topic_artifact
+
+    def delete_topic() -> None:
+        with service.vault.entry_operations_locked():
+            with service.database.connect() as conn:
+                conn.execute("DELETE FROM research_topics WHERE id=?", (topic_id,))
+            shutil.rmtree(topic_dir)
+
+    worker, finished, errors = _start_topic_mutation_after_artifact_save(
+        service, delete_topic, original_save
+    )
+
+    artifact = await service.generate_topic_artifact(
+        topic_id,
+        "overview",
+        provider=TopicProvider(entry.id),
+    )
+    worker.join(timeout=2)
+
+    assert finished.is_set()
+    assert errors == []
+    assert artifact["status"] == "current"
+    with service.database.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM research_topics WHERE id=?", (topic_id,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM topic_artifacts WHERE topic_id=?", (topic_id,)
+        ).fetchone()[0] == 0
+    assert not topic_dir.exists()
 
 
 @pytest.mark.asyncio

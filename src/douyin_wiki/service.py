@@ -1180,30 +1180,31 @@ class DouyinWikiService:
         enabled_ids = {source.entry_id for source in topic.sources if source.enabled}
         if not any(entry_id in answer for entry_id in enabled_ids):
             raise ExternalToolError("专题成果缺少来源标注，未保存；请重试")
-        latest_topic = self._refresh_topic(topic_id)
-        now = utc_now()
-        artifact = TopicArtifact(
-            id=f"{kind}-{uuid.uuid4().hex[:12]}",
-            topic_id=topic.id,
-            kind=kind,
-            title=labels[kind],
-            content_markdown=answer.strip(),
-            source_revision=topic.source_revision,
-            source_revisions=revisions,
-            status=(
-                "current"
-                if latest_topic.source_revision == topic.source_revision
-                else "needs_update"
-            ),
-            model=provider.model or None,
-            prompt_tokens=usage.get("prompt_tokens"),
-            completion_tokens=usage.get("completion_tokens"),
-            total_tokens=usage.get("total_tokens"),
-            created_at=now,
-            updated_at=now,
-        )
-        artifact = self.database.save_topic_artifact(artifact)
-        self._persist_topic(latest_topic)
+        with self.vault.entry_operations_locked():
+            latest_topic = self._refresh_topic(topic_id)
+            now = utc_now()
+            artifact = TopicArtifact(
+                id=f"{kind}-{uuid.uuid4().hex[:12]}",
+                topic_id=topic.id,
+                kind=kind,
+                title=labels[kind],
+                content_markdown=answer.strip(),
+                source_revision=topic.source_revision,
+                source_revisions=revisions,
+                status=(
+                    "current"
+                    if latest_topic.source_revision == topic.source_revision
+                    else "needs_update"
+                ),
+                model=provider.model or None,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                total_tokens=usage.get("total_tokens"),
+                created_at=now,
+                updated_at=now,
+            )
+            artifact = self.database.save_topic_artifact(artifact)
+            self._persist_topic(latest_topic)
         return artifact.model_dump(mode="json")
 
     def save_topic_note(
