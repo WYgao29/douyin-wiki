@@ -1180,24 +1180,31 @@ class DouyinWikiService:
         enabled_ids = {source.entry_id for source in topic.sources if source.enabled}
         if not any(entry_id in answer for entry_id in enabled_ids):
             raise ExternalToolError("专题成果缺少来源标注，未保存；请重试")
-        now = utc_now()
-        artifact = TopicArtifact(
-            id=f"{kind}-{uuid.uuid4().hex[:12]}",
-            topic_id=topic.id,
-            kind=kind,
-            title=labels[kind],
-            content_markdown=answer.strip(),
-            source_revision=topic.source_revision,
-            source_revisions=revisions,
-            model=provider.model or None,
-            prompt_tokens=usage.get("prompt_tokens"),
-            completion_tokens=usage.get("completion_tokens"),
-            total_tokens=usage.get("total_tokens"),
-            created_at=now,
-            updated_at=now,
-        )
-        artifact = self.database.save_topic_artifact(artifact)
-        self._persist_topic(topic)
+        with self.vault.entry_operations_locked():
+            latest_topic = self._refresh_topic(topic_id)
+            now = utc_now()
+            artifact = TopicArtifact(
+                id=f"{kind}-{uuid.uuid4().hex[:12]}",
+                topic_id=topic.id,
+                kind=kind,
+                title=labels[kind],
+                content_markdown=answer.strip(),
+                source_revision=topic.source_revision,
+                source_revisions=revisions,
+                status=(
+                    "current"
+                    if latest_topic.source_revision == topic.source_revision
+                    else "needs_update"
+                ),
+                model=provider.model or None,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                total_tokens=usage.get("total_tokens"),
+                created_at=now,
+                updated_at=now,
+            )
+            artifact = self.database.save_topic_artifact(artifact)
+            self._persist_topic(latest_topic)
         return artifact.model_dump(mode="json")
 
     def save_topic_note(
@@ -2294,45 +2301,54 @@ class DouyinWikiService:
             normalized.get("contradictions", []), entry.id
         )
         validated = AnalysisResult.model_validate(normalized)
-        data = dict(current_data)
-        data["analysis"] = validated.model_dump(mode="json")
-        data["provider"] = (
-            f"agent:{artifacts.get('analysis_producer', 'gateway')}"
-            if self.config.analysis_mode == AnalysisMode.GATEWAY
-            else self.analysis.name
-        )
-        data["model"] = (
-            artifacts.get("analysis_model", "agent")
-            if self.config.analysis_mode == AnalysisMode.GATEWAY
-            else self.analysis.model
-        )
-        data["prompt_version"] = (
-            f"external:{PROMPT_VERSION}"
-            if self.config.analysis_mode == AnalysisMode.GATEWAY
-            else PROMPT_VERSION
-        )
-        updated = entry.model_copy(
-            update={
-                "title": safe_filename(validated.title),
-                "summary": validated.one_liner,
-                "tags": validated.tags,
-                "updated_at": utc_now(),
-            }
-        )
-        chunks, relations, reminders = self._prepare_entry_bundle(updated, data)
-        self._persist_entry_documents_and_bundle(
-            updated,
-            data,
-            chunks,
-            relations,
-            reminders,
-            action="reanalyze-v2",
-            log_summary=f"复用现有逐字稿与 OCR，由 {data['provider']} 生成 v2 分析",
-            commit_message=f"reanalyze-v2: {updated.video_id} {updated.title}",
-            require_existing=True,
-        )
-        source_kind = current_data.get("metadata", {}).get("source_kind", SourceKind.VIDEO.value)
-        creator_folder = str(current_data.get("creator", {}).get("folder_path") or "")
+        with self.vault.entry_operations_locked():
+            # The model call intentionally happens before this lock. Reload both
+            # projections so concurrent user mutations are merged into the
+            # final analysis write instead of being overwritten by the snapshot
+            # captured before analysis started.
+            latest_entry = self.database.get_entry(entry_id)
+            latest_data = self.database.get_entry_data(entry_id)
+            latest_data["analysis"] = validated.model_dump(mode="json")
+            latest_data["provider"] = (
+                f"agent:{artifacts.get('analysis_producer', 'gateway')}"
+                if self.config.analysis_mode == AnalysisMode.GATEWAY
+                else self.analysis.name
+            )
+            latest_data["model"] = (
+                artifacts.get("analysis_model", "agent")
+                if self.config.analysis_mode == AnalysisMode.GATEWAY
+                else self.analysis.model
+            )
+            latest_data["prompt_version"] = (
+                f"external:{PROMPT_VERSION}"
+                if self.config.analysis_mode == AnalysisMode.GATEWAY
+                else PROMPT_VERSION
+            )
+            updated = latest_entry.model_copy(
+                update={
+                    "title": safe_filename(validated.title),
+                    "summary": validated.one_liner,
+                    "tags": validated.tags,
+                    "updated_at": utc_now(),
+                }
+            )
+            chunks, relations, reminders = self._prepare_entry_bundle(updated, latest_data)
+            self._persist_entry_documents_and_bundle_locked(
+                updated,
+                latest_data,
+                chunks,
+                relations,
+                reminders,
+                action="reanalyze-v2",
+                log_summary=(
+                    f"复用现有逐字稿与 OCR，由 {latest_data['provider']} 生成 v2 分析"
+                ),
+                commit_message=f"reanalyze-v2: {updated.video_id} {updated.title}",
+            )
+            source_kind = latest_data.get("metadata", {}).get(
+                "source_kind", SourceKind.VIDEO.value
+            )
+            creator_folder = str(latest_data.get("creator", {}).get("folder_path") or "")
         return self.database.update_job(
             job.id,
             status=JobStatus.COMPLETED,
@@ -2378,7 +2394,26 @@ class DouyinWikiService:
     @asynccontextmanager
     async def _work_capture_locked(self, work_id: str):
         lock = self.vault.work_capture_locked(work_id)
-        await asyncio.to_thread(lock.__enter__)
+        acquisition = asyncio.create_task(asyncio.to_thread(lock.__enter__))
+        try:
+            await asyncio.shield(acquisition)
+        except asyncio.CancelledError:
+            # Cancellation cannot stop the executor thread.  Wait for a
+            # blocked flock to finish, then release it before propagating the
+            # cancellation so a later capture cannot inherit a leaked lock.
+            while not acquisition.done():
+                try:
+                    await asyncio.shield(acquisition)
+                except asyncio.CancelledError:
+                    continue
+            if not acquisition.cancelled():
+                try:
+                    acquisition.result()
+                except BaseException:
+                    pass
+                else:
+                    await asyncio.to_thread(lock.__exit__, None, None, None)
+            raise
         try:
             yield
         except BaseException as exc:
@@ -2411,12 +2446,11 @@ class DouyinWikiService:
         if resolved_data.get("source_kind", SourceKind.VIDEO.value) == SourceKind.IMAGE_NOTE.value:
             return await self._process_image_note_capture(job, artifacts, resolved_data)
 
-        existing = self.database.find_entry_by_video_id(video_id)
-        if existing:
-            with self.vault.entry_operations_locked():
-                # Re-read after the work lock so a preceding capture can win
-                # the first-write race and its user data is never lost.
-                existing = self.database.get_entry(existing.id)
+        with self.vault.entry_operations_locked():
+            # Re-read after the work lock so a preceding capture can win the
+            # first-write race and its user data is never lost.
+            existing = self.database.find_entry_by_video_id(video_id)
+            if existing:
                 for inspiration in request.inspirations:
                     existing = self._add_inspiration_locked(existing.id, inspiration)
                 should_reacquire = (
@@ -2828,25 +2862,27 @@ class DouyinWikiService:
         """Process a static image work without invoking any video-only adapter."""
         request = job.request
         work_id = str(resolved_data["video_id"])
-        existing = self.database.find_entry_by_video_id(work_id)
-        if existing:
-            for inspiration in request.inspirations:
-                existing = self.add_inspiration(existing.id, inspiration)
-            existing_data = self.database.get_entry_data(existing.id)
-            if self._image_note_files_intact(existing_data):
-                existing = self._repair_entry_if_needed(existing)
-                return self.database.update_job(
-                    job.id,
-                    status=JobStatus.COMPLETED,
-                    progress=1,
-                    result={
-                        "entry_id": existing.id,
-                        "duplicate": True,
-                        "source_kind": SourceKind.IMAGE_NOTE.value,
-                        "source_path": existing.source_path,
-                    },
-                    unlock=True,
-                )
+        with self.vault.entry_operations_locked():
+            # The work lock makes this re-read authoritative for a waiter.
+            existing = self.database.find_entry_by_video_id(work_id)
+            if existing:
+                for inspiration in request.inspirations:
+                    existing = self._add_inspiration_locked(existing.id, inspiration)
+                existing_data = self.database.get_entry_data(existing.id)
+                if self._image_note_files_intact(existing_data):
+                    existing = self._repair_entry_if_needed_locked(existing)
+                    return self.database.update_job(
+                        job.id,
+                        status=JobStatus.COMPLETED,
+                        progress=1,
+                        result={
+                            "entry_id": existing.id,
+                            "duplicate": True,
+                            "source_kind": SourceKind.IMAGE_NOTE.value,
+                            "source_path": existing.source_path,
+                        },
+                        unlock=True,
+                    )
         effective_inspirations = existing.inspirations if existing else request.inspirations
 
         creator_context = artifacts.get("creator_context") or {}
@@ -3279,18 +3315,42 @@ class DouyinWikiService:
     ) -> EntryRecord:
         """Commit one entry mutation under the cross-process operation lock."""
         with self.vault.entry_operations_locked():
-            if require_existing:
-                self.database.get_entry(entry.id)
-            self._write_entry_documents(
+            return self._persist_entry_documents_and_bundle_locked(
                 entry,
                 data,
+                chunks,
+                relations,
+                reminders,
                 action=action,
                 log_summary=log_summary,
                 commit_message=commit_message,
+                require_existing=require_existing,
             )
-            return self.database.persist_entry_bundle(
-                entry, data, chunks, relations, reminders
-            )
+
+    def _persist_entry_documents_and_bundle_locked(
+        self,
+        entry: EntryRecord,
+        data: dict[str, Any],
+        chunks: list[dict[str, Any]],
+        relations: list[dict[str, Any]],
+        reminders: list[ReminderCandidate],
+        *,
+        action: str,
+        log_summary: str,
+        commit_message: str,
+        require_existing: bool = False,
+    ) -> EntryRecord:
+        """Persist an entry while the caller already owns the operation lock."""
+        if require_existing:
+            self.database.get_entry(entry.id)
+        self._write_entry_documents(
+            entry,
+            data,
+            action=action,
+            log_summary=log_summary,
+            commit_message=commit_message,
+        )
+        return self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
 
     def _persist_creator_avatar(self, inventory: CreatorInventoryResult, folder_path: str):
         source_value = inventory.profile.avatar_path
@@ -3531,56 +3591,220 @@ class DouyinWikiService:
         loaded = self.vault.load_entries()
         loaded_creators = self.vault.load_creators()
         loaded_topics = self.vault.load_topics()
-        report = {
-            "dry_run": not apply,
-            "entry_count": len(loaded),
-            "entry_ids": [entry.id for entry, _ in loaded],
-            "creator_count": len(loaded_creators),
-            "creator_ids": [creator.id for creator, _ in loaded_creators],
-            "topic_count": len(loaded_topics),
-            "topic_ids": [topic.id for topic, _ in loaded_topics],
-            "entry_errors": list(self.vault.last_entry_load_errors),
-        }
-        if not apply:
-            return report
-        if self.vault.last_entry_load_errors:
-            raise JobStateError(
-                "Vault 中存在无法解析的资料；请根据 dry-run 的 entry_errors 修复后再重建"
+        entry_ids = [entry.id for entry, _ in loaded]
+        entry_id_set = set(entry_ids)
+
+        def entry_sidecar_path(entry: EntryRecord, data: dict[str, Any]) -> Path:
+            creator_folder = str(data.get("creator", {}).get("folder_path") or "")
+            return self.config.vault_path / (
+                Path(creator_folder) / ".data" / "sources" / f"{entry.video_id}.md"
+                if creator_folder
+                else Path("wiki") / ".data" / "sources" / f"{entry.video_id}.md"
             )
-        if self.database.has_unfinished_creator_jobs():
-            raise JobStateError("存在未完成的博主清点或批量任务，完成后再重建 SQLite")
+
+        def creator_sidecar_path(creator) -> Path:
+            return self.config.vault_path / creator.folder_path / ".data" / "creator.md"
+
+        def topic_sidecar_path(topic: ResearchTopic) -> Path:
+            return self.config.vault_path / "topics" / topic.id / ".data" / "topic.md"
+
+        def append_error(collection: list[dict[str, str]], path: Path, message: str) -> None:
+            self.vault._append_load_error(collection, path, ValueError(message))
+
+        for index, entry_id in enumerate(entry_ids):
+            if entry_id in entry_ids[:index]:
+                entry, data = loaded[index]
+                append_error(
+                    self.vault.last_entry_load_errors,
+                    entry_sidecar_path(entry, data),
+                    f"重复 entry.id：{entry_id}",
+                )
+
         prepared: list[
             tuple[
                 EntryRecord,
                 dict[str, Any],
                 list[dict[str, Any]],
+                list[dict[str, Any]],
                 list[ReminderCandidate],
             ]
         ] = []
-        self.database.clear_knowledge_cache(include_creators=True)
-        # Insert base entries first so relation foreign keys can be restored in pass two.
         for entry, data in loaded:
-            self.database.upsert_entry(entry, data)
-            chunks = self.indexer.index_entry(entry, data, persist=False)
-            reminders = [
-                ReminderCandidate.model_validate(item)
-                for item in data.get("analysis", {}).get("reminders", [])
-            ]
-            prepared.append((entry, data, chunks, reminders))
-        for entry, data, chunks, reminders in prepared:
-            relations = []
-            for relation in data.get("relations", []):
-                try:
-                    self.database.get_entry(relation["target_entry_id"])
-                except (EntryNotFoundError, KeyError):
-                    continue
-                relations.append(relation)
-            self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
+            sidecar_path = entry_sidecar_path(entry, data)
+            try:
+                chunks = self.indexer.index_entry(entry, data, persist=False)
+            except Exception as exc:
+                self.vault._append_load_error(
+                    self.vault.last_entry_load_errors, sidecar_path, exc
+                )
+                chunks = []
+
+            raw_relations = data.get("relations", [])
+            relations: list[dict[str, Any]] = []
+            if not isinstance(raw_relations, list):
+                append_error(
+                    self.vault.last_entry_load_errors,
+                    sidecar_path,
+                    "relations 必须是数组",
+                )
+            else:
+                for relation in raw_relations:
+                    if not isinstance(relation, dict):
+                        append_error(
+                            self.vault.last_entry_load_errors,
+                            sidecar_path,
+                            "relations 中每项必须是对象",
+                        )
+                        continue
+                    target_id = relation.get("target_entry_id")
+                    if target_id not in entry_id_set or target_id == entry.id:
+                        append_error(
+                            self.vault.last_entry_load_errors,
+                            sidecar_path,
+                            f"关系目标不存在：{target_id}",
+                        )
+                        continue
+                    try:
+                        confidence = float(relation.get("confidence", 0))
+                    except (TypeError, ValueError) as exc:
+                        self.vault._append_load_error(
+                            self.vault.last_entry_load_errors, sidecar_path, exc
+                        )
+                        continue
+                    if not 0 <= confidence <= 1:
+                        append_error(
+                            self.vault.last_entry_load_errors,
+                            sidecar_path,
+                            f"关系 confidence 超出范围：{confidence}",
+                        )
+                        continue
+                    relations.append(relation)
+
+            reminders: list[ReminderCandidate] = []
+            raw_reminders = data.get("analysis", {}).get("reminders", [])
+            if not isinstance(raw_reminders, list):
+                append_error(
+                    self.vault.last_entry_load_errors,
+                    sidecar_path,
+                    "analysis.reminders 必须是数组",
+                )
+            else:
+                for reminder in raw_reminders:
+                    try:
+                        candidate = ReminderCandidate.model_validate(reminder)
+                        self.vault._safe_id(candidate.id, field="reminder.id")
+                        reminders.append(candidate)
+                    except Exception as exc:
+                        self.vault._append_load_error(
+                            self.vault.last_entry_load_errors, sidecar_path, exc
+                        )
+            raw_reminder_states = data.get("reminder_states", [])
+            if not isinstance(raw_reminder_states, list):
+                append_error(
+                    self.vault.last_entry_load_errors,
+                    sidecar_path,
+                    "reminder_states 必须是数组",
+                )
+            else:
+                for state in raw_reminder_states:
+                    if not isinstance(state, dict) or not isinstance(state.get("id"), str):
+                        append_error(
+                            self.vault.last_entry_load_errors,
+                            sidecar_path,
+                            "reminder_states 中每项必须包含字符串 id",
+                        )
+                    elif state.get("status") not in {"candidate", "creating", "created"}:
+                        append_error(
+                            self.vault.last_entry_load_errors,
+                            sidecar_path,
+                            f"reminder 状态无效：{state.get('status')}",
+                        )
+                    else:
+                        try:
+                            self.vault._safe_id(state["id"], field="reminder_state.id")
+                        except Exception as exc:
+                            self.vault._append_load_error(
+                                self.vault.last_entry_load_errors, sidecar_path, exc
+                            )
+            prepared.append((entry, data, chunks, relations, reminders))
+
         for creator, works in loaded_creators:
-            self.database.restore_creator_bundle(creator, works)
+            sidecar_path = creator_sidecar_path(creator)
+            for work in works:
+                if work.entry_id and work.entry_id not in entry_id_set:
+                    append_error(
+                        self.vault.last_creator_load_errors,
+                        sidecar_path,
+                        f"作品关联资料不存在：{work.entry_id}",
+                    )
+
         for topic, artifacts in loaded_topics:
-            self.database.restore_topic_bundle(topic, artifacts)
-        self.indexer.record_embedding_signature()
+            sidecar_path = topic_sidecar_path(topic)
+            for source in topic.sources:
+                if source.entry_id not in entry_id_set:
+                    append_error(
+                        self.vault.last_topic_load_errors,
+                        sidecar_path,
+                        f"专题来源资料不存在：{source.entry_id}",
+                    )
+            for artifact in artifacts:
+                artifact_path = (
+                    self.config.vault_path
+                    / "topics"
+                    / topic.id
+                    / "artifacts"
+                    / f"{artifact.id}.md"
+                )
+                if artifact.topic_id != topic.id:
+                    append_error(
+                        self.vault.last_artifact_load_errors,
+                        artifact_path,
+                        "artifact.topic_id 与 topic.id 不一致",
+                    )
+                for revision in artifact.source_revisions:
+                    if revision.entry_id not in entry_id_set:
+                        append_error(
+                            self.vault.last_artifact_load_errors,
+                            artifact_path,
+                            f"成果关联资料不存在：{revision.entry_id}",
+                        )
+
+        report = {
+            "dry_run": not apply,
+            "entry_count": len(loaded),
+            "entry_ids": entry_ids,
+            "creator_count": len(loaded_creators),
+            "creator_ids": [creator.id for creator, _ in loaded_creators],
+            "topic_count": len(loaded_topics),
+            "topic_ids": [topic.id for topic, _ in loaded_topics],
+            "entry_errors": list(self.vault.last_entry_load_errors),
+            "creator_errors": list(self.vault.last_creator_load_errors),
+            "topic_errors": list(self.vault.last_topic_load_errors),
+            "artifact_errors": list(self.vault.last_artifact_load_errors),
+        }
+        embedding_signature = self.indexer.embeddings.signature()
+        if (
+            self.vault.last_entry_load_errors
+            or self.vault.last_creator_load_errors
+            or self.vault.last_topic_load_errors
+            or self.vault.last_artifact_load_errors
+        ):
+            if not apply:
+                return report
+            raise JobStateError(
+                "Vault 中存在无法解析的资料；请根据 dry-run 的 entry_errors、"
+                "creator_errors、topic_errors、artifact_errors 修复后再重建"
+            )
+        if not apply:
+            return report
+        if self.database.has_unfinished_creator_jobs():
+            raise JobStateError("存在未完成的博主清点或批量任务，完成后再重建 SQLite")
+        self.database.replace_knowledge_cache(
+            entries=prepared,
+            creators=loaded_creators,
+            topics=loaded_topics,
+            embedding_signature=embedding_signature,
+        )
         return {**report, "dry_run": False, "status": "rebuilt"}
 
     def run_maintenance(self, *, apply: bool = False) -> dict[str, Any]:

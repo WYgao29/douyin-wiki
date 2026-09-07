@@ -76,6 +76,7 @@ class LibraryCatalog:
         self.vault_path = vault_path.expanduser().resolve()
         self.database = database
         self._items: dict[str, LibraryItem] = {}
+        self._load_errors: list[dict[str, str]] = []
         self._fingerprint: tuple[tuple[str, int, int], ...] = ()
         self._version = 0
         self._lock = threading.RLock()
@@ -89,6 +90,11 @@ class LibraryCatalog:
     def fingerprint(self) -> tuple[tuple[str, int, int], ...]:
         with self._lock:
             return self._fingerprint
+
+    @property
+    def load_errors(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [dict(error) for error in self._load_errors]
 
     @property
     def watch_roots(self) -> list[Path]:
@@ -109,8 +115,18 @@ class LibraryCatalog:
             candidates.extend(creators.glob("*/sources/*.md"))
 
         items: dict[str, LibraryItem] = {}
+        load_errors: list[dict[str, str]] = []
         for path in sorted(candidates):
-            item = self._read_item(path, db_entries)
+            try:
+                item = self._read_item(path, db_entries)
+            except Exception as exc:
+                load_errors.append(
+                    {
+                        "path": str(path.relative_to(self.vault_path)),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
             if item is None:
                 continue
             previous = items.get(item.entry_id)
@@ -121,6 +137,7 @@ class LibraryCatalog:
                 items[item.entry_id] = item
         with self._lock:
             self._items = items
+            self._load_errors = load_errors
             self._fingerprint = self.compute_fingerprint()
             self._version += 1
             return list(items.values())
@@ -192,11 +209,8 @@ class LibraryCatalog:
         return result
 
     def _read_item(self, path: Path, db_entries: dict[str, Any]) -> LibraryItem | None:
-        try:
-            text = path.read_text(encoding="utf-8")
-            frontmatter, body = split_frontmatter(text)
-        except (OSError, UnicodeError, yaml.YAMLError):
-            return None
+        text = path.read_text(encoding="utf-8")
+        frontmatter, body = split_frontmatter(text)
         if frontmatter.get("type") not in {None, "source"}:
             return None
         work_id = str(frontmatter.get("video_id") or "").strip()
@@ -204,6 +218,8 @@ class LibraryCatalog:
             match = re.search(r"(?<!\d)(\d{12,22})(?!\d)", path.stem)
             work_id = match.group(1) if match else ""
         if not work_id:
+            if frontmatter.get("type") == "source":
+                raise ValueError("source Markdown 缺少 video_id")
             return None
         entry = db_entries.get(work_id)
         entry_id = entry.id if entry else f"dy-{work_id}"
@@ -232,6 +248,7 @@ class LibraryCatalog:
         )
         return LibraryItem(
             entry_id=entry_id,
+            database_managed=entry is not None,
             work_id=work_id,
             title=title,
             author=author,

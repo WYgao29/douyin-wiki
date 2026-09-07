@@ -650,6 +650,7 @@ class Evidence(BaseModel):
 
 class LibraryItem(BaseModel):
     entry_id: str
+    database_managed: bool = True
     work_id: str
     title: str
     author: str = "未知作者"

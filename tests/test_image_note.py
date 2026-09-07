@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -95,6 +96,21 @@ class NoteDownloader:
         )
 
 
+class BlockingNoteDownloader(NoteDownloader):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def download(self, url: str, work_id: str, target_dir: Path) -> VideoMetadata:
+        self.entered += 1
+        if self.entered == 1:
+            self.started.set()
+            await self.release.wait()
+        return await super().download(url, work_id, target_dir)
+
+
 class InspectingAuthGuidanceLauncher:
     def __init__(self, database) -> None:
         self.database = database
@@ -178,6 +194,21 @@ class NoteAnalysis(AnalysisProvider):
             ],
             tags=["本地模型", "量化"],
         )
+
+
+class CountingNoteAnalysis(NoteAnalysis):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def analyze(
+        self,
+        segments: list[TranscriptSegment],
+        ocr: list[OCRObservation],
+        inspirations: list[InspirationInput],
+        metadata: dict,
+    ) -> AnalysisResult:
+        self.calls += 1
+        return await super().analyze(segments, ocr, inspirations, metadata)
 
 
 def make_service(
@@ -310,6 +341,46 @@ async def test_duplicate_note_reuses_images_but_reacquires_missing_file(tmp_path
         "灵感一",
         "灵感二",
     ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_capture_serializes_image_note_pipeline_and_merges_inspirations(
+    tmp_path: Path,
+) -> None:
+    downloader = BlockingNoteDownloader()
+    service = make_service(tmp_path, note_downloader=downloader)
+    analysis = CountingNoteAnalysis()
+    service.analysis = analysis
+    first_job = service.capture_douyin(
+        "https://v.douyin.com/oH4K0gee_Ok/", [InspirationInput(text="一")]
+    )
+    second_job = service.capture_douyin(
+        "https://v.douyin.com/oH4K0gee_Ok/", [InspirationInput(text="二")]
+    )
+    first_claimed = service.database.claim_next_job(worker_id="worker-one")
+    second_claimed = service.database.claim_next_job(worker_id="worker-two")
+    assert first_claimed and first_claimed.id == first_job.id
+    assert second_claimed and second_claimed.id == second_job.id
+
+    first_task = asyncio.create_task(service.process_claimed_job(first_claimed))
+    await downloader.started.wait()
+    second_task = asyncio.create_task(service.process_claimed_job(second_claimed))
+    ticks = 0
+    for _ in range(20):
+        await asyncio.sleep(0)
+        ticks += 1
+    assert ticks > 0
+    assert downloader.entered == 1
+    downloader.release.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first.status == JobStatus.COMPLETED
+    assert second.status == JobStatus.COMPLETED
+    assert downloader.calls == 1
+    assert analysis.calls == 1
+    entry = service.database.get_entry(first.result["entry_id"])
+    assert {item.text for item in entry.inspirations} == {"一", "二"}
+    assert any(job.result.get("duplicate") for job in (first, second))
 
 
 @pytest.mark.asyncio

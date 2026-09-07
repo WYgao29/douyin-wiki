@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .models import AnalysisMode
 
@@ -19,13 +19,38 @@ def default_config_path() -> Path:
     return Path.home() / "Library" / "Application Support" / "douyin-wiki" / "config.toml"
 
 
+def normalize_llm_base_url(value: str) -> str:
+    candidate = value.strip()
+    parsed = urlsplit(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("模型接口必须是有效的 HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or "#" in candidate:
+        raise ValueError("模型接口不能包含凭据或 URL 片段")
+    loopback = parsed.hostname.lower() == "localhost"
+    if not loopback:
+        try:
+            loopback = ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            loopback = False
+    if parsed.scheme == "http" and not loopback:
+        raise ValueError("非本机模型接口必须使用 HTTPS")
+    return candidate.rstrip("/")
+
+
 class LLMSettings(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     enabled: bool = True
     base_url: str = "https://api.openai.com/v1"
     model: str = ""
     api_key_env: str = "DOUYIN_WIKI_LLM_API_KEY"
     timeout_seconds: float = 120
     max_retries: int = 2
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def normalize_base_url(cls, value: str) -> str:
+        return normalize_llm_base_url(value)
 
 
 class EmbeddingSettings(BaseModel):
@@ -76,6 +101,8 @@ class WebSettings(BaseModel):
 
 
 class AppConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     vault_path: Path = Path.home() / "Documents" / "Obsidian" / "抖库"
     timezone: str = "Asia/Shanghai"
     analysis_mode: AnalysisMode = AnalysisMode.GATEWAY
