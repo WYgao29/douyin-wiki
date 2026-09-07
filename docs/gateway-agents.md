@@ -179,9 +179,9 @@ token，获得用户明确同意后才能调用 `approve_job`。超过 2 小时�
 空轮询不消耗模型 token；只有出现可操作事件时才唤醒 Agent。Hermes 的定时任务与投递能力见
 [Hermes Cron 文档](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron/)。
 
-仓库提供了 `scripts/hermes_event_monitor.py`。部署到 Hermes 后，可把它配置为 cron 的
-`--monitor-script`；它在没有未确认事件时不输出任何内容。Hermes 会对输出做变更检测，未变化时
-不会启动 Agent。当前机器可用以下命令检查已部署任务：
+Hermes 的 cron 配置可直接调用抖库 CLI 的监控命令：
+`uv run douyin-wiki gateway monitor-events`（请在项目根目录执行）。它在没有未确认事件时不输出任何内容。
+Hermes 会对输出做变更检测，未变化时不会启动 Agent。当前机器可用以下命令检查已部署任务：
 
 ```bash
 hermes mcp test douyin-wiki
