@@ -194,7 +194,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--color-primary); 
 .app-shell.is-sidebar-collapsed.is-chat-collapsed { grid-template-columns: 0 minmax(540px, 1fr) 0; }
 .app-shell.is-sidebar-collapsed .library-sidebar, .app-shell.is-chat-collapsed .chat-panel { visibility: hidden; overflow: hidden; }
 .library-sidebar, .chat-panel { min-width: 0; background: var(--glass-canvas); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); }
-.library-sidebar { display: flex; flex-direction: column; border-right: 1px solid var(--color-border-subtle); padding: var(--space-4) var(--space-3); overflow: hidden auto; }
+.library-sidebar { position: relative; z-index: 0; display: flex; flex-direction: column; border-right: 1px solid var(--color-border-subtle); padding: var(--space-4) var(--space-3); overflow: hidden auto; }
 .sidebar-brand-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); margin-bottom: var(--space-5); padding: 0 var(--space-1); }
 .brand { display: flex; min-width: 0; align-items: center; gap: var(--space-3); color: var(--color-text-primary); text-decoration: none; }
 .brand-mark { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; overflow: hidden; border-radius: 10px; background: #000000; box-shadow: 0 2px 8px rgba(0, 0, 0, .22), inset 0 0 0 .5px rgba(255, 255, 255, .12); }
@@ -252,7 +252,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--color-primary); 
 .settings-nav-link:hover { background: var(--color-surface-hover); color: var(--color-text-primary); }
 .sidebar-version { padding: var(--space-2); color: var(--color-text-disabled); font-size: var(--text-xs); }
 
-.library-main { min-width: 0; overflow: auto; background: var(--color-canvas); }
+.library-main { position: relative; z-index: 1; min-width: 0; overflow: auto; background: var(--color-canvas); }
 .topbar { position: sticky; z-index: 20; top: 0; display: flex; min-height: var(--toolbar-height); align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-6); border-bottom: 1px solid var(--color-border-subtle); background: var(--glass-canvas); -webkit-backdrop-filter: var(--glass-blur); backdrop-filter: var(--glass-blur); }
 .mobile-nav-button, .sidebar-restore-button { display: none; }
 .app-shell.is-sidebar-collapsed .sidebar-restore-button { display: inline-grid; }
@@ -271,7 +271,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--color-primary); 
 .segmented-control { display: inline-flex; padding: 2px; border: 1px solid var(--color-border-subtle); border-radius: var(--radius-md); background: var(--color-surface-hover); }
 .segmented-control button { display: inline-grid; width: 32px; height: 30px; place-items: center; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--color-text-tertiary); transition: background var(--duration-fast) var(--ease-standard), box-shadow var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard); }
 .segmented-control button[aria-pressed="true"] { background: var(--color-surface); color: var(--color-text-primary); box-shadow: 0 1px 3px rgba(0, 0, 0, .1), 0 0 0 .5px rgba(0, 0, 0, .02); }
-.filter-popover { position: absolute; z-index: 50; top: calc(100% + var(--space-2)); right: 0; display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(620px, calc(100vh - 84px)); flex-direction: column; border: 1px solid var(--color-border-default); border-radius: var(--radius-lg); background: var(--color-surface); box-shadow: var(--shadow-popover); }
+.filter-popover { position: fixed; z-index: 50; top: var(--filter-popover-top, calc(var(--toolbar-height) + var(--space-2))); right: auto; left: var(--filter-popover-left, var(--space-4)); display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(620px, calc(100vh - 84px)); flex-direction: column; border: 1px solid var(--color-border-default); border-radius: var(--radius-lg); background: var(--color-surface); box-shadow: var(--shadow-popover); }
 .filter-popover > header, .filter-popover > footer { display: flex; align-items: center; justify-content: space-between; padding: var(--space-3) var(--space-4); }
 .filter-popover > header { border-bottom: 1px solid var(--color-border-subtle); }
 .filter-popover > header strong, .filter-popover > header span { display: block; }

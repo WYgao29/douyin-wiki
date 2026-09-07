@@ -1371,7 +1371,24 @@ async function openArticle(entryId, push = true, transitionSource = null, citati
   }
 }
 
+function positionFilterPopover() {
+  const toggle = $("#filter-toggle");
+  const popover = $("#filter-popover");
+  if (!toggle || !popover) return;
+  const rect = toggle.getBoundingClientRect();
+  const viewportPadding = 16;
+  const gap = 8;
+  const width = Math.min(380, Math.max(0, window.innerWidth - viewportPadding * 2));
+  const left = Math.max(
+    viewportPadding,
+    Math.min(rect.right - width, window.innerWidth - width - viewportPadding),
+  );
+  popover.style.setProperty("--filter-popover-top", `${rect.bottom + gap}px`);
+  popover.style.setProperty("--filter-popover-left", `${left}px`);
+}
+
 function openFilterPopover(focusTags = false) {
+  positionFilterPopover();
   $("#filter-popover").classList.remove("hidden");
   $("#filter-toggle").setAttribute("aria-expanded", "true");
   window.setTimeout(() => {
@@ -1393,6 +1410,7 @@ function renderPanelState() {
   shell.classList.toggle("is-chat-collapsed", desktopChat && state.chatCollapsed);
   $("#chat-restore").classList.toggle("hidden", !desktopChat || !state.chatCollapsed);
   $("#chat-toggle").setAttribute("aria-expanded", String(desktopChat ? !state.chatCollapsed : state.activeDrawer === "chat"));
+  if (!$("#filter-popover").classList.contains("hidden")) positionFilterPopover();
 }
 
 function setSidebarOpen(open) {

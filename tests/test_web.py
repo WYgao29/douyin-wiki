@@ -504,6 +504,26 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "topicsCreateButton.classList.toggle(\"hidden\", !hasManagedItems);" in script.text
 
 
+def test_web_filter_popover_can_paint_above_sidebar(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        stylesheet = client.get("/static/app.css")
+        script = client.get("/static/app.js")
+
+    assert stylesheet.status_code == 200
+    assert ".library-sidebar { position: relative; z-index: 0;" in stylesheet.text
+    assert ".library-main { position: relative; z-index: 1; min-width: 0;" in stylesheet.text
+    assert (
+        ".filter-popover { position: fixed; z-index: 50; "
+        "top: var(--filter-popover-top"
+    ) in stylesheet.text
+
+    assert script.status_code == 200
+    assert "function positionFilterPopover()" in script.text
+
+
 @pytest.mark.parametrize(
     "share_text",
     [
