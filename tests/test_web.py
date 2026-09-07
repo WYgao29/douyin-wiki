@@ -10,12 +10,12 @@ from time import monotonic, sleep
 import pytest
 from fastapi.testclient import TestClient
 
-from douyin_wiki.config import AppConfig, load_config
+from douyin_wiki.config import AppConfig, LLMSettings, load_config
 from douyin_wiki.errors import EntryNotFoundError
 from douyin_wiki.models import EntryRecord, InspirationInput, JobStatus, RetentionPolicy
 from douyin_wiki.service import DouyinWikiService
 from douyin_wiki.webapp.app import create_app
-from douyin_wiki.webapp.chat import ChatChunk
+from douyin_wiki.webapp.chat import ChatChunk, OpenAICompatibleChatProvider
 
 
 class FakeChatProvider:
@@ -891,7 +891,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.1.7" in page.text
+        assert "/static/model-settings.js?v=0.1.8" in page.text
         assert "settings-info-panel" not in page.text
 
 
@@ -1165,6 +1165,42 @@ def test_loopback_model_endpoint_does_not_require_api_key(tmp_path: Path, monkey
         assert status["configured"] is True
         assert status["api_key_required"] is False
         assert status["api_key_source"] == "本机接口无需密钥"
+
+
+def test_loopback_model_provider_forwards_configured_api_key(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.webapp.chat.get_secret", lambda _: "omlx-local-key")
+
+    provider = OpenAICompatibleChatProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="Qwen3.6-35B-A3B-4bit",
+        )
+    )
+
+    assert provider.configured is True
+    assert provider.api_key == "omlx-local-key"
+
+
+def test_loopback_model_status_reports_configured_api_key_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    local_config = config.model_copy(
+        update={
+            "llm": config.llm.model_copy(
+                update={"base_url": "http://127.0.0.1:8000/v1", "model": "local-model"}
+            )
+        }
+    )
+    monkeypatch.setattr("douyin_wiki.webapp.app.get_secret", lambda _: "omlx-local-key")
+    monkeypatch.setattr("douyin_wiki.webapp.chat.get_secret", lambda _: "omlx-local-key")
+    app = create_app(local_config, service=service, start_watcher=False)
+
+    with TestClient(app) as client:
+        status = client.get("/api/settings/model").json()
+        assert status["api_key_configured"] is True
+        assert status["api_key_required"] is False
+        assert status["api_key_source"] == "macOS Keychain"
 
 
 def test_switching_cloud_endpoint_requires_a_new_provider_key(tmp_path: Path, monkeypatch) -> None:

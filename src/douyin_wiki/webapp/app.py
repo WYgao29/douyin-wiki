@@ -40,7 +40,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.7"
+WEB_VERSION = "0.1.8"
 
 
 class CaptureSubmissionRequest(BaseModel):
@@ -846,12 +846,12 @@ def create_app(
             "api_key_configured": key_present,
             "api_key_required": key_required,
             "api_key_source": (
-                "本机接口无需密钥"
-                if not key_required
-                else "环境变量"
+                "环境变量"
                 if os.environ.get(current_config.llm.api_key_env)
                 else "macOS Keychain"
                 if key_present
+                else "本机接口无需密钥"
+                if not key_required
                 else "未配置"
             ),
             "configured": current_provider.configured,

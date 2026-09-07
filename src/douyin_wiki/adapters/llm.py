@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from ..config import LLMSettings, llm_api_key_required, llm_is_configured
+from ..config import LLMSettings, llm_is_configured
 from ..errors import ExternalToolError, ModelConfigurationError
 from ..models import (
     AnalysisResult,
@@ -49,7 +49,10 @@ class OpenAICompatibleProvider(AnalysisProvider):
         self.settings = settings
         self.model = settings.model
         stored_key = get_secret(settings.api_key_env)
-        self.api_key = stored_key if llm_api_key_required(settings.base_url) else ""
+        # Loopback servers may be unauthenticated (for example LM Studio/Ollama),
+        # but some local servers such as OMLX still require an API key. Preserve a
+        # configured key while allowing local endpoints to work without one.
+        self.api_key = stored_key
         self.configured = llm_is_configured(settings, self.api_key)
         self.last_usage: dict[str, int] = {}
 

@@ -1118,3 +1118,13 @@ def test_provider_mode_allows_loopback_endpoint_without_api_key(monkeypatch) -> 
 
     assert provider.configured is True
     assert provider.api_key == ""
+
+
+def test_provider_mode_forwards_configured_loopback_api_key(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "omlx-local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="local-model")
+    )
+
+    assert provider.configured is True
+    assert provider.api_key == "omlx-local-key"

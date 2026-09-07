@@ -54,10 +54,10 @@ function renderStatus(settings) {
     ? `${settings.model} · ${settings.base_url}`
     : "填写接口和模型名称；云端服务还需要对应的 API Key。";
   const key = $("#key-status");
-  key.textContent = !settings.api_key_required
-    ? "本机接口无需密钥"
-    : settings.api_key_configured
+  key.textContent = settings.api_key_configured
     ? `已保存 · ${settings.api_key_source}`
+    : !settings.api_key_required
+    ? "本机接口无需密钥"
     : "尚未保存";
   key.classList.toggle("ready", !settings.api_key_required || settings.api_key_configured);
 }
