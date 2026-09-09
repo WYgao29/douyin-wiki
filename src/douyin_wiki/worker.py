@@ -34,6 +34,7 @@ class Worker:
 
     async def run_once(self):
         self.service.database.recover_expired_jobs()
+        self.service.favorites.refresh_all()
         job = self.service.database.claim_next_job(
             worker_id=self.worker_id,
             lease_seconds=self.service.config.worker.lease_seconds,
@@ -44,6 +45,7 @@ class Worker:
 
     async def run_forever(self) -> None:
         self.service.database.recover_expired_jobs()
+        self.service.favorites.refresh_all()
         try:
             self.run_due_maintenance()
         except Exception as exc:  # Maintenance must not block capture queue availability.
@@ -68,6 +70,7 @@ class Worker:
                 sys.stderr.write("抖库代码已更新，Worker 正在退出并由 LaunchAgent 重启。\n")
                 return
             self.service.database.recover_expired_jobs()
+            self.service.favorites.refresh_all()
             while len(running) < self.max_parallel_jobs:
                 job = self.service.database.claim_next_job(
                     worker_id=self.worker_id,

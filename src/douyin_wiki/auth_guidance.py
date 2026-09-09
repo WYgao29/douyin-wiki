@@ -17,7 +17,7 @@ from .config import AuthGuidanceSettings
 from .errors import BrowserAuthRequiredError, JobStateError
 from .models import AuthCheckResult, JobStatus
 
-AuthScope = Literal["video", "image_note", "creator"]
+AuthScope = Literal["video", "image_note", "creator", "favorites"]
 AuthChannel = Literal["video", "douyin"]
 
 AUTH_DIALOG_SCRIPT = """
@@ -79,8 +79,12 @@ class MacOSDialog:
             label = "图文与博主"
             image_count = affected_counts.get("image_note", 0)
             creator_count = affected_counts.get("creator", 0)
-            total = image_count + creator_count
+            favorites_count = affected_counts.get("favorites", 0)
+            total = image_count + creator_count + favorites_count
             detail = f"图文 {image_count} 个，博主 {creator_count} 个"
+            if favorites_count:
+                label = "图文、博主与收藏"
+                detail += f"，收藏 {favorites_count} 个"
         else:
             return False
         result = self.runner(
@@ -153,7 +157,7 @@ class SubprocessAuthGuidanceLauncher:
         if (
             not self.settings.enabled
             or self.platform_name != "darwin"
-            or scope not in {"video", "image_note", "creator"}
+            or scope not in {"video", "image_note", "creator", "favorites"}
             or re.fullmatch(r"[0-9a-f]{32}", trigger_job_id) is None
         ):
             return False
@@ -212,7 +216,7 @@ class AuthGuidanceService(Protocol):
 def auth_channel(scope: str) -> AuthChannel:
     if scope == "video":
         return "video"
-    if scope in {"image_note", "creator"}:
+    if scope in {"image_note", "creator", "favorites"}:
         return "douyin"
     raise ValueError(f"不支持的授权范围：{scope}")
 
@@ -309,7 +313,7 @@ class AuthGuidanceCoordinator:
         return ready
 
     def _affected_jobs(self, channel: AuthChannel):
-        scopes = {"video"} if channel == "video" else {"image_note", "creator"}
+        scopes = {"video"} if channel == "video" else {"image_note", "creator", "favorites"}
         return [
             job
             for job in self.service.database.list_jobs(
@@ -321,11 +325,13 @@ class AuthGuidanceCoordinator:
 
     @staticmethod
     def _affected_counts(jobs, channel: AuthChannel) -> dict[str, int]:
-        scopes = ("video",) if channel == "video" else ("image_note", "creator")
-        return {
-            scope: sum(job.result.get("auth_scope") == scope for job in jobs)
-            for scope in scopes
+        scopes = ("video",) if channel == "video" else ("image_note", "creator", "favorites")
+        counts = {
+            scope: sum(job.result.get("auth_scope") == scope for job in jobs) for scope in scopes
         }
+        if not counts.get("favorites"):
+            counts.pop("favorites", None)
+        return counts
 
     @staticmethod
     def _video_ready(check: AuthCheckResult) -> bool:
@@ -389,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config-path", type=Path, required=True)
     parser.add_argument(
         "--scope",
-        choices=("video", "image_note", "creator"),
+        choices=("video", "image_note", "creator", "favorites"),
         required=True,
     )
     parser.add_argument("--job-id", type=_job_id, required=True)

@@ -73,7 +73,7 @@ AuthState = Literal[
 class AuthCheckResult(BaseModel):
     """Non-secret authentication health returned to CLI and MCP callers."""
 
-    scope: Literal["video", "image_note", "creator"]
+    scope: Literal["video", "image_note", "creator", "favorites"]
     state: AuthState
     ok: bool
     server_verified: bool = False

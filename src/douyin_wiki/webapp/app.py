@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,7 +30,7 @@ from ..config import (
     normalize_llm_base_url,
 )
 from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
-from ..localization import label_entry_status
+from ..localization import add_display_labels, label_entry_status
 from ..models import InspirationDraft, InspirationInput, TopicArtifactKind
 from ..secrets import get_secret, store_secret
 from ..service import DouyinWikiService
@@ -40,7 +40,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.8"
+WEB_VERSION = "0.1.9"
 
 
 class CaptureSubmissionRequest(BaseModel):
@@ -227,6 +227,25 @@ async def _watch_catalog(
             catalog.refresh()
             known_fingerprint = catalog.fingerprint
             await notifier.publish()
+
+
+class FavoritesScanBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    folder_ids: list[str] | None = None
+    include_images: bool = False
+    directory_only: bool = False
+
+
+class FavoritesSelectionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selected: bool
+    work_ids: list[str] | None = None
+    folder_id: str | None = None
+
+
+class FavoritesConfirmBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accept_partial: bool = False
 
 
 def create_app(
@@ -997,6 +1016,55 @@ def create_app(
         if target is None:
             raise HTTPException(status_code=404, detail="图片不存在或不允许访问")
         return FileResponse(target, headers={"Cache-Control": "private, max-age=3600"})
+
+    async def favorites_call(method, *args, **kwargs):
+        try:
+            return await asyncio.to_thread(method, *args, **kwargs)
+        except EntryNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except JobStateError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/favorites/imports", status_code=202)
+    async def favorites_scan(body: FavoritesScanBody):
+        job = await favorites_call(core.favorites.start, **body.model_dump())
+        return {"job_id": job.id, "status": job.status}
+
+    @app.get("/api/favorites/imports")
+    async def favorites_history(limit: int = Query(50, ge=1, le=200)):
+        return add_display_labels(await favorites_call(core.favorites.history, limit=limit))
+
+    @app.get("/api/favorites/imports/{job_id}")
+    async def favorites_detail(
+        job_id: str,
+        page: int = Query(1, ge=1),
+        limit: int = Query(50, ge=1, le=200),
+        folder_id: str | None = None,
+        query: str = "",
+    ):
+        return add_display_labels(
+            await favorites_call(
+                core.favorites.get, job_id, page=page, limit=limit, folder_id=folder_id, query=query
+            )
+        )
+
+    @app.post("/api/favorites/imports/{job_id}/selection")
+    async def favorites_selection(job_id: str, body: FavoritesSelectionBody):
+        return add_display_labels(
+            await favorites_call(core.favorites.select, job_id, **body.model_dump())
+        )
+
+    @app.post("/api/favorites/imports/{job_id}/confirm", status_code=202)
+    async def favorites_confirm(job_id: str, body: FavoritesConfirmBody):
+        job = await favorites_call(core.favorites.confirm, job_id, **body.model_dump())
+        return {"job_id": job.id, "status": job.status}
+
+    @app.post("/api/favorites/imports/{job_id}/retry", status_code=202)
+    async def favorites_retry(job_id: str):
+        job = await favorites_call(core.favorites.retry_failed, job_id)
+        return {"job_id": job.id, "status": job.status}
 
     return app
 

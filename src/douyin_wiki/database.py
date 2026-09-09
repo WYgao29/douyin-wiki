@@ -353,10 +353,23 @@ class Database:
         finally:
             _ACTIVE_CLAIM.reset(token)
 
+    def assert_job_claim(self, conn: sqlite3.Connection, job_id: str) -> None:
+        active = _ACTIVE_CLAIM.get()
+        if active and active[0] == job_id:
+            row = conn.execute(
+                "SELECT 1 FROM jobs WHERE id=? AND lock_owner=? AND locked_at IS NOT NULL "
+                "AND lease_expires_at>?", (job_id, active[1], utc_now().isoformat())
+            ).fetchone()
+            if row is None:
+                raise JobLeaseLostError("收藏清点任务的 Worker 租约已失效")
+
     def initialize(self) -> None:
+        from .favorites_store import FAVORITES_SCHEMA
+
         with self.connect() as conn:
             previous_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             conn.executescript(SCHEMA)
+            conn.executescript(FAVORITES_SCHEMA)
             self._migrate_chat_sessions_for_topics(conn)
             chunk_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
@@ -733,6 +746,7 @@ class Database:
         error_code: str | None = None,
         error_message: str | None = None,
         unlock: bool = False,
+        expected_child_updates: dict[str, str] | None = None,
     ) -> JobRecord:
         active_claim = _ACTIVE_CLAIM.get()
         expected_owner = active_claim[1] if active_claim and active_claim[0] == job_id else None
@@ -742,6 +756,14 @@ class Database:
             if current_row is None:
                 raise JobStateError(f"job not found: {job_id}")
             current = self._job_from_row(current_row)
+            if expected_child_updates is not None:
+                # Check the aggregation snapshot under the same write lock as publication.
+                for child_id, observed_at in expected_child_updates.items():
+                    child = conn.execute(
+                        "SELECT updated_at FROM jobs WHERE id=?", (child_id,)
+                    ).fetchone()
+                    if child is None or child["updated_at"] != observed_at:
+                        return current
             assignments = ["updated_at=?"]
             values: list[Any] = [iso_now()]
             if status is not None:
@@ -793,6 +815,8 @@ class Database:
                 }
             ):
                 event_result = dict(result if result is not None else current.result)
+                if favorites_context := merged_artifacts.get("favorites_context"):
+                    event_result["favorites_context"] = favorites_context
                 if creator_context := merged_artifacts.get("creator_context"):
                     event_result["creator_context"] = creator_context
                 event_time = iso_now()
@@ -961,6 +985,8 @@ class Database:
         if job.request.gateway_context is None:
             return None
         event_result = dict(result)
+        if favorites_context := job.artifacts.get("favorites_context"):
+            event_result["favorites_context"] = favorites_context
         if creator_context := job.artifacts.get("creator_context"):
             event_result["creator_context"] = creator_context
         with self.connect() as conn:

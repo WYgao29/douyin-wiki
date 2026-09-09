@@ -891,7 +891,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.1.8" in page.text
+        assert "/static/model-settings.js?v=0.1.9" in page.text
         assert "settings-info-panel" not in page.text
 
 

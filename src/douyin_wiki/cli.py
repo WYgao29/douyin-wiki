@@ -935,6 +935,79 @@ def web_status(config_path: Path | None = None) -> None:
     _print(WebLaunchAgentInstaller(config_path).status(config))
 
 
+favorites_app = typer.Typer(help="收藏清点、选择与批量导入（确认前仅生成清单）")
+app.add_typer(favorites_app, name="favorites")
+
+
+@favorites_app.command("scan")
+def favorites_scan(
+    folder_id: Annotated[list[str] | None, typer.Option("--folder-id")] = None,
+    include_images: bool = False,
+    directory_only: bool = False,
+    gateway: str | None = None,
+    conversation_id: str | None = None,
+    config_path: Path | None = None,
+) -> None:
+    context = GatewayContext(gateway=gateway, conversation_id=conversation_id) if gateway else None
+    job = _service(config_path).favorites.start(
+        folder_ids=folder_id,
+        include_images=include_images,
+        directory_only=directory_only,
+        gateway_context=context,
+    )
+    _print({"job_id": job.id, "status": job.status})
+
+
+@favorites_app.command("list")
+def favorites_list(limit: int = 50, config_path: Path | None = None) -> None:
+    _print(_service(config_path).favorites.history(limit=limit))
+
+
+@favorites_app.command("show")
+def favorites_show(
+    job_id: str,
+    page: int = 1,
+    limit: int = 50,
+    folder_id: str | None = None,
+    query: str = "",
+    config_path: Path | None = None,
+) -> None:
+    _print(
+        _service(config_path).favorites.get(
+            job_id, page=page, limit=limit, folder_id=folder_id, query=query
+        )
+    )
+
+
+@favorites_app.command("select")
+def favorites_select(
+    job_id: str,
+    exclude: bool = False,
+    work_id: Annotated[list[str] | None, typer.Option("--work-id")] = None,
+    folder_id: str | None = None,
+    config_path: Path | None = None,
+) -> None:
+    _print(
+        _service(config_path).favorites.select(
+            job_id, selected=not exclude, work_ids=work_id, folder_id=folder_id
+        )
+    )
+
+
+@favorites_app.command("confirm")
+def favorites_confirm(
+    job_id: str, accept_partial: bool = False, config_path: Path | None = None
+) -> None:
+    job = _service(config_path).favorites.confirm(job_id, accept_partial=accept_partial)
+    _print({"job_id": job.id, "status": job.status})
+
+
+@favorites_app.command("retry")
+def favorites_retry(job_id: str, config_path: Path | None = None) -> None:
+    job = _service(config_path).favorites.retry_failed(job_id)
+    _print({"job_id": job.id, "status": job.status})
+
+
 def main() -> None:
     try:
         app()

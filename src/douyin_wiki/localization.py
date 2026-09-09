@@ -99,12 +99,13 @@ PHASE_LABELS = {
     "image_ocr_review": "图片文字复核",
 }
 
-SOURCE_KIND_LABELS = {"video": "视频", "image_note": "图文"}
+SOURCE_KIND_LABELS = {"video": "视频", "image_note": "图文", "article": "文章"}
 ANALYSIS_MODE_LABELS = {"gateway": "网关 Agent", "provider": "模型接口", "local": "本地模式"}
 DISPLAY_MODE_LABELS = {"all": "全部", "paginated": "分页"}
 JOB_KIND_LABELS = {
     "capture": "单条采集",
     "creator_import": "博主批量采集",
+    "favorites_import": "收藏批量导入",
     "reanalyze": "重新分析",
     "overview": "专题总览",
     "comparison": "跨来源对比表",
@@ -118,6 +119,7 @@ AUTH_SCOPE_LABELS = {
     "video": "视频下载",
     "image_note": "图文采集",
     "creator": "博主主页",
+    "favorites": "收藏清点",
     "library": "整个资料库",
     "entry": "单篇文章",
     "topic": "专题",
@@ -162,8 +164,22 @@ STATUS_LABELS = {
     **GENERAL_STATUS_LABELS,
 }
 
+FAVORITES_DISPOSITION_LABELS = {
+    "pending": "待入库",
+    "excluded": "已排除",
+    "unsupported": "暂不支持",
+    "unavailable": "不可用",
+    "imported": "已入库",
+    "active": "处理中",
+    "completed": "已完成",
+    "failed": "失败",
+}
+
 FIELD_LABELS = {
+    "disposition": FAVORITES_DISPOSITION_LABELS,
     "status": STATUS_LABELS,
+    "job_status": JOB_STATUS_LABELS,
+    "auth_scope": AUTH_SCOPE_LABELS,
     "state": AUTH_STATE_LABELS,
     "decision": CREATOR_DECISION_LABELS,
     "availability": CREATOR_AVAILABILITY_LABELS,
@@ -184,6 +200,12 @@ COUNT_LABELS = {
     **CREATOR_DECISION_LABELS,
     **CREATOR_AVAILABILITY_LABELS,
     "total": "总数",
+    "discovered": "已发现",
+    "eligible": "可导入",
+    "unsupported": "暂不支持",
+    "unavailable": "不可用",
+    "excluded": "已排除",
+    "active": "处理中",
 }
 
 
@@ -251,9 +273,10 @@ def _dump(value: Any) -> Any:
 
 
 def _localized_counts(value: dict[str, Any]) -> dict[str, Any]:
-    return {
-        COUNT_LABELS.get(str(key), str(key)): localize_for_user(item) for key, item in value.items()
-    }
+    labels = COUNT_LABELS
+    if "eligible" in value or "unsupported" in value:
+        labels = {**labels, "selected": "已选择"}
+    return {labels.get(str(key), str(key)): localize_for_user(item) for key, item in value.items()}
 
 
 def localize_for_user(value: Any, *, field: str | None = None) -> Any:

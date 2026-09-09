@@ -10,3 +10,5 @@
 - `screenshots/`：Web v0.1.1 在桌面、平板、手机和亮暗主题下的视觉验收记录。
 
 用户安装、运行、CLI、专题和发行包说明以仓库根目录的 [README](../README.md) 为准。
+
+- [收藏批量导入](favorites-import.md)：网页、CLI/MCP、登录、恢复及当前验证边界。

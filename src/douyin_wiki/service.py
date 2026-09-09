@@ -89,6 +89,7 @@ class DouyinWikiService:
         downloader: YtDlpDownloader | None = None,
         image_note_downloader: PlaywrightImageNoteDownloader | None = None,
         creator_adapter: DouyinCreatorAdapter | None = None,
+        favorites_adapter=None,
         media: FFmpegMediaProcessor | None = None,
         transcriber: WhisperTranscriber | None = None,
         ocr: VisionOCR | None = None,
@@ -107,6 +108,13 @@ class DouyinWikiService:
         )
         self.creator_adapter = creator_adapter or DouyinCreatorAdapter(
             config.media, config.browser_profile_dir, self.resolver
+        )
+        from .adapters.favorites import DouyinFavoritesAdapter
+        from .favorites import FavoritesService
+
+        self.favorites = FavoritesService(
+            self,
+            favorites_adapter or DouyinFavoritesAdapter(config.media, config.browser_profile_dir)
         )
         self.media = media or FFmpegMediaProcessor()
         self.transcriber = transcriber or WhisperTranscriber(config.media)
@@ -203,6 +211,10 @@ class DouyinWikiService:
             source = self.config.media.browser
         elif scope == "image_note":
             adapter = self.image_note_downloader
+            kwargs = {}
+            source = str(self.config.browser_profile_dir)
+        elif scope == "favorites":
+            adapter = self.favorites.adapter
             kwargs = {}
             source = str(self.config.browser_profile_dir)
         elif scope == "creator":
@@ -474,6 +486,8 @@ class DouyinWikiService:
     def get_job(self, job_id: str) -> JobRecord:
         job = self.database.get_job(job_id)
         self._apply_live_creator_selection(job)
+        if job.kind == "favorites_import":
+            job = self.favorites.refresh(job.id)
         if job.status == JobStatus.NEEDS_REVIEW:
             job.result["review_issues"] = [
                 issue.model_dump(mode="json")
@@ -483,8 +497,10 @@ class DouyinWikiService:
 
     def list_jobs(self, status: JobStatus | None = None, limit: int = 50) -> list[JobRecord]:
         jobs = self.database.list_jobs(status, limit)
-        for job in jobs:
+        for index, job in enumerate(jobs):
             self._apply_live_creator_selection(job)
+            if job.kind == "favorites_import":
+                jobs[index] = self.favorites.refresh(job.id)
         return jobs
 
     def _apply_live_creator_selection(self, job: JobRecord) -> None:
@@ -2035,7 +2051,9 @@ class DouyinWikiService:
 
     async def process_claimed_job(self, job: JobRecord) -> JobRecord:
         try:
-            if job.kind == "creator_import":
+            if job.kind == "favorites_import":
+                outcome = await self.favorites.process(job)
+            elif job.kind == "creator_import":
                 outcome = await self._process_creator_import(job)
             elif job.kind == "reanalyze":
                 outcome = await self._process_reanalysis(job)
@@ -2050,6 +2068,8 @@ class DouyinWikiService:
             is_creator = job.kind == "creator_import"
             next_command = "douyin-wiki auth video" if is_video else "douyin-wiki auth douyin"
             auth_scope = "video" if is_video else ("creator" if is_creator else "image_note")
+            if job.kind == "favorites_import":
+                auth_scope = "favorites"
             outcome = self.database.update_job(
                 job.id,
                 status=JobStatus.NEEDS_AUTH,
@@ -2086,6 +2106,7 @@ class DouyinWikiService:
                 error_message=str(exc),
                 unlock=True,
             )
+        self.favorites.refresh_for_child(outcome.id)
         creator_context = outcome.artifacts.get("creator_context")
         if creator_context:
             if outcome.status in {JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_WARNINGS}:

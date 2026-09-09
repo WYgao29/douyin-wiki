@@ -41,7 +41,8 @@ token，必须经用户确认后调用 approve_job。无常驻 Agent 时可用 l
 original_url，以及视频 timestamp_ms 或图文 image_index；创建提醒前必须获得用户明确确认。
 博主批量采集调用 capture_douyin_creator。任务显示为“待选择作品”后，调用
 get_creator_inventory 一次读取并展示全部作品，再用 set_creator_work_selection 保存选择；全部作品均已
-选择或跳过后才可调用 confirm_creator_import。带 creator_context.batch_silent=true 的子任务仍需
+选择或跳过后才可调用 confirm_creator_import。
+带 favorites_context.batch_silent=true 或 creator_context.batch_silent=true 的子任务仍需
 完成校正和分析，但不要逐条向用户发送完成消息；以父任务汇总结果为准。同步只在用户明确调用
 sync_creator 时执行，不得自动或定时访问博主主页。
 专题研究必须使用 create_topic 等专题工具；search_topic 只检索当前启用来源。专题没有相关证据时
@@ -548,6 +549,65 @@ def doctor() -> dict[str, Any]:
     from .setup import doctor as run_doctor
 
     return _payload(run_doctor(load_config()))
+
+
+@mcp.tool()
+def scan_favorites(
+    folder_ids: list[str] | None = None,
+    include_images: bool = False,
+    directory_only: bool = False,
+    gateway_context: dict[str, Any] | None = None,
+) -> dict:
+    """只清点收藏，不下载或导入。后续展示清单并取得用户确认后才调用 confirm_favorites_import。"""
+    job = _service().favorites.start(
+        folder_ids=folder_ids,
+        include_images=include_images,
+        directory_only=directory_only,
+        gateway_context=GatewayContext.model_validate(gateway_context) if gateway_context else None,
+    )
+    return _payload({"job_id": job.id, "status": job.status})
+
+
+@mcp.tool()
+def list_favorites_imports(limit: int = 50) -> list[dict]:
+    """恢复已有收藏导入任务，不访问收藏网页。"""
+    return _payload(_service().favorites.history(limit=limit))
+
+
+@mcp.tool()
+def get_favorites_import(
+    job_id: str, page: int = 1, limit: int = 50, folder_id: str | None = None, query: str = ""
+) -> dict:
+    """读取收藏清单及批量汇总；has_more 为真时继续翻页。"""
+    return _payload(
+        _service().favorites.get(job_id, page=page, limit=limit, folder_id=folder_id, query=query)
+    )
+
+
+@mcp.tool()
+def set_favorites_selection(
+    job_id: str, selected: bool, work_ids: list[str] | None = None, folder_id: str | None = None
+) -> dict:
+    """保存选择；不指定作品或收藏夹时作用于整份清单。文章暂不支持导入。"""
+    return _payload(
+        _service().favorites.select(
+            job_id, selected=selected, work_ids=work_ids, folder_id=folder_id
+        )
+    )
+
+
+@mcp.tool()
+def confirm_favorites_import(job_id: str, accept_partial: bool = False) -> dict:
+    """用户明确确认后批量入队；不完整清单需单独接受。重复确认不会重复创建任务。"""
+    job = _service().favorites.confirm(job_id, accept_partial=accept_partial)
+    return _payload({"job_id": job.id, "status": job.status})
+
+
+@mcp.tool()
+def retry_favorites_import(job_id: str) -> dict:
+    """重试失败的清点或子任务，保留已完成结果；不绕过选择确认。"""
+    job = _service().favorites.retry_failed(job_id)
+    return _payload({"job_id": job.id, "status": job.status})
 
 
 def main() -> None:
