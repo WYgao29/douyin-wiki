@@ -139,44 +139,44 @@
 
   <dialog id="capture-dialog" class="inspiration-dialog" aria-labelledby="capture-title" aria-describedby="capture-description">
     <form method="dialog" id="capture-form">
-      <header><div><span class="dialog-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#plus"></use></svg>写入抖库</span><h2 id="capture-title">写入抖音链接</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭写入窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <header><div><span class="dialog-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#plus"></use></svg>写入抖库</span><h2 id="capture-title">写入抖音链接</h2></div><button value="cancel" formnovalidate class="icon-button dialog-close" type="submit" aria-label="关闭写入窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
       <p id="capture-description" class="dialog-description">粘贴单独的抖音链接，或从抖音复制的整段分享文案。提交后将由后台完成采集、分析和入库。</p>
       <label for="capture-share-text">链接或分享文案<textarea id="capture-share-text" rows="5" maxlength="20000" required placeholder="https://v.douyin.com/…"></textarea></label>
       <p id="capture-error" class="dialog-error hidden" role="alert"></p>
-      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-capture" class="primary-button" value="default" type="submit">加入写入队列</button></div>
+      <div class="dialog-actions"><button value="cancel" formnovalidate class="secondary-button" type="submit">取消</button><button id="confirm-capture" class="primary-button" value="default" type="submit">加入写入队列</button></div>
     </form>
   </dialog>
 
   <dialog id="inspiration-dialog" class="inspiration-dialog" aria-labelledby="inspiration-title" aria-describedby="inspiration-description">
     <form method="dialog" id="inspiration-form">
-      <header><div><span class="dialog-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg>写回 Obsidian</span><h2 id="inspiration-title">保存为灵感</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭灵感窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <header><div><span class="dialog-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#sparkles"></use></svg>写回 Obsidian</span><h2 id="inspiration-title">保存为灵感</h2></div><button value="cancel" formnovalidate class="icon-button dialog-close" type="submit" aria-label="关闭灵感窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
       <p id="inspiration-description" class="dialog-description">系统会逐字保存你的内容，AI 不会自动改写。</p>
       <label for="inspiration-entry">目标文章<select id="inspiration-entry" required></select></label>
       <label for="inspiration-text">灵感原文<textarea id="inspiration-text" rows="5" maxlength="4000" required></textarea></label>
       <label for="inspiration-quote">对应原句（可选）<textarea id="inspiration-quote" rows="3" maxlength="4000"></textarea></label>
       <div class="time-fields"><label for="inspiration-start">开始毫秒（可选）<input id="inspiration-start" type="number" min="0"></label><label for="inspiration-end">结束毫秒（可选）<input id="inspiration-end" type="number" min="0"></label></div>
       <p id="inspiration-error" class="dialog-error hidden" role="alert"></p>
-      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-inspiration" class="primary-button" value="default" type="submit">确认保存</button></div>
+      <div class="dialog-actions"><button value="cancel" formnovalidate class="secondary-button" type="submit">取消</button><button id="confirm-inspiration" class="primary-button" value="default" type="submit">确认保存</button></div>
     </form>
   </dialog>
   <dialog id="topic-dialog" class="inspiration-dialog" aria-labelledby="topic-dialog-title">
     <form method="dialog" id="topic-form">
-      <header><div><span class="dialog-kicker">选定来源研究</span><h2 id="topic-dialog-title">创建专题</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <header><div><span class="dialog-kicker">选定来源研究</span><h2 id="topic-dialog-title">创建专题</h2></div><button value="cancel" formnovalidate class="icon-button dialog-close" type="submit" aria-label="关闭"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
       <p class="dialog-description">专题问答只会使用你选择并启用的文章，不会回退到全库。</p>
       <label for="topic-title-input">专题标题<input id="topic-title-input" maxlength="200" required></label>
       <label for="topic-goal-input">研究目标<textarea id="topic-goal-input" rows="3" maxlength="4000"></textarea></label>
       <label for="topic-instructions-input">自定义指令（可选）<textarea id="topic-instructions-input" rows="3" maxlength="8000"></textarea></label>
       <p id="topic-selection-summary" class="dialog-description"></p>
       <p id="topic-error" class="dialog-error hidden" role="alert"></p>
-      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-topic" class="primary-button" value="default" type="submit">创建专题</button></div>
+      <div class="dialog-actions"><button value="cancel" formnovalidate class="secondary-button" type="submit">取消</button><button id="confirm-topic" class="primary-button" value="default" type="submit">创建专题</button></div>
     </form>
   </dialog>
   <dialog id="destructive-dialog" class="inspiration-dialog" aria-labelledby="destructive-title" aria-describedby="destructive-description">
     <form method="dialog" id="destructive-form">
-      <header><div><span class="dialog-kicker danger-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#alert-circle"></use></svg>需要确认</span><h2 id="destructive-title">确认操作</h2></div><button value="cancel" class="icon-button dialog-close" type="submit" aria-label="关闭确认窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
+      <header><div><span class="dialog-kicker danger-kicker"><svg aria-hidden="true"><use href="/static/icons.svg#alert-circle"></use></svg>需要确认</span><h2 id="destructive-title">确认操作</h2></div><button value="cancel" formnovalidate class="icon-button dialog-close" type="submit" aria-label="关闭确认窗口"><svg aria-hidden="true"><use href="/static/icons.svg#x"></use></svg></button></header>
       <p id="destructive-description" class="dialog-description"></p>
       <p id="destructive-error" class="dialog-error hidden" role="alert"></p>
-      <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit">取消</button><button id="confirm-destructive" class="danger-button" value="default" type="submit">确认</button></div>
+      <div class="dialog-actions"><button value="cancel" formnovalidate class="secondary-button" type="submit">取消</button><button id="confirm-destructive" class="danger-button" value="default" type="submit">确认</button></div>
     </form>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
