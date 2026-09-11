@@ -114,7 +114,7 @@ class DouyinWikiService:
 
         self.favorites = FavoritesService(
             self,
-            favorites_adapter or DouyinFavoritesAdapter(config.media, config.browser_profile_dir)
+            favorites_adapter or DouyinFavoritesAdapter(config.media, config.browser_profile_dir),
         )
         self.media = media or FFmpegMediaProcessor()
         self.transcriber = transcriber or WhisperTranscriber(config.media)
@@ -702,9 +702,7 @@ class DouyinWikiService:
         """Retry a failed job from its last persisted stage checkpoint."""
         job = self.database.get_job(job_id)
         if job.kind == "media_restore":
-            return self.database.requeue_job_deduplicated(
-                job_id, match_artifact="entry_id"
-            )
+            return self.database.requeue_job_deduplicated(job_id, match_artifact="entry_id")
         if job.status not in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}:
             raise JobStateError("只有“失败”或“需要登录授权”的任务可以重试")
         return self.database.requeue_job(job_id)
@@ -730,9 +728,7 @@ class DouyinWikiService:
         with self.vault.entry_operations_locked():
             return self._add_inspiration_locked(entry_id, inspiration)
 
-    def _add_inspiration_locked(
-        self, entry_id: str, inspiration: InspirationInput
-    ) -> EntryRecord:
+    def _add_inspiration_locked(self, entry_id: str, inspiration: InspirationInput) -> EntryRecord:
         entry = self.database.get_entry(entry_id)
         if inspiration in entry.inspirations:
             return entry
@@ -764,9 +760,7 @@ class DouyinWikiService:
         with self.vault.entry_operations_locked():
             entry = self.database.get_entry(entry_id)
             data = self.database.get_entry_data(entry_id)
-            source_kind = data.get("metadata", {}).get(
-                "source_kind", SourceKind.VIDEO.value
-            )
+            source_kind = data.get("metadata", {}).get("source_kind", SourceKind.VIDEO.value)
             now = utc_now()
             if favorite or source_kind == SourceKind.IMAGE_NOTE.value:
                 retention = RetentionPolicy.KEEP
@@ -820,9 +814,7 @@ class DouyinWikiService:
         model: str = "agent",
     ) -> EntryRecord:
         with self.vault.entry_operations_locked():
-            return self._submit_analysis_locked(
-                entry_id, analysis, producer=producer, model=model
-            )
+            return self._submit_analysis_locked(entry_id, analysis, producer=producer, model=model)
 
     def _submit_analysis_locked(
         self,
@@ -953,17 +945,14 @@ class DouyinWikiService:
     def _refresh_topic(self, topic_id: str) -> ResearchTopic:
         topic = self.database.get_topic(topic_id)
         entries = [
-            (self.database.get_entry(source.entry_id), source.enabled)
-            for source in topic.sources
+            (self.database.get_entry(source.entry_id), source.enabled) for source in topic.sources
         ]
         revision, _ = self._topic_revision(entries)
         if revision != topic.source_revision:
             topic = self.database.update_topic_revision(
                 topic_id,
                 source_revision=revision,
-                source_versions={
-                    entry.id: entry.updated_at.isoformat() for entry, _ in entries
-                },
+                source_versions={entry.id: entry.updated_at.isoformat() for entry, _ in entries},
             )
             self._persist_topic(topic)
         return topic
@@ -971,8 +960,7 @@ class DouyinWikiService:
     def _persist_topic(self, topic: ResearchTopic) -> list[Path]:
         artifacts = self.database.list_topic_artifacts(topic.id)
         entries = {
-            source.entry_id: self.database.get_entry(source.entry_id)
-            for source in topic.sources
+            source.entry_id: self.database.get_entry(source.entry_id) for source in topic.sources
         }
         with self.vault.locked():
             changed = self.vault.write_topic(topic, artifacts, entries)
@@ -990,9 +978,7 @@ class DouyinWikiService:
         instructions: str = "",
     ) -> dict[str, Any]:
         with self.vault.entry_operations_locked():
-            return self._create_topic_locked(
-                title, entry_ids, goal=goal, instructions=instructions
-            )
+            return self._create_topic_locked(title, entry_ids, goal=goal, instructions=instructions)
 
     def _create_topic_locked(
         self,
@@ -1064,10 +1050,7 @@ class DouyinWikiService:
         revision, _ = self._topic_revision(ordered)
         topic = self.database.set_topic_sources(
             topic_id,
-            [
-                (entry.id, enabled, entry.updated_at.isoformat())
-                for entry, enabled in ordered
-            ],
+            [(entry.id, enabled, entry.updated_at.isoformat()) for entry, enabled in ordered],
             source_revision=revision,
         )
         self._persist_topic(topic)
@@ -1096,12 +1079,8 @@ class DouyinWikiService:
         enabled_sources = [source for source in topic.sources if source.enabled]
         if not enabled_sources:
             raise ValueError("当前专题没有启用的来源")
-        enabled_entries = [
-            self.database.get_entry(source.entry_id) for source in enabled_sources
-        ]
-        _, revisions = self._topic_revision(
-            [(entry, True) for entry in enabled_entries]
-        )
+        enabled_entries = [self.database.get_entry(source.entry_id) for source in enabled_sources]
+        _, revisions = self._topic_revision([(entry, True) for entry in enabled_entries])
         per_source_budget = max(1200, min(14_000, 52_000 // len(enabled_sources)))
         contexts: list[dict[str, Any]] = []
         for source, entry in zip(enabled_sources, enabled_entries, strict=True):
@@ -1433,14 +1412,10 @@ class DouyinWikiService:
         chunks, relations, reminders = self._prepare_entry_bundle(entry, data)
         self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
         dependency_result = self.database.restore_entry_dependencies(entry.id, dependencies)
-        restored_topic_ids = self._restore_trashed_topic_sources(
-            entry, dependencies, persist=False
-        )
+        restored_topic_ids = self._restore_trashed_topic_sources(entry, dependencies, persist=False)
         return dependency_result, restored_topic_ids
 
-    def _move_trashed_files_back(
-        self, item_dir: Path, manifest: dict[str, Any]
-    ) -> None:
+    def _move_trashed_files_back(self, item_dir: Path, manifest: dict[str, Any]) -> None:
         vault = self.config.vault_path.resolve()
         files_root = (item_dir / "files").resolve()
         for item in reversed(manifest.get("files", [])):
@@ -1534,9 +1509,7 @@ class DouyinWikiService:
         return warnings
 
     @staticmethod
-    def _normalize_trashed_entry_data(
-        entry: EntryRecord, data: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _normalize_trashed_entry_data(entry: EntryRecord, data: dict[str, Any]) -> dict[str, Any]:
         """Fill fields omitted by older database projections before restoring files."""
         normalized = dict(data)
         metadata = dict(normalized.get("metadata") or {})
@@ -1585,10 +1558,7 @@ class DouyinWikiService:
             revision, _ = self._topic_revision(ordered)
             restored_topic = self.database.set_topic_sources(
                 topic_id,
-                [
-                    (value.id, enabled, value.updated_at.isoformat())
-                    for value, enabled in ordered
-                ],
+                [(value.id, enabled, value.updated_at.isoformat()) for value, enabled in ordered],
                 source_revision=revision,
             )
             if persist:
@@ -1697,9 +1667,7 @@ class DouyinWikiService:
                     ) from rollback_error
                 raise
 
-            warnings = self._finalize_deleted_entry(
-                entry, data, dependencies, paths
-            )
+            warnings = self._finalize_deleted_entry(entry, data, dependencies, paths)
             manifest["warnings"] = warnings
             manifest["phase"] = "completed"
             try:
@@ -1719,9 +1687,7 @@ class DouyinWikiService:
                 "warnings": warnings,
             }
 
-    def restore_trashed_entry(
-        self, trash_id: str, *, confirmed: bool = False
-    ) -> dict[str, Any]:
+    def restore_trashed_entry(self, trash_id: str, *, confirmed: bool = False) -> dict[str, Any]:
         if not confirmed:
             raise ValueError("恢复资料前需要用户明确确认")
         with self.vault.entry_operations_locked():
@@ -1820,6 +1786,79 @@ class DouyinWikiService:
                 "warnings": [],
             }
 
+    @staticmethod
+    def _unique_trash_ids(trash_ids: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for trash_id in trash_ids:
+            if not trash_id or trash_id in seen:
+                continue
+            seen.add(trash_id)
+            unique.append(trash_id)
+        if not unique:
+            raise ValueError("请选择要处理的资料")
+        if len(unique) > 500:
+            raise ValueError("一次最多处理 500 条资料")
+        return unique
+
+    def restore_trashed_entries(
+        self, trash_ids: list[str], *, confirmed: bool = False
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("恢复资料前需要用户明确确认")
+        restored: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        warnings: list[str] = []
+        for trash_id in self._unique_trash_ids(trash_ids):
+            try:
+                result = self.restore_trashed_entry(trash_id, confirmed=True)
+                restored.append(result)
+                warnings.extend(str(item) for item in result.get("warnings") or [])
+            except (EntryNotFoundError, ValueError, DouyinWikiError) as exc:
+                failed.append({"trash_id": trash_id, "error": str(exc)})
+        if not restored:
+            raise ValueError("恢复失败：" + "；".join(item["error"] for item in failed[:5]))
+        if failed:
+            warnings.append(
+                f"{len(failed)} 条未能恢复："
+                + "；".join(f"{item['trash_id']}（{item['error']}）" for item in failed[:5])
+            )
+        return {
+            "status": "已恢复",
+            "restored": restored,
+            "failed": failed,
+            "warnings": warnings,
+        }
+
+    def permanently_delete_trashed_entries(
+        self, trash_ids: list[str], *, confirmed: bool = False
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("彻底删除前需要用户明确确认")
+        deleted: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        warnings: list[str] = []
+        for trash_id in self._unique_trash_ids(trash_ids):
+            try:
+                result = self.permanently_delete_trashed_entry(trash_id, confirmed=True)
+                deleted.append(result)
+                warnings.extend(str(item) for item in result.get("warnings") or [])
+            except (EntryNotFoundError, ValueError, DouyinWikiError) as exc:
+                failed.append({"trash_id": trash_id, "error": str(exc)})
+        if not deleted:
+            raise ValueError("彻底删除失败：" + "；".join(item["error"] for item in failed[:5]))
+        if failed:
+            warnings.append(
+                f"{len(failed)} 条未能删除："
+                + "；".join(f"{item['trash_id']}（{item['error']}）" for item in failed[:5])
+            )
+        return {
+            "status": "已彻底删除",
+            "deleted": deleted,
+            "failed": failed,
+            "warnings": warnings,
+        }
+
     def recover_entry_trash_operations(self) -> dict[str, Any]:
         """Recover interrupted delete/restore operations after an unclean exit."""
         with self.vault.entry_operations_locked():
@@ -1871,9 +1910,7 @@ class DouyinWikiService:
                         self.config.vault_path / str(item.get("path") or "")
                         for item in manifest.get("files", [])
                     ]
-                    warnings = self._finalize_deleted_entry(
-                        entry, data, dependencies, paths
-                    )
+                    warnings = self._finalize_deleted_entry(entry, data, dependencies, paths)
                     manifest["warnings"] = [
                         *manifest.get("warnings", []),
                         *warnings,
@@ -1894,9 +1931,7 @@ class DouyinWikiService:
                             source.relative_to(vault)
                             target.relative_to(files_root)
                             if source.exists() and target.exists():
-                                raise ValueError(
-                                    f"恢复中断后出现文件冲突：{relative.as_posix()}"
-                                )
+                                raise ValueError(f"恢复中断后出现文件冲突：{relative.as_posix()}")
                             if source.exists():
                                 target.parent.mkdir(parents=True, exist_ok=True)
                                 shutil.move(str(source), str(target))
@@ -1920,9 +1955,7 @@ class DouyinWikiService:
                     report["completed"].append(manifest["trash_id"])
                     report["warnings"].extend(warnings)
             except Exception as exc:
-                report["warnings"].append(
-                    f"废纸篓事务 {item_dir.name} 自动恢复失败：{exc}"
-                )
+                report["warnings"].append(f"废纸篓事务 {item_dir.name} 自动恢复失败：{exc}")
         return report
 
     def migrate_inspiration_vocabulary(self) -> dict[str, Any]:
@@ -2153,13 +2186,9 @@ class DouyinWikiService:
             updated = current.model_copy(
                 update={
                     "media_status": "present",
-                    "retention": (
-                        RetentionPolicy.KEEP if keep else RetentionPolicy.TEMPORARY
-                    ),
+                    "retention": (RetentionPolicy.KEEP if keep else RetentionPolicy.TEMPORARY),
                     "media_expires_at": (
-                        None
-                        if keep
-                        else now + timedelta(days=self.config.media.retention_days)
+                        None if keep else now + timedelta(days=self.config.media.retention_days)
                     ),
                     "updated_at": now,
                 }
@@ -2361,14 +2390,10 @@ class DouyinWikiService:
                 relations,
                 reminders,
                 action="reanalyze-v2",
-                log_summary=(
-                    f"复用现有逐字稿与 OCR，由 {latest_data['provider']} 生成 v2 分析"
-                ),
+                log_summary=(f"复用现有逐字稿与 OCR，由 {latest_data['provider']} 生成 v2 分析"),
                 commit_message=f"reanalyze-v2: {updated.video_id} {updated.title}",
             )
-            source_kind = latest_data.get("metadata", {}).get(
-                "source_kind", SourceKind.VIDEO.value
-            )
+            source_kind = latest_data.get("metadata", {}).get("source_kind", SourceKind.VIDEO.value)
             creator_folder = str(latest_data.get("creator", {}).get("folder_path") or "")
         return self.database.update_job(
             job.id,
@@ -3655,9 +3680,7 @@ class DouyinWikiService:
             try:
                 chunks = self.indexer.index_entry(entry, data, persist=False)
             except Exception as exc:
-                self.vault._append_load_error(
-                    self.vault.last_entry_load_errors, sidecar_path, exc
-                )
+                self.vault._append_load_error(self.vault.last_entry_load_errors, sidecar_path, exc)
                 chunks = []
 
             raw_relations = data.get("relations", [])
@@ -3770,11 +3793,7 @@ class DouyinWikiService:
                     )
             for artifact in artifacts:
                 artifact_path = (
-                    self.config.vault_path
-                    / "topics"
-                    / topic.id
-                    / "artifacts"
-                    / f"{artifact.id}.md"
+                    self.config.vault_path / "topics" / topic.id / "artifacts" / f"{artifact.id}.md"
                 )
                 if artifact.topic_id != topic.id:
                     append_error(

@@ -35,6 +35,7 @@ const state = {
   currentTopic: document.body.dataset.topicId || "",
   topics: [],
   trashItems: [],
+  selectedTrashIds: new Set(),
   topicSelectionMode: false,
   selectedEntryIds: new Set(),
   currentSession: "",
@@ -905,6 +906,31 @@ async function loadTrash() {
   return state.trashItems;
 }
 
+function selectedTrashItems() {
+  return state.trashItems.filter((item) => state.selectedTrashIds.has(item.trash_id));
+}
+
+function updateTrashSelection() {
+  const available = new Set(state.trashItems.map((item) => item.trash_id));
+  state.selectedTrashIds = new Set(
+    [...state.selectedTrashIds].filter((id) => available.has(id))
+  );
+  const selected = state.selectedTrashIds.size;
+  $("#trash-toolbar").classList.toggle("hidden", !state.trashItems.length);
+  $("#trash-confirm").classList.toggle("hidden", !selected);
+  $("#trash-selection-count").textContent = `已选 ${selected} 条`;
+  $("#trash-clear-selection").disabled = !selected;
+  $("#trash-select-all").disabled = !state.trashItems.length;
+}
+
+function setTrashSelection(ids) {
+  state.selectedTrashIds = new Set(ids);
+  $$("#trash-list input[type='checkbox']").forEach((input) => {
+    input.checked = state.selectedTrashIds.has(input.value);
+  });
+  updateTrashSelection();
+}
+
 function renderTrash() {
   const root = $("#trash-list");
   $("#trash-count").textContent = `${state.trashItems.length} 条资料`;
@@ -918,11 +944,22 @@ function renderTrash() {
     copy.textContent = "从文章页面删除的资料会暂存在这里。";
     empty.append(title, copy);
     root.replaceChildren(empty);
+    updateTrashSelection();
     return;
   }
   root.replaceChildren(...state.trashItems.map((item) => {
     const row = document.createElement("article");
     row.className = "trash-item";
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.value = item.trash_id;
+    check.checked = state.selectedTrashIds.has(item.trash_id);
+    check.setAttribute("aria-label", `选择 ${item.title}`);
+    check.addEventListener("change", () => {
+      if (check.checked) state.selectedTrashIds.add(item.trash_id);
+      else state.selectedTrashIds.delete(item.trash_id);
+      updateTrashSelection();
+    });
     const icon = document.createElement("span");
     icon.className = `trash-item-icon ${item.source_kind === "image_note" ? "is-image" : "is-video"}`;
     icon.append(svgIcon(item.source_kind === "image_note" ? "image" : "video"));
@@ -973,9 +1010,51 @@ function renderTrash() {
       },
     }));
     actions.append(restore, purge);
-    row.append(icon, copy, actions);
+    row.append(check, icon, copy, actions);
     return row;
   }));
+  updateTrashSelection();
+}
+
+function openTrashBatchDialog(kind) {
+  const items = selectedTrashItems();
+  if (!items.length) return;
+  const count = items.length;
+  const ids = items.map((item) => item.trash_id);
+  const size = formatBytes(items.reduce((total, item) => total + (Number(item.size_bytes) || 0), 0));
+  if (kind === "restore") {
+    openDestructiveDialog({
+      title: count === 1 ? "恢复这条资料？" : `恢复这 ${count} 条资料？`,
+      description: "将恢复所选文章、原始记录、视频或图片，并重新加入检索和相关专题。",
+      confirmLabel: "确认恢复",
+      action: async () => {
+        return api("/api/trash/batch/restore", {
+          method: "POST", body: JSON.stringify({confirmed: true, trash_ids: ids}),
+        });
+      },
+      successMessage: count === 1 ? "资料已恢复" : `已恢复 ${count} 条资料`,
+      onSuccess: async () => {
+        state.selectedTrashIds.clear();
+        await Promise.all([loadTrash(), loadLibrary({showLoading: false}), loadTopics()]);
+      },
+    });
+    return;
+  }
+  openDestructiveDialog({
+    title: count === 1 ? "彻底删除这条资料？" : `彻底删除这 ${count} 条资料？`,
+    description: `所选资料及其共 ${size} 本地文件将被永久删除，无法通过抖库恢复；Markdown 可能仍存在于 Git 历史中。`,
+    confirmLabel: "彻底删除",
+    action: async () => {
+      return api("/api/trash/batch/purge", {
+        method: "POST", body: JSON.stringify({confirmed: true, trash_ids: ids}),
+      });
+    },
+    successMessage: count === 1 ? "资料已彻底删除" : `已彻底删除 ${count} 条资料`,
+    onSuccess: async () => {
+      state.selectedTrashIds.clear();
+      await loadTrash();
+    },
+  });
 }
 
 async function showTrash(push = true) {
@@ -2010,6 +2089,12 @@ function bindEvents() {
   }));
   $("#topics-nav").addEventListener("click", () => showTopics());
   $("#trash-nav").addEventListener("click", () => showTrash());
+  $("#trash-select-all").addEventListener("click", () => {
+    setTrashSelection(state.trashItems.map((item) => item.trash_id));
+  });
+  $("#trash-clear-selection").addEventListener("click", () => setTrashSelection([]));
+  $("#trash-restore-selected").addEventListener("click", () => openTrashBatchDialog("restore"));
+  $("#trash-purge-selected").addEventListener("click", () => openTrashBatchDialog("purge"));
   $$("[data-route]").forEach((node) => node.addEventListener("click", (event) => {
     const path = node.getAttribute("data-route") || node.getAttribute("href");
     if (!path || !path.startsWith("/")) return;

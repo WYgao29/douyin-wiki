@@ -162,7 +162,7 @@ inspirations:
                 "takeaways": ["关键结论"],
                 "chapters": [],
                 "knowledge_atoms": [],
-            }
+            },
         },
     )
     return config, service
@@ -253,9 +253,7 @@ content_type: explanation
     with TestClient(app) as client:
         library = client.get("/api/library")
         assert library.status_code == 200
-        item = next(
-            item for item in library.json()["items"] if item["entry_id"] == "dy-456"
-        )
+        item = next(item for item in library.json()["items"] if item["entry_id"] == "dy-456")
         assert item["database_managed"] is False
 
         article = client.get("/api/articles/dy-456")
@@ -272,9 +270,7 @@ content_type: explanation
         assert "只读" in rejected.json()["detail"]
         assert service.database.list_chat_sessions() == []
 
-        managed = next(
-            item for item in library.json()["items"] if item["entry_id"] == "dy-123"
-        )
+        managed = next(item for item in library.json()["items"] if item["entry_id"] == "dy-123")
         assert managed["database_managed"] is True
         created = client.post(
             "/api/chat/sessions",
@@ -292,17 +288,13 @@ def test_web_can_favorite_and_unfavorite_an_article(tmp_path: Path) -> None:
         initial = client.get("/api/library").json()["items"][0]
         assert initial["favorite"] is False
 
-        favorited = client.put(
-            "/api/articles/dy-123/favorite", json={"favorite": True}
-        )
+        favorited = client.put("/api/articles/dy-123/favorite", json={"favorite": True})
         assert favorited.status_code == 200
         assert favorited.json()["item"]["favorite"] is True
         assert favorited.json()["restore_job"] is None
         assert service.database.get_entry("dy-123").retention == RetentionPolicy.KEEP
 
-        unfavorited = client.put(
-            "/api/articles/dy-123/favorite", json={"favorite": False}
-        )
+        unfavorited = client.put("/api/articles/dy-123/favorite", json={"favorite": False})
         assert unfavorited.status_code == 200
         assert unfavorited.json()["item"]["favorite"] is False
         assert service.database.get_entry("dy-123").retention == RetentionPolicy.TEMPORARY
@@ -311,16 +303,12 @@ def test_web_can_favorite_and_unfavorite_an_article(tmp_path: Path) -> None:
 
 def test_web_favorite_queues_removed_media_restore_and_exposes_job(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
-    entry = service.database.get_entry("dy-123").model_copy(
-        update={"media_status": "removed"}
-    )
+    entry = service.database.get_entry("dy-123").model_copy(update={"media_status": "removed"})
     service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
     app = create_app(config, service=service, start_watcher=False)
 
     with TestClient(app) as client:
-        response = client.put(
-            "/api/articles/dy-123/favorite", json={"favorite": True}
-        )
+        response = client.put("/api/articles/dy-123/favorite", json={"favorite": True})
         assert response.status_code == 202
         restore_job = response.json()["restore_job"]
         assert restore_job["kind"] == "media_restore"
@@ -337,9 +325,7 @@ def test_web_favorite_returns_404_for_missing_article(tmp_path: Path) -> None:
     app = create_app(config, service=service, start_watcher=False)
 
     with TestClient(app) as client:
-        response = client.put(
-            "/api/articles/missing/favorite", json={"favorite": True}
-        )
+        response = client.put("/api/articles/missing/favorite", json={"favorite": True})
     assert response.status_code == 404
 
 
@@ -354,9 +340,7 @@ def test_web_favorite_returns_committed_state_when_catalog_refresh_fails(
 
     monkeypatch.setattr(app.state.catalog, "refresh", broken_refresh)
     with TestClient(app) as client:
-        response = client.put(
-            "/api/articles/dy-123/favorite", json={"favorite": True}
-        )
+        response = client.put("/api/articles/dy-123/favorite", json={"favorite": True})
 
     assert response.status_code == 200
     assert response.json()["item"]["favorite"] is True
@@ -367,9 +351,7 @@ def test_web_favorite_returns_committed_state_when_catalog_refresh_fails(
 @pytest.mark.parametrize("status", [JobStatus.NEEDS_AUTH, JobStatus.FAILED])
 def test_web_can_retry_media_restore_job(tmp_path: Path, status: JobStatus) -> None:
     config, service = _web_fixture(tmp_path)
-    entry = service.database.get_entry("dy-123").model_copy(
-        update={"media_status": "removed"}
-    )
+    entry = service.database.get_entry("dy-123").model_copy(update={"media_status": "removed"})
     service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
     restore = service.set_entry_favorite(entry.id, True)["restore_job"]
     service.database.update_job(
@@ -393,9 +375,7 @@ def test_web_can_retry_media_restore_job(tmp_path: Path, status: JobStatus) -> N
 
 def test_web_retry_reuses_replacement_media_restore_job(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
-    entry = service.database.get_entry("dy-123").model_copy(
-        update={"media_status": "removed"}
-    )
+    entry = service.database.get_entry("dy-123").model_copy(update={"media_status": "removed"})
     service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
     failed = service.set_entry_favorite(entry.id, True)["restore_job"]
     service.database.update_job(
@@ -448,6 +428,11 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'id="command-dialog"' in page.text
         assert 'id="trash-nav"' in page.text
         assert 'id="trash-view"' in page.text
+        assert 'id="trash-select-all"' in page.text
+        assert 'id="trash-clear-selection"' in page.text
+        assert 'id="trash-confirm"' in page.text
+        assert 'id="trash-restore-selected"' in page.text
+        assert 'id="trash-purge-selected"' in page.text
         assert 'id="destructive-dialog"' in page.text
         assert 'id="imports-toggle"' in page.text
         assert 'id="auth-nav"' in page.text
@@ -515,7 +500,7 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "state.currentArticleItem = data.item;" in script.text
         assert "state.currentArticleItem?.entry_id === entryId" in script.text
         assert 'const topicsCreateButton = $("#topics-create-button");' in script.text
-        assert "topicsCreateButton.classList.toggle(\"hidden\", !hasManagedItems);" in script.text
+        assert 'topicsCreateButton.classList.toggle("hidden", !hasManagedItems);' in script.text
 
 
 def test_web_filter_popover_can_paint_above_sidebar(tmp_path: Path) -> None:
@@ -530,8 +515,7 @@ def test_web_filter_popover_can_paint_above_sidebar(tmp_path: Path) -> None:
     assert ".library-sidebar { position: relative; z-index: 0;" in stylesheet.text
     assert ".library-main { position: relative; z-index: 1; min-width: 0;" in stylesheet.text
     assert (
-        ".filter-popover { position: fixed; z-index: 50; "
-        "top: var(--filter-popover-top"
+        ".filter-popover { position: fixed; z-index: 50; top: var(--filter-popover-top"
     ) in stylesheet.text
 
     assert script.status_code == 200
@@ -542,10 +526,7 @@ def test_web_filter_popover_can_paint_above_sidebar(tmp_path: Path) -> None:
     "share_text",
     [
         "https://www.douyin.com/video/7659645255277039717",
-        (
-            "3.21 复制打开抖音，看看【测试作者的作品】实用技巧 "
-            "https://v.douyin.com/AbCdEfG/ 08/31"
-        ),
+        ("3.21 复制打开抖音，看看【测试作者的作品】实用技巧 https://v.douyin.com/AbCdEfG/ 08/31"),
     ],
 )
 def test_web_capture_queues_link_or_share_text(tmp_path: Path, share_text: str) -> None:
@@ -593,21 +574,17 @@ def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
     source_before = source.read_bytes()
     machine_before = machine.read_bytes()
     with TestClient(app) as client:
-        topic_id = service.create_topic(
-            "删除恢复测试", ["dy-123"], goal="验证专题来源恢复"
-        )["topic"]["id"]
+        topic_id = service.create_topic("删除恢复测试", ["dy-123"], goal="验证专题来源恢复")[
+            "topic"
+        ]["id"]
         session_id = client.post(
             "/api/chat/sessions",
             json={"scope": "entry", "context_entry_id": "dy-123"},
         ).json()["id"]
-        rejected = client.request(
-            "DELETE", "/api/articles/dy-123", json={"confirmed": False}
-        )
+        rejected = client.request("DELETE", "/api/articles/dy-123", json={"confirmed": False})
         assert rejected.status_code == 400
 
-        deleted = client.request(
-            "DELETE", "/api/articles/dy-123", json={"confirmed": True}
-        )
+        deleted = client.request("DELETE", "/api/articles/dy-123", json={"confirmed": True})
         assert deleted.status_code == 200
         trash_id = deleted.json()["trash_id"]
         assert client.get("/api/library").json()["total"] == 0
@@ -627,9 +604,7 @@ def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
         assert trash["items"][0]["title"] == "测试文章"
         assert client.get("/trash").status_code == 200
 
-        restored = client.post(
-            f"/api/trash/{trash_id}/restore", json={"confirmed": True}
-        )
+        restored = client.post(f"/api/trash/{trash_id}/restore", json={"confirmed": True})
         assert restored.status_code == 200, restored.text
         assert restored.json()["entry_id"] == "dy-123"
         assert client.get("/api/library").json()["total"] == 1
@@ -641,9 +616,9 @@ def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
         assert machine.is_file()
         assert source.read_bytes() == source_before
         assert machine.read_bytes() == machine_before
-        assert [
-            item.entry_id for item in service.database.get_topic(topic_id).sources
-        ] == ["dy-123"]
+        assert [item.entry_id for item in service.database.get_topic(topic_id).sources] == [
+            "dy-123"
+        ]
         restored_session = service.database.get_chat_session(session_id)
         assert restored_session.scope == "entry"
         assert restored_session.context_entry_id == "dy-123"
@@ -657,19 +632,123 @@ def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
             "DELETE", f"/api/trash/{trash_id}", json={"confirmed": False}
         )
         assert rejected_purge.status_code == 400
-        purged = client.request(
-            "DELETE", f"/api/trash/{trash_id}", json={"confirmed": True}
-        )
+        purged = client.request("DELETE", f"/api/trash/{trash_id}", json={"confirmed": True})
         assert purged.status_code == 200
         assert purged.json()["status"] == "已彻底删除"
-        assert not (
-            config.vault_path / ".douyin-wiki" / "trash" / "entries" / trash_id
-        ).exists()
+        assert not (config.vault_path / ".douyin-wiki" / "trash" / "entries" / trash_id).exists()
         assert client.get("/api/trash").json()["total"] == 0
-        invalid = client.request(
-            "DELETE", "/api/trash/not-a-valid-id", json={"confirmed": True}
-        )
+        invalid = client.request("DELETE", "/api/trash/not-a-valid-id", json={"confirmed": True})
         assert invalid.status_code == 400
+
+
+def _add_managed_article(
+    service: DouyinWikiService, vault: Path, video_id: str, title: str
+) -> None:
+    now = datetime.now(UTC)
+    source_name = f"{title}_{video_id}.md"
+    raw_name = f"{title}_{video_id}.md"
+    (vault / "wiki" / "sources" / source_name).write_text(
+        f"---\ntype: source\nvideo_id: '{video_id}'\n---\n# {title}\n",
+        encoding="utf-8",
+    )
+    (vault / "raw" / raw_name).write_text("原始记录", encoding="utf-8")
+    (vault / "wiki" / ".data" / "sources" / f"{video_id}.md").write_text(
+        "机器数据", encoding="utf-8"
+    )
+    service.database.upsert_entry(
+        EntryRecord(
+            id=f"dy-{video_id}",
+            video_id=video_id,
+            title=title,
+            original_url=f"https://www.douyin.com/video/{video_id}",
+            canonical_url=f"https://www.douyin.com/video/{video_id}",
+            raw_path=f"raw/{raw_name}",
+            source_path=f"wiki/sources/{source_name}",
+            status="active",
+            media_status="present",
+            retention=RetentionPolicy.KEEP,
+            summary=title,
+            created_at=now,
+            updated_at=now,
+        ),
+        {
+            "metadata": {
+                "video_id": video_id,
+                "title": title,
+                "author": "测试博主",
+                "source_kind": "video",
+            },
+            "analysis": {
+                "analysis_version": 2,
+                "title": title,
+                "one_liner": title,
+            },
+        },
+    )
+
+
+def test_trash_batch_restore_and_permanent_delete(tmp_path: Path) -> None:
+    config, service = _web_fixture(tmp_path)
+    _add_managed_article(service, config.vault_path, "456", "第二篇")
+    app = create_app(
+        config,
+        service=service,
+        chat_provider=FakeChatProvider(),
+        start_watcher=False,
+    )
+    with TestClient(app) as client:
+        first = client.request("DELETE", "/api/articles/dy-123", json={"confirmed": True}).json()
+        second = client.request("DELETE", "/api/articles/dy-456", json={"confirmed": True}).json()
+        trash_ids = [first["trash_id"], second["trash_id"]]
+        assert client.get("/api/trash").json()["total"] == 2
+
+        rejected = client.post(
+            "/api/trash/batch/restore", json={"confirmed": False, "trash_ids": trash_ids}
+        )
+        assert rejected.status_code == 400
+        empty = client.post(
+            "/api/trash/batch/restore", json={"confirmed": True, "trash_ids": []}
+        )
+        assert empty.status_code == 422
+
+        restored = client.post(
+            "/api/trash/batch/restore", json={"confirmed": True, "trash_ids": trash_ids}
+        )
+        assert restored.status_code == 200, restored.text
+        assert len(restored.json()["restored"]) == 2
+        assert restored.json()["failed"] == []
+        assert client.get("/api/library").json()["total"] == 2
+        assert client.get("/api/trash").json()["total"] == 0
+
+        again = [
+            client.request("DELETE", f"/api/articles/{entry_id}", json={"confirmed": True}).json()[
+                "trash_id"
+            ]
+            for entry_id in ("dy-123", "dy-456")
+        ]
+        missing = "0" * 32
+        partial = client.post(
+            "/api/trash/batch/restore",
+            json={"confirmed": True, "trash_ids": [again[0], missing]},
+        )
+        assert partial.status_code == 200, partial.text
+        assert len(partial.json()["restored"]) == 1
+        assert len(partial.json()["failed"]) == 1
+        assert client.get("/api/trash").json()["total"] == 1
+
+        remaining = client.get("/api/trash").json()["items"][0]["trash_id"]
+        rejected_purge = client.post(
+            "/api/trash/batch/purge", json={"confirmed": False, "trash_ids": [remaining]}
+        )
+        assert rejected_purge.status_code == 400
+        purged = client.post(
+            "/api/trash/batch/purge",
+            json={"confirmed": True, "trash_ids": [remaining, remaining]},
+        )
+        assert purged.status_code == 200, purged.text
+        assert len(purged.json()["deleted"]) == 1
+        assert client.get("/api/trash").json()["total"] == 0
+        assert not (config.vault_path / ".douyin-wiki" / "trash" / "entries" / remaining).exists()
 
 
 def test_interrupted_delete_is_rolled_back_on_recovery(tmp_path: Path, monkeypatch) -> None:
@@ -687,9 +766,7 @@ def test_interrupted_delete_is_rolled_back_on_recovery(tmp_path: Path, monkeypat
     assert not source.exists()
     assert service.database.get_entry("dy-123").id == "dy-123"
     manifests = list(
-        (config.vault_path / ".douyin-wiki" / "trash" / "entries").glob(
-            "*/manifest.json"
-        )
+        (config.vault_path / ".douyin-wiki" / "trash" / "entries").glob("*/manifest.json")
     )
     assert len(manifests) == 1
     assert '"phase": "files_moved"' in manifests[0].read_text(encoding="utf-8")
@@ -701,9 +778,7 @@ def test_interrupted_delete_is_rolled_back_on_recovery(tmp_path: Path, monkeypat
     assert service.list_trashed_entries() == []
 
 
-def test_interrupted_restore_is_completed_without_ghost_trash(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_interrupted_restore_is_completed_without_ghost_trash(tmp_path: Path, monkeypatch) -> None:
     config, service = _web_fixture(tmp_path)
     deleted = service.trash_entry("dy-123", confirmed=True)
     original_write = service._write_trash_manifest
@@ -713,21 +788,13 @@ def test_interrupted_restore_is_completed_without_ghost_trash(
             raise SystemExit("模拟恢复完成后的进程中断")
         original_write(item_dir, manifest)
 
-    monkeypatch.setattr(
-        service, "_write_trash_manifest", interrupt_after_database_restore
-    )
+    monkeypatch.setattr(service, "_write_trash_manifest", interrupt_after_database_restore)
     with pytest.raises(SystemExit):
         service.restore_trashed_entry(deleted["trash_id"], confirmed=True)
 
     assert service.database.get_entry("dy-123").id == "dy-123"
     assert (config.vault_path / "wiki" / "sources" / "测试文章_123.md").is_file()
-    item_dir = (
-        config.vault_path
-        / ".douyin-wiki"
-        / "trash"
-        / "entries"
-        / deleted["trash_id"]
-    )
+    item_dir = config.vault_path / ".douyin-wiki" / "trash" / "entries" / deleted["trash_id"]
     assert item_dir.is_dir()
 
     monkeypatch.setattr(service, "_write_trash_manifest", original_write)
@@ -821,9 +888,7 @@ def test_web_delete_survives_catalog_refresh_failure(tmp_path: Path, monkeypatch
         lambda: (_ for _ in ()).throw(RuntimeError("目录故障")),
     )
     with TestClient(app) as client:
-        response = client.request(
-            "DELETE", "/api/articles/dy-123", json={"confirmed": True}
-        )
+        response = client.request("DELETE", "/api/articles/dy-123", json={"confirmed": True})
     assert response.status_code == 200
     assert any("网页目录刷新失败" in item for item in response.json()["warnings"])
     with pytest.raises(EntryNotFoundError):
@@ -907,7 +972,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="analysis-view"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.2.16" in page.text
+        assert "/static/model-settings.js?v=0.2.19" in page.text
         assert "对话模型" in page.text
         assert 'name="analysis-mode"' in page.text
         assert "保存分析方式" in page.text
@@ -921,7 +986,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="app-shell"' in analysis.text
         assert "导入后的分析方式" in analysis.text
         assert 'value="provider"' in analysis.text
-        assert "/static/analysis-settings.js?v=0.2.16" in analysis.text
+        assert "/static/analysis-settings.js?v=0.2.19" in analysis.text
         assert 'href="/settings/model"' in analysis.text
         assert 'data-route="/settings/analysis"' in analysis.text
 
@@ -992,7 +1057,7 @@ inspirations: []
 
 ## 灵感
 
-- 未填写；AI 不推测用户灵感。
+- 未填写
 
 ## 一句话
 
@@ -1102,9 +1167,7 @@ def test_model_settings_save_to_keychain_without_changing_gateway_mode(
         assert tested.json()["usage"]["total_tokens"] == 7
 
 
-def test_web_can_switch_analysis_mode_without_silent_change(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_web_can_switch_analysis_mode_without_silent_change(tmp_path: Path, monkeypatch) -> None:
     config, service = _web_fixture(tmp_path)
     config_path = tmp_path / "config.toml"
     monkeypatch.setattr("douyin_wiki.webapp.app.get_secret", lambda account: "")

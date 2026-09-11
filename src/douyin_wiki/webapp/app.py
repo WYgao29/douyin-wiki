@@ -49,7 +49,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.2.16"
+WEB_VERSION = "0.2.19"
 
 ANALYSIS_MODE_INFO = {
     "gateway": {
@@ -122,6 +122,12 @@ class SaveTopicNoteRequest(BaseModel):
 
 class ConfirmDestructiveActionRequest(BaseModel):
     confirmed: bool = False
+
+
+class TrashBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmed: bool = False
+    trash_ids: list[str] = Field(min_length=1, max_length=500)
 
 
 class SetFavoriteRequest(BaseModel):
@@ -633,10 +639,30 @@ def create_app(
             items.append(item)
         return {"items": items, "total": len(items)}
 
+    @app.post("/api/trash/batch/restore")
+    async def restore_trash_items(payload: TrashBatchRequest):
+        try:
+            result = core.restore_trashed_entries(payload.trash_ids, confirmed=payload.confirmed)
+        except EntryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, DouyinWikiError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await publish_mutation(result)
+
+    @app.post("/api/trash/batch/purge")
+    async def permanently_delete_trash_items(payload: TrashBatchRequest):
+        try:
+            result = core.permanently_delete_trashed_entries(
+                payload.trash_ids, confirmed=payload.confirmed
+            )
+        except EntryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return await publish_mutation(result, refresh_catalog=False)
+
     @app.post("/api/trash/{trash_id}/restore")
-    async def restore_trash_item(
-        trash_id: str, payload: ConfirmDestructiveActionRequest
-    ):
+    async def restore_trash_item(trash_id: str, payload: ConfirmDestructiveActionRequest):
         try:
             result = core.restore_trashed_entry(trash_id, confirmed=payload.confirmed)
         except EntryNotFoundError as exc:
@@ -650,9 +676,7 @@ def create_app(
         trash_id: str, payload: ConfirmDestructiveActionRequest
     ):
         try:
-            result = core.permanently_delete_trashed_entry(
-                trash_id, confirmed=payload.confirmed
-            )
+            result = core.permanently_delete_trashed_entry(trash_id, confirmed=payload.confirmed)
         except EntryNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -699,9 +723,7 @@ def create_app(
         return _topic_payload(value)
 
     @app.post("/api/topics/{topic_id}/artifacts", status_code=201)
-    async def generate_topic_artifact(
-        topic_id: str, payload: GenerateTopicArtifactRequest
-    ):
+    async def generate_topic_artifact(topic_id: str, payload: GenerateTopicArtifactRequest):
         try:
             artifact = await core.generate_topic_artifact(
                 topic_id,
@@ -826,21 +848,15 @@ def create_app(
             messages, citations = await asyncio.to_thread(
                 context_builder.build,
                 payload.content,
-                context_entry_id=(
-                    session.context_entry_id if session.scope == "entry" else None
-                ),
-                context_topic_id=(
-                    session.context_topic_id if session.scope == "topic" else None
-                ),
+                context_entry_id=(session.context_entry_id if session.scope == "entry" else None),
+                context_topic_id=(session.context_topic_id if session.scope == "topic" else None),
                 history=history,
             )
         except KeyError as exc:
             raise HTTPException(
                 status_code=409, detail="该对话关联的专题已不存在，请新建对话"
             ) from exc
-        await asyncio.to_thread(
-            core.database.add_chat_message, session_id, "user", payload.content
-        )
+        await asyncio.to_thread(core.database.add_chat_message, session_id, "user", payload.content)
         if session.title == "新对话":
             await asyncio.to_thread(
                 core.database.update_chat_session,
@@ -956,9 +972,7 @@ def create_app(
             ),
             "configured": current_provider.configured,
             "analysis_mode": current_config.analysis_mode.value,
-            "analysis_mode_label": ANALYSIS_MODE_INFO[current_config.analysis_mode.value][
-                "label"
-            ],
+            "analysis_mode_label": ANALYSIS_MODE_INFO[current_config.analysis_mode.value]["label"],
             "analysis_modes": [
                 {"value": value, **info} for value, info in ANALYSIS_MODE_INFO.items()
             ],
@@ -1035,9 +1049,7 @@ def create_app(
         async with settings_lock:
             config_path_value = Path(app.state.config_path)
             current_config = (
-                load_config(config_path_value)
-                if config_path_value.exists()
-                else app.state.config
+                load_config(config_path_value) if config_path_value.exists() else app.state.config
             )
             updated = current_config.model_copy(update={"analysis_mode": payload.mode})
             if config_path_value.exists():
@@ -1047,9 +1059,7 @@ def create_app(
                     {None: {"analysis_mode": payload.mode.value}},
                 )
             else:
-                await asyncio.to_thread(
-                    write_config, updated, config_path_value, overwrite=True
-                )
+                await asyncio.to_thread(write_config, updated, config_path_value, overwrite=True)
             app.state.config = updated
             core.config = updated
             if payload.mode == AnalysisMode.PROVIDER:

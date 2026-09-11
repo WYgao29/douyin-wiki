@@ -141,9 +141,7 @@ class VaultWriter:
         """
         if not isinstance(work_id, str) or _SAFE_WORK_ID.fullmatch(work_id) is None:
             raise ValueError("work_id must be a numeric Douyin work ID")
-        lock_path = (
-            self.vault_path / ".douyin-wiki" / "locks" / "works" / f"{work_id}.lock"
-        )
+        lock_path = self.vault_path / ".douyin-wiki" / "locks" / "works" / f"{work_id}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -751,9 +749,7 @@ class VaultWriter:
                 continue
             target = Path(entry.source_path).with_suffix("").as_posix()
             state = "启用" if source.enabled else "停用"
-            source_lines.append(
-                f"{source.position}. [[{target}|{entry.title}]] · {state}"
-            )
+            source_lines.append(f"{source.position}. [[{target}|{entry.title}]] · {state}")
         artifact_lines = [
             f"- [[topics/{topic.id}/artifacts/{artifact.id}|{artifact.title}]]"
             f" · {'需要更新' if artifact.status == 'needs_update' else '当前版本'}"
@@ -805,9 +801,7 @@ class VaultWriter:
                     "artifact_id": artifact.id,
                     "artifact_kind": artifact.kind,
                     "title": artifact.title,
-                    "status": (
-                        "需要更新" if artifact.status == "needs_update" else "当前版本"
-                    ),
+                    "status": ("需要更新" if artifact.status == "needs_update" else "当前版本"),
                     "source_revision": artifact.source_revision,
                     "source_revisions": [
                         item.model_dump(mode="json") for item in artifact.source_revisions
@@ -947,8 +941,7 @@ class VaultWriter:
             if machine_data_path != expected_machine_path:
                 raise ValueError("machine_data_path 与机器侧车路径不一致")
             if not (
-                source_page_path.stem == video_id
-                or source_page_path.stem.endswith(f"_{video_id}")
+                source_page_path.stem == video_id or source_page_path.stem.endswith(f"_{video_id}")
             ):
                 raise ValueError("source_page 文件名与 video_id 不一致")
         source_frontmatter_kind = source_frontmatter.get("source_kind")
@@ -990,9 +983,7 @@ class VaultWriter:
             retention=retention,
             favorite=favorite,
             media_expires_at=(
-                None
-                if favorite
-                else parse_datetime(source_frontmatter.get("media_expires_at"))
+                None if favorite else parse_datetime(source_frontmatter.get("media_expires_at"))
             ),
             summary=analysis.one_liner,
             inspirations=inspirations,
@@ -1054,9 +1045,7 @@ class VaultWriter:
         for machine_path in machine_paths:
             try:
                 machine_frontmatter, machine_body = self._parse_document_strict(machine_path)
-                payload_match = re.search(
-                    r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S
-                )
+                payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
                 if not payload_match:
                     raise ValueError("博主机器侧车缺少 YAML 数据块")
                 payload = yaml.safe_load(payload_match.group("payload"))
@@ -1164,9 +1153,7 @@ class VaultWriter:
                     if artifact_id in seen_artifact_ids:
                         raise ValueError(f"重复 artifact.id：{artifact_id}")
                     seen_artifact_ids.add(artifact_id)
-                    artifact_path = (
-                        machine_path.parent.parent / "artifacts" / f"{artifact_id}.md"
-                    )
+                    artifact_path = machine_path.parent.parent / "artifacts" / f"{artifact_id}.md"
                     referenced_artifact_paths.add(artifact_path)
                     if not artifact_path.is_file():
                         raise FileNotFoundError(f"专题成果文件不存在：{artifact_path.name}")
@@ -1278,9 +1265,7 @@ class VaultWriter:
                     try:
                         self._parse_document_strict(artifact_path)
                     except Exception as exc:
-                        self._append_load_error(
-                            self.last_artifact_load_errors, artifact_path, exc
-                        )
+                        self._append_load_error(self.last_artifact_load_errors, artifact_path, exc)
                     else:
                         self._append_load_error(
                             self.last_artifact_load_errors,
@@ -1713,7 +1698,7 @@ class VaultWriter:
     @staticmethod
     def _inspiration_lines(inspirations: list[InspirationInput]) -> list[str]:
         if not inspirations:
-            return ["- 未填写；AI 不推测用户灵感。"]
+            return ["- 未填写"]
         lines = []
         for inspiration in inspirations:
             suffix = ""
@@ -1800,9 +1785,7 @@ class VaultWriter:
     @staticmethod
     def _parse_document_strict(path: Path) -> tuple[dict[str, Any], str]:
         content = path.read_text(encoding="utf-8")
-        match = re.match(
-            r"^---\s*\n(?P<frontmatter>.*?)\n---\s*\n(?P<body>.*)$", content, re.S
-        )
+        match = re.match(r"^---\s*\n(?P<frontmatter>.*?)\n---\s*\n(?P<body>.*)$", content, re.S)
         if not match:
             raise ValueError("文档缺少 YAML frontmatter")
         frontmatter = yaml.safe_load(match.group("frontmatter"))
