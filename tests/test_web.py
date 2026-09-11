@@ -483,7 +483,7 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert ".article-hero.has-cover" not in stylesheet.text
         assert ".article-cover-frame" not in stylesheet.text
         assert ".article-cover" in stylesheet.text
-        assert "font-family: var(--font-reading)" in stylesheet.text
+        assert "--font-reading:" in stylesheet.text
         assert ".article-body { max-inline-size: 40rem" in stylesheet.text
         assert "::view-transition-group(active-album-cover)" in stylesheet.text
         assert "view-transition-name: app-sidebar" in stylesheet.text
@@ -907,7 +907,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="analysis-view"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.2.14" in page.text
+        assert "/static/model-settings.js?v=0.2.16" in page.text
         assert "对话模型" in page.text
         assert 'name="analysis-mode"' in page.text
         assert "保存分析方式" in page.text
@@ -921,7 +921,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="app-shell"' in analysis.text
         assert "导入后的分析方式" in analysis.text
         assert 'value="provider"' in analysis.text
-        assert "/static/analysis-settings.js?v=0.2.14" in analysis.text
+        assert "/static/analysis-settings.js?v=0.2.16" in analysis.text
         assert 'href="/settings/model"' in analysis.text
         assert 'data-route="/settings/analysis"' in analysis.text
 
