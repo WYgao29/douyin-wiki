@@ -302,6 +302,26 @@ ON web_chat_messages(session_id, id);
 
 """
 
+AUTH_SESSIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    account_hint TEXT,
+    cookie_source_label TEXT,
+    error_summary TEXT,
+    affected_job_count INTEGER NOT NULL DEFAULT 0,
+    retried_job_ids_json TEXT NOT NULL DEFAULT '[]',
+    trigger_job_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_channel_updated
+ON auth_sessions(channel, updated_at DESC);
+"""
+
 
 _LEXICAL_PARTS = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+|[\w]+", re.UNICODE)
 _ACTIVE_CLAIM: ContextVar[tuple[str, str] | None] = ContextVar("active_job_claim", default=None)
@@ -370,6 +390,7 @@ class Database:
             previous_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             conn.executescript(SCHEMA)
             conn.executescript(FAVORITES_SCHEMA)
+            conn.executescript(AUTH_SESSIONS_SCHEMA)
             self._migrate_chat_sessions_for_topics(conn)
             chunk_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()
@@ -400,7 +421,7 @@ class Database:
             if previous_version < 9:
                 self._rebuild_fts_conn(conn)
             self._retire_undeliverable_events_conn(conn)
-            conn.execute("PRAGMA user_version=10")
+            conn.execute("PRAGMA user_version=11")
 
     @staticmethod
     def _rebuild_fts_conn(conn: sqlite3.Connection) -> None:
@@ -638,19 +659,263 @@ class Database:
         self,
         status: JobStatus | None = None,
         limit: int | None = 50,
+        *,
+        kinds: Collection[str] | None = None,
+        statuses: Collection[str | JobStatus] | None = None,
+        offset: int = 0,
     ) -> list[JobRecord]:
-        query = "SELECT * FROM jobs"
-        params: list[Any] = []
-        if status:
-            query += " WHERE status=?"
-            params.append(status.value)
+        query, params = self._job_filter_sql(status=status, kinds=kinds, statuses=statuses)
         query += " ORDER BY created_at DESC"
         if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
+            if offset:
+                query += " OFFSET ?"
+                params.append(offset)
         with self.connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._job_from_row(row) for row in rows]
+
+    def count_jobs(
+        self,
+        status: JobStatus | None = None,
+        *,
+        kinds: Collection[str] | None = None,
+        statuses: Collection[str | JobStatus] | None = None,
+    ) -> int:
+        query, params = self._job_filter_sql(status=status, kinds=kinds, statuses=statuses)
+        query = query.replace("SELECT * FROM jobs", "SELECT COUNT(*) AS total FROM jobs", 1)
+        with self.connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["total"] if row else 0)
+
+    @staticmethod
+    def _job_filter_sql(
+        *,
+        status: JobStatus | None = None,
+        kinds: Collection[str] | None = None,
+        statuses: Collection[str | JobStatus] | None = None,
+    ) -> tuple[str, list[Any]]:
+        query = "SELECT * FROM jobs"
+        clauses: list[str] = []
+        params: list[Any] = []
+        wanted_statuses = [status] if status else []
+        if statuses:
+            wanted_statuses.extend(statuses)
+        normalized_statuses = [
+            item.value if isinstance(item, JobStatus) else str(item) for item in wanted_statuses
+        ]
+        if normalized_statuses:
+            placeholders = ",".join("?" * len(normalized_statuses))
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(normalized_statuses)
+        if kinds:
+            kind_list = [str(item) for item in kinds]
+            placeholders = ",".join("?" * len(kind_list))
+            clauses.append(f"kind IN ({placeholders})")
+            params.extend(kind_list)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        return query, params
+
+    def job_status_counts(self) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS total FROM jobs GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def list_job_timeline(self, job_id: str) -> list[JobEvent]:
+        job = self.get_job(job_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_events WHERE job_id=? ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        return [
+            JobEvent(
+                id=row["id"],
+                job_id=row["job_id"],
+                status=JobStatus(row["status"]),
+                gateway_context=job.request.gateway_context,
+                result=json.loads(row["result_json"]),
+                created_at=parse_datetime(row["created_at"]),
+                acknowledged_at=parse_datetime(row["acknowledged_at"])
+                if row["acknowledged_at"]
+                else None,
+                superseded_at=parse_datetime(row["superseded_at"])
+                if row["superseded_at"]
+                else None,
+            )
+            for row in rows
+        ]
+
+    def delete_job_record(self, job_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    def create_auth_session(
+        self,
+        *,
+        channel: str,
+        scope: str,
+        stage: str = "queued",
+        trigger_job_id: str | None = None,
+        cookie_source_label: str | None = None,
+        affected_job_count: int = 0,
+        account_hint: str | None = None,
+    ) -> dict[str, Any]:
+        session_id = uuid.uuid4().hex
+        now = iso_now()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO auth_sessions
+                   (id, channel, scope, stage, account_hint, cookie_source_label,
+                    error_summary, affected_job_count, retried_job_ids_json,
+                    trigger_job_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL, ?, '[]', ?, ?, ?)""",
+                (
+                    session_id,
+                    channel,
+                    scope,
+                    stage,
+                    account_hint,
+                    cookie_source_label,
+                    affected_job_count,
+                    trigger_job_id,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_auth_session(session_id)
+
+    def get_auth_session(self, session_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM auth_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        if row is None:
+            raise JobStateError(f"auth session not found: {session_id}")
+        return self._auth_session_from_row(row)
+
+    def latest_auth_session(
+        self, channel: str, *, active_only: bool = False
+    ) -> dict[str, Any] | None:
+        query = "SELECT * FROM auth_sessions WHERE channel=?"
+        params: list[Any] = [channel]
+        if active_only:
+            query += (
+                " AND stage IN ('queued','launching','waiting_login','verifying')"
+            )
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self.connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return self._auth_session_from_row(row) if row else None
+
+    def list_auth_sessions(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM auth_sessions ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._auth_session_from_row(row) for row in rows]
+
+    def update_auth_session(
+        self,
+        session_id: str,
+        *,
+        stage: str | None = None,
+        error_summary: str | None = None,
+        affected_job_count: int | None = None,
+        retried_job_ids: list[str] | None = None,
+        account_hint: str | None = None,
+        complete: bool = False,
+    ) -> dict[str, Any]:
+        current = self.get_auth_session(session_id)
+        now = iso_now()
+        updates = {
+            "stage": stage or current["stage"],
+            "error_summary": (
+                error_summary if error_summary is not None else current["error_summary"]
+            ),
+            "affected_job_count": (
+                affected_job_count
+                if affected_job_count is not None
+                else current["affected_job_count"]
+            ),
+            "retried_job_ids_json": json.dumps(
+                retried_job_ids if retried_job_ids is not None else current["retried_job_ids"],
+                ensure_ascii=False,
+            ),
+            "account_hint": account_hint if account_hint is not None else current["account_hint"],
+            "updated_at": now,
+            "completed_at": now if complete else current["completed_at"],
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE auth_sessions
+                   SET stage=?, error_summary=?, affected_job_count=?,
+                       retried_job_ids_json=?, account_hint=?, updated_at=?, completed_at=?
+                   WHERE id=?""",
+                (
+                    updates["stage"],
+                    updates["error_summary"],
+                    updates["affected_job_count"],
+                    updates["retried_job_ids_json"],
+                    updates["account_hint"],
+                    updates["updated_at"],
+                    updates["completed_at"],
+                    session_id,
+                ),
+            )
+        return self.get_auth_session(session_id)
+
+    @staticmethod
+    def _auth_session_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "channel": row["channel"],
+            "scope": row["scope"],
+            "stage": row["stage"],
+            "account_hint": row["account_hint"],
+            "cookie_source_label": row["cookie_source_label"],
+            "error_summary": row["error_summary"],
+            "affected_job_count": int(row["affected_job_count"] or 0),
+            "retried_job_ids": json.loads(row["retried_job_ids_json"] or "[]"),
+            "trigger_job_id": row["trigger_job_id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    def record_worker_heartbeat(
+        self,
+        worker_id: str,
+        *,
+        running_job_id: str | None = None,
+        queue_length: int | None = None,
+    ) -> None:
+        payload = {
+            "worker_id": worker_id,
+            "at": iso_now(),
+            "running_job_id": running_job_id,
+            "queue_length": queue_length,
+        }
+        self.set_index_metadata("worker_heartbeat", json.dumps(payload, ensure_ascii=False))
+
+    def get_worker_heartbeat(self) -> dict[str, Any] | None:
+        raw = self.get_index_metadata("worker_heartbeat")
+        return json.loads(raw) if raw else None
+
+    def request_worker_reload(self) -> None:
+        self.set_index_metadata("worker_reload_requested_at", iso_now())
+
+    def worker_reload_requested_at(self) -> str | None:
+        return self.get_index_metadata("worker_reload_requested_at")
+
+    def clear_worker_reload_request(self) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM index_metadata WHERE key=?", ("worker_reload_requested_at",))
 
     def claim_next_job(
         self,

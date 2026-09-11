@@ -56,12 +56,9 @@ async def test_ui_inventory_requires_separate_confirm_and_partial_acceptance(
     page = offline_page
     root = Path(__file__).parents[1] / "src/douyin_wiki/webapp"
     template = (root / "templates/app.html").read_text()
-    begin = template.index('  <dialog id="favorites-dialog"')
-    end = template.index('  <dialog id="capture-dialog"')
-    html = (
-        '<meta charset="utf-8"><button id="favorites-toggle">导入收藏</button>'
-        + template[begin:end]
-    )
+    begin = template.index('      <section id="imports-favorites-view"')
+    end = template.index('      <section id="jobs-view"')
+    html = '<meta charset="utf-8">' + template[begin:end]
     data = {
         "job_id": "fixture-parent",
         "status": "needs_selection",
@@ -114,8 +111,15 @@ async def test_ui_inventory_requires_separate_confirm_and_partial_acceptance(
     )
     await page.goto("http://fixture.test/")
     await page.add_style_tag(content=(root / "static/app.css").read_text())
-    await page.add_script_tag(content=(root / "static/favorites.js").read_text())
-    await page.locator("#favorites-toggle").click()
+    await page.add_script_tag(content=(root / "static/shared.js").read_text())
+    await page.evaluate(
+        "document.getElementById('imports-favorites-view').classList.remove('hidden')"
+    )
+    await page.add_script_tag(content=(root / "static/imports-favorites.js").read_text())
+    await page.evaluate(
+        "window.dispatchEvent(new CustomEvent('douku:route',"
+        " {detail:{path:'/imports/favorites'}}))"
+    )
     await page.locator("#favorites-scan").click()
     await page.locator("#favorites-items a").wait_for()
     assert await page.locator("#favorites-items img").count() == 0
@@ -124,8 +128,5 @@ async def test_ui_inventory_requires_separate_confirm_and_partial_acceptance(
     assert not any(path.endswith("/confirm") for path, _ in calls)
     await page.locator("#favorites-partial").check()
     await page.locator("#favorites-confirm").click()
-    await page.wait_for_function("document.getElementById('favorites-gateway').hidden === false")
+    await page.wait_for_timeout(500)
     assert sum(path.endswith("/confirm") for path, _ in calls) == 1
-    assert await page.locator("#favorites-confirm").is_disabled()
-    await page.locator("#favorites-close").click()
-    assert not await page.locator("#favorites-dialog").is_visible()

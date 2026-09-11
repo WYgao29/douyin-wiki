@@ -107,6 +107,7 @@ JOB_KIND_LABELS = {
     "creator_import": "博主批量采集",
     "favorites_import": "收藏批量导入",
     "reanalyze": "重新分析",
+    "media_restore": "媒体恢复",
     "overview": "专题总览",
     "comparison": "跨来源对比表",
     "evidence_map": "证据地图",

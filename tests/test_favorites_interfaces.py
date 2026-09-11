@@ -113,7 +113,12 @@ def test_web_scan_only_creates_inventory_job(config, service) -> None:
     assert response.status_code == 202
     assert response.json() == {"job_id": "favorites-1", "status": "queued"}
     assert favorites.started == [
-        {"folder_ids": ["folder-1"], "include_images": True, "directory_only": False}
+        {
+            "folder_ids": ["folder-1"],
+            "include_images": True,
+            "directory_only": False,
+            "update_mode": "incremental",
+        }
     ]
     assert favorites.confirmed == []
 

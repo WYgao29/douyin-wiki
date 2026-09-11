@@ -31,20 +31,31 @@ from ..config import (
 )
 from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
 from ..localization import add_display_labels, label_entry_status
-from ..models import InspirationDraft, InspirationInput, TopicArtifactKind
+from ..models import (
+    CaptureOptions,
+    InspirationDraft,
+    InspirationInput,
+    RetentionPolicy,
+    TopicArtifactKind,
+)
 from ..secrets import get_secret, store_secret
 from ..service import DouyinWikiService
 from ..setup import update_config_values, write_config
 from ..time_utils import beijing_iso, format_beijing
+from ..web_operation import WebOperationService
 from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.1.9"
+WEB_VERSION = "0.2.4"
 
 
 class CaptureSubmissionRequest(BaseModel):
     share_text: str = Field(min_length=1, max_length=20_000)
+    inspirations: list[InspirationInput] = Field(default_factory=list)
+    retention: RetentionPolicy = RetentionPolicy.TEMPORARY
+    allow_long: bool = False
+    approve_cloud_analysis: bool = False
 
 
 class CreateSessionRequest(BaseModel):
@@ -121,17 +132,26 @@ class ModelSettingsRequest(BaseModel):
 class ChangeNotifier:
     def __init__(self) -> None:
         self.version = 0
+        self.last_name = "library"
+        self.last_payload: dict[str, Any] = {"version": 0}
         self._condition = asyncio.Condition()
 
-    async def publish(self) -> None:
+    async def publish(self, name: str = "library", payload: dict[str, Any] | None = None) -> None:
         async with self._condition:
             self.version += 1
+            self.last_name = name
+            self.last_payload = payload or {"version": self.version}
             self._condition.notify_all()
 
     async def wait(self, last_version: int) -> int:
         async with self._condition:
             await self._condition.wait_for(lambda: self.version > last_version)
             return self.version
+
+    async def wait_named(self, last_version: int) -> tuple[int, str, dict[str, Any]]:
+        async with self._condition:
+            await self._condition.wait_for(lambda: self.version > last_version)
+            return self.version, self.last_name, self.last_payload
 
 
 def _item_payload(item: Any) -> dict[str, Any]:
@@ -234,6 +254,7 @@ class FavoritesScanBody(BaseModel):
     folder_ids: list[str] | None = None
     include_images: bool = False
     directory_only: bool = False
+    update_mode: Literal["incremental", "full"] = "incremental"
 
 
 class FavoritesSelectionBody(BaseModel):
@@ -268,6 +289,7 @@ def create_app(
     catalog = LibraryCatalog(cfg.vault_path, core.database)
     catalog.refresh()
     notifier = ChangeNotifier()
+    operations = WebOperationService(core)
     provider_factory = chat_provider_factory or OpenAICompatibleChatProvider
     provider = chat_provider or provider_factory(cfg.llm)
     context_builder = ChatContextBuilder(core)
@@ -322,6 +344,7 @@ def create_app(
     app.state.service = core
     app.state.catalog = catalog
     app.state.chat_provider = provider
+    app.state.operations = operations
 
     async def publish_mutation(
         result: dict[str, Any], *, refresh_catalog: bool = True
@@ -470,8 +493,17 @@ def create_app(
             extract_douyin_url(payload.share_text)
         except DouyinWikiError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        job = core.capture_douyin(payload.share_text)
-        return {"job_id": job.id, "status": job.status.value}
+        job = core.capture_douyin(
+            payload.share_text,
+            inspirations=payload.inspirations,
+            options=CaptureOptions(
+                retention=payload.retention,
+                allow_long=payload.allow_long,
+                approve_cloud_analysis=payload.approve_cloud_analysis,
+            ),
+        )
+        presented = operations.present(job)
+        return {"job_id": job.id, **presented}
 
     @app.get("/api/articles/{entry_id}")
     async def article(entry_id: str):
@@ -518,7 +550,7 @@ def create_app(
     @app.get("/api/jobs/{job_id}")
     async def job_status(job_id: str):
         try:
-            return _job_payload(core.get_job(job_id))
+            return operations.get_job(job_id)
         except JobStateError as exc:
             raise HTTPException(status_code=404, detail="任务不存在") from exc
 
@@ -529,7 +561,7 @@ def create_app(
         except JobStateError as exc:
             raise HTTPException(status_code=404, detail="任务不存在") from exc
         try:
-            return _job_payload(core.retry_job(job_id))
+            return operations.present(core.retry_job(job_id))
         except JobStateError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1043,10 +1075,17 @@ def create_app(
         limit: int = Query(50, ge=1, le=200),
         folder_id: str | None = None,
         query: str = "",
+        only_new: bool = False,
     ):
         return add_display_labels(
             await favorites_call(
-                core.favorites.get, job_id, page=page, limit=limit, folder_id=folder_id, query=query
+                core.favorites.get,
+                job_id,
+                page=page,
+                limit=limit,
+                folder_id=folder_id,
+                query=query,
+                only_new=only_new,
             )
         )
 
@@ -1066,6 +1105,16 @@ def create_app(
         job = await favorites_call(core.favorites.retry_failed, job_id)
         return {"job_id": job.id, "status": job.status}
 
+    from .operation_api import register_operation_routes
+
+    register_operation_routes(
+        app,
+        core=core,
+        operations=operations,
+        templates=templates,
+        notifier=notifier,
+        web_version=WEB_VERSION,
+    )
     return app
 
 

@@ -32,15 +32,29 @@ class Worker:
             + service.config.worker.analysis_concurrency,
         )
 
+    def _heartbeat(self, running_job_id: str | None = None) -> None:
+        from .models import JobStatus
+
+        self.service.database.record_worker_heartbeat(
+            self.worker_id,
+            running_job_id=running_job_id,
+            queue_length=self.service.database.count_jobs(status=JobStatus.QUEUED),
+        )
+
+    def reload_requested(self) -> bool:
+        return bool(self.service.database.worker_reload_requested_at())
+
     async def run_once(self):
         self.service.database.recover_expired_jobs()
         self.service.favorites.refresh_all()
+        self._heartbeat()
         job = self.service.database.claim_next_job(
             worker_id=self.worker_id,
             lease_seconds=self.service.config.worker.lease_seconds,
         )
         if job is None:
             return None
+        self._heartbeat(job.id)
         return await self._process_with_heartbeat(job)
 
     async def run_forever(self) -> None:
@@ -63,14 +77,21 @@ class Worker:
                         f"抖库任务收尾失败，Worker 将继续运行：{type(exc).__name__}: {exc}\n"
                     )
             running -= completed
-            if self.source_changed():
+            if self.source_changed() or self.reload_requested():
                 if running:
                     await asyncio.wait(running, timeout=self.service.config.worker.poll_seconds)
                     continue
-                sys.stderr.write("抖库代码已更新，Worker 正在退出并由 LaunchAgent 重启。\n")
+                if self.reload_requested():
+                    self.service.database.clear_worker_reload_request()
+                    sys.stderr.write(
+                        "抖库收到 Web 重载请求，Worker 正在退出并由 LaunchAgent 重启。\n"
+                    )
+                else:
+                    sys.stderr.write("抖库代码已更新，Worker 正在退出并由 LaunchAgent 重启。\n")
                 return
             self.service.database.recover_expired_jobs()
             self.service.favorites.refresh_all()
+            self._heartbeat()
             while len(running) < self.max_parallel_jobs:
                 job = self.service.database.claim_next_job(
                     worker_id=self.worker_id,

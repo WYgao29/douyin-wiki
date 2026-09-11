@@ -114,6 +114,59 @@ class FavoritesStore:
             )
         return job_id
 
+    def previous_work_ids(self, job_id: str) -> set[str]:
+        current = self.load(job_id)
+        folder_ids = current["options"].get("folder_ids")
+        for other_id in self.parent_ids(limit=50):
+            if other_id == job_id:
+                continue
+            other = self.load(other_id)
+            if other["options"].get("directory_only"):
+                continue
+            if other["options"].get("folder_ids") != folder_ids:
+                continue
+            return {row["work_id"] for row in self.rows(other_id)}
+        return set()
+
+    def seed_from_previous(self, job_id: str, *, folder_ids=None) -> int:
+        source_id = None
+        for other_id in self.parent_ids(limit=50):
+            if other_id == job_id:
+                continue
+            other = self.load(other_id)
+            if other["options"].get("directory_only"):
+                continue
+            if other["options"].get("folder_ids") != folder_ids:
+                continue
+            source_id = other_id
+            break
+        if source_id is None:
+            return 0
+        rows = self.rows(source_id)
+        if not rows:
+            return 0
+        with self.database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for index, row in enumerate(rows, start=1):
+                conn.execute(
+                    """INSERT OR IGNORE INTO favorites_items
+                       (parent_id,work_id,position,data_json,selected)
+                       VALUES (?,?,?,?,?)""",
+                    (job_id, row["work_id"], index, row["data_json"], int(row["selected"])),
+                )
+            snapshot = json.loads(
+                conn.execute(
+                    "SELECT snapshot_json FROM favorites_runs WHERE parent_id=?",
+                    (source_id,),
+                ).fetchone()["snapshot_json"]
+                or "{}"
+            )
+            conn.execute(
+                "UPDATE favorites_runs SET snapshot_json=? WHERE parent_id=?",
+                (json.dumps(snapshot, ensure_ascii=False), job_id),
+            )
+        return len(rows)
+
     def checkpoint(self, job_id: str, snapshot: FavoriteInventory) -> None:
         payload = snapshot.model_dump(mode="json")
         with self.database.connect() as conn:
