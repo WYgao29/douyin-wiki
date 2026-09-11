@@ -56,8 +56,10 @@
       root.replaceChildren(D.emptyState("没有符合条件的任务", "提交导入或等待后台处理后，任务会出现在这里。"));
       return;
     }
-    root.replaceChildren(...data.items.map((job) => {
+    const items = [...data.items].sort((a, b) => Number(Boolean(b.requires_user_action)) - Number(Boolean(a.requires_user_action)));
+    root.replaceChildren(...items.map((job) => {
       const row = D.node("article", null, "job-row");
+      if (job.requires_user_action) row.classList.add("is-waiting");
       row.tabIndex = 0;
       row.setAttribute("role", "link");
       const title = D.node("h2", job.kind_label || job.kind);

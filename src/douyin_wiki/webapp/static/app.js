@@ -94,7 +94,7 @@ function readPreferences() {
     ? readStored(STORAGE.density, "comfortable")
     : "comfortable";
   state.sidebarCollapsed = readStored(STORAGE.sidebar, "false") === "true";
-  state.chatCollapsed = readStored(STORAGE.chat, "false") === "true";
+  state.chatCollapsed = readStored(STORAGE.chat, "true") === "true";
 }
 
 function readStateFromURL() {
@@ -546,15 +546,6 @@ function makeFavoriteButton(item, className = "") {
   return button;
 }
 
-function stableHash(value) {
-  let hash = 2166136261;
-  for (const character of String(value || "抖库")) {
-    hash ^= character.codePointAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
 function galleryAccessibleName(item) {
   return [
     item.title || "未命名文章",
@@ -602,7 +593,7 @@ function makeListItem(item) {
   copy.append(title, summary, makeMetadata(item));
   const tags = document.createElement("div");
   tags.className = "item-tags";
-  (item.tags || []).slice(0, 3).forEach((tag) => {
+  (item.tags || []).slice(0, 2).forEach((tag) => {
     const node = document.createElement("span");
     node.className = "item-tag";
     node.textContent = `#${tag}`;
@@ -642,7 +633,6 @@ function makeGalleryCard(item, index, animateNew) {
     article.style.setProperty("--enter-delay", `${Math.min(index, 8) * 35}ms`);
     state.animatedEntryIds.add(animationId);
   }
-  article.style.setProperty("--cover-tilt", stableHash(item.work_id || item.entry_id) % 2 ? ".35deg" : "-.35deg");
   const link = document.createElement("a");
   link.className = "gallery-card-link";
   link.href = `/articles/${encodeURIComponent(item.entry_id)}`;
@@ -1430,11 +1420,11 @@ function closeFilterPopover() {
 function renderPanelState() {
   const shell = $("#app-shell");
   const desktopSidebar = window.matchMedia("(min-width: 960px)").matches;
-  const desktopChat = window.matchMedia("(min-width: 1280px)").matches;
+  const mobile = window.matchMedia("(max-width: 959px)").matches;
   shell.classList.toggle("is-sidebar-collapsed", desktopSidebar && state.sidebarCollapsed);
-  shell.classList.toggle("is-chat-collapsed", desktopChat && state.chatCollapsed);
-  $("#chat-restore").classList.toggle("hidden", !desktopChat || !state.chatCollapsed);
-  $("#chat-toggle").setAttribute("aria-expanded", String(desktopChat ? !state.chatCollapsed : state.activeDrawer === "chat"));
+  if (!mobile) shell.classList.toggle("chat-overlay-open", !state.chatCollapsed);
+  $("#chat-restore")?.classList.add("hidden");
+  $("#chat-toggle").setAttribute("aria-expanded", String(mobile ? state.activeDrawer === "chat" : !state.chatCollapsed));
   if (!$("#filter-popover").classList.contains("hidden")) positionFilterPopover();
 }
 
@@ -1449,12 +1439,12 @@ function setSidebarOpen(open) {
 }
 
 function setChatPanelOpen(open) {
-  if (window.matchMedia("(max-width: 1279px)").matches) {
+  state.chatCollapsed = !open;
+  writePreference(STORAGE.chat, state.chatCollapsed);
+  if (window.matchMedia("(max-width: 959px)").matches) {
     if (open) openDrawer("chat"); else closeDrawers();
     return;
   }
-  state.chatCollapsed = !open;
-  writePreference(STORAGE.chat, state.chatCollapsed);
   renderPanelState();
 }
 
@@ -1484,7 +1474,7 @@ function closeDrawers(restoreFocus = true) {
   $("#drawer-backdrop").classList.add("hidden");
   document.body.classList.remove("drawer-open");
   $("#nav-toggle").setAttribute("aria-expanded", "false");
-  if (!window.matchMedia("(min-width: 1280px)").matches) $("#chat-toggle").setAttribute("aria-expanded", "false");
+  if (window.matchMedia("(max-width: 959px)").matches) $("#chat-toggle").setAttribute("aria-expanded", "false");
   if (restoreFocus && previous) (previous === "sidebar" ? $("#nav-toggle") : $("#chat-toggle")).focus();
 }
 
@@ -2213,6 +2203,7 @@ function bindEvents() {
     if (event.detail.path !== "/imports") return;
     hideLegacyViews();
     window.Douku?.setPage("imports");
+    window.Douku?.setNav("imports-nav");
     $("#imports-view").classList.remove("hidden");
     document.title = "导入内容 · 抖库";
   });
@@ -2240,7 +2231,7 @@ function bindEvents() {
     }
   });
   window.addEventListener("resize", () => {
-    if (window.matchMedia("(min-width: 1280px)").matches) closeDrawers(false);
+    if (window.matchMedia("(min-width: 960px)").matches) closeDrawers(false);
     renderPanelState();
     if (state.libraryLoaded) renderLibrary();
     if (!$("#filter-popover")?.classList.contains("hidden")) positionFilterPopover();

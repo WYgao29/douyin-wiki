@@ -49,6 +49,7 @@
     if (event.detail.path !== "/imports/single") return;
     D.hideAllViews();
     D.setPage("imports-single");
+    D.setNav("imports-nav");
     D.$("imports-single-view").classList.remove("hidden");
     document.title = "单条导入 · 抖库";
     await loadHints();

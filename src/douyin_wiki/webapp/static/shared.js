@@ -39,13 +39,13 @@
   };
   Douku.hideAllViews = () => {
     VIEW_IDS.forEach((id) => Douku.$(id)?.classList.add("hidden"));
-    Douku.qsa(".nav-item").forEach((node) => node.classList.remove("active"));
+    Douku.qsa(".nav-item, .settings-nav-link").forEach((node) => node.classList.remove("active"));
   };
   Douku.setPage = (name) => {
     Douku.$("app-shell")?.setAttribute("data-page", name);
   };
   Douku.setNav = (id) => {
-    Douku.qsa(".nav-item").forEach((node) => node.classList.remove("active"));
+    Douku.qsa(".nav-item, .settings-nav-link").forEach((node) => node.classList.remove("active"));
     Douku.$(id)?.classList.add("active");
   };
   Douku.isOperationPath = (path) => (
