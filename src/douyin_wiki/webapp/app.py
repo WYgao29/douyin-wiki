@@ -49,7 +49,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.2.11"
+WEB_VERSION = "0.2.14"
 
 ANALYSIS_MODE_INFO = {
     "gateway": {
@@ -480,16 +480,26 @@ def create_app(
     async def analysis_settings_page(request: Request):
         return templates.TemplateResponse(
             request,
-            "analysis_settings.html",
-            {"page_title": "导入分析", "web_version": WEB_VERSION},
+            "app.html",
+            {
+                "page_title": "导入分析",
+                "initial_entry_id": "",
+                "initial_topic_id": "",
+                "web_version": WEB_VERSION,
+            },
         )
 
     @app.get("/settings/model", response_class=HTMLResponse)
     async def model_settings_page(request: Request):
         return templates.TemplateResponse(
             request,
-            "model_settings.html",
-            {"page_title": "对话模型", "web_version": WEB_VERSION},
+            "app.html",
+            {
+                "page_title": "对话模型",
+                "initial_entry_id": "",
+                "initial_topic_id": "",
+                "web_version": WEB_VERSION,
+            },
         )
 
     @app.get("/api/library")

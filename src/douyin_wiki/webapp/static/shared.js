@@ -4,6 +4,7 @@
     "library-view", "article-view", "topics-view", "topic-view", "trash-view",
     "imports-view", "imports-single-view", "imports-creators-view", "imports-favorites-view",
     "jobs-view", "job-detail-view", "auth-view", "system-view",
+    "analysis-view", "model-view",
   ];
   const Douku = window.Douku || {};
   Douku.$ = (id) => document.getElementById(id);
@@ -23,14 +24,51 @@
     }
     return body;
   };
-  Douku.toast = (message) => {
-    const node = Douku.$("toast");
+  const TOAST_MS = 2600;
+  const toastState = {timer: 0, remaining: 0, started: 0, sticky: false};
+  const toastNode = () => Douku.$("toast");
+  const hideToast = () => toastNode()?.classList.remove("show");
+  const scheduleToastHide = (ms) => {
+    window.clearTimeout(toastState.timer);
+    toastState.started = Date.now();
+    toastState.remaining = ms;
+    toastState.timer = window.setTimeout(() => {
+      if (document.hidden) return;
+      hideToast();
+      toastState.remaining = 0;
+    }, ms);
+  };
+  Douku.revealToast = (node, {sticky = false, duration = TOAST_MS} = {}) => {
+    if (!node) return;
+    node.classList.add("show");
+    window.clearTimeout(toastState.timer);
+    toastState.sticky = sticky;
+    if (sticky) {
+      toastState.remaining = 0;
+      return;
+    }
+    scheduleToastHide(duration);
+  };
+  Douku.toast = (message, options) => {
+    const node = toastNode();
     if (!node) return;
     node.textContent = message;
-    node.classList.add("show");
-    window.clearTimeout(Douku.toast.timer);
-    Douku.toast.timer = window.setTimeout(() => node.classList.remove("show"), 2600);
+    Douku.revealToast(node, options);
   };
+  document.addEventListener("visibilitychange", () => {
+    const node = toastNode();
+    if (!node?.classList.contains("show")) return;
+    if (document.hidden) {
+      window.clearTimeout(toastState.timer);
+      if (toastState.remaining) {
+        toastState.remaining = Math.max(0, toastState.remaining - (Date.now() - toastState.started));
+      }
+      return;
+    }
+    if (toastState.sticky) return;
+    if (toastState.remaining > 0) scheduleToastHide(toastState.remaining);
+    else hideToast();
+  });
   Douku.node = (tag, text, className) => {
     const value = document.createElement(tag);
     if (text != null) value.textContent = text;
@@ -52,6 +90,7 @@
     path === "/imports" || path.startsWith("/imports/")
     || path === "/jobs" || path.startsWith("/jobs/")
     || path === "/settings/auth" || path === "/settings/system"
+    || path === "/settings/analysis" || path === "/settings/model"
   );
   Douku.navigate = (path, push = true) => {
     if (push) history.pushState({}, "", path);

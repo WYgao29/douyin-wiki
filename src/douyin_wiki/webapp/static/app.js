@@ -138,11 +138,7 @@ function writeStateToURL(mode = "replace") {
 }
 
 function toast(message) {
-  const node = $("#toast");
-  node.textContent = message;
-  node.classList.add("show");
-  window.clearTimeout(toast.timer);
-  toast.timer = window.setTimeout(() => node.classList.remove("show"), 2600);
+  window.Douku.toast(message);
 }
 
 function showRestoreRetry(jobId, message) {
@@ -164,8 +160,7 @@ function showRestoreRetry(jobId, message) {
     }
   });
   node.replaceChildren(copy, retry);
-  node.classList.add("show");
-  window.clearTimeout(toast.timer);
+  window.Douku.revealToast(node, {sticky: true});
 }
 
 async function api(url, options = {}) {
@@ -431,7 +426,7 @@ function renderToolbarState() {
 function makeCover(item, className) {
   const cover = document.createElement("div");
   cover.className = className;
-  if (className === "gallery-cover") {
+  if (className === "gallery-cover" || className === "article-cover") {
     cover.classList.add(item.source_kind === "image_note" ? "image-note-cover" : "video-cover");
   }
   if (item.cover_url) {
@@ -489,8 +484,6 @@ function updateFavoriteButton(button, favorite) {
   button.setAttribute("aria-pressed", String(favorite));
   button.setAttribute("aria-label", favorite ? "取消收藏" : "收藏");
   button.title = favorite ? "取消收藏" : "收藏";
-  const label = $("[data-favorite-label]", button);
-  if (label) label.textContent = favorite ? "取消收藏" : "收藏";
 }
 
 async function pollRestoreJob(jobId) {
@@ -878,7 +871,8 @@ function renderTopicsList() {
     goal.textContent = topic.goal || "未填写研究目标";
     const meta = document.createElement("span");
     const active = topic.sources.filter((source) => source.enabled).length;
-    meta.textContent = `${active} 个启用来源 · ${topic.updated_display}`;
+    const updated = String(topic.updated_display || "").replace(/（北京时间）/g, "").trim();
+    meta.textContent = `${active} 个启用来源${updated ? ` · ${updated}` : ""}`;
     button.append(title, goal, meta);
     button.addEventListener("click", () => openTopic(topic.id));
     return button;
@@ -1158,6 +1152,8 @@ async function openTopic(topicId, push = true) {
 function makeArticleHeader(item) {
   const hero = document.createElement("header");
   hero.className = "article-hero";
+  const cover = makeCover(item, "article-cover");
+  cover.setAttribute("aria-hidden", "true");
   const copy = document.createElement("div");
   copy.className = "article-hero-copy";
   const badges = document.createElement("div");
@@ -1171,9 +1167,10 @@ function makeArticleHeader(item) {
   badges.append(type, status);
   const title = document.createElement("h1");
   title.textContent = item.title;
-  const byline = document.createElement("div");
+  const byline = document.createElement("p");
   byline.className = "article-byline";
-  [item.author || "未知作者", `发布于 ${item.published_display || "时间未知"}`, `采集于 ${item.captured_display || "时间未知"}`].forEach((value) => {
+  const stamp = (value) => String(value || "").replace(/（北京时间）/g, "").trim();
+  [item.author || "未知作者", stamp(item.published_display), stamp(item.captured_display) ? `采集 ${stamp(item.captured_display)}` : ""].filter(Boolean).forEach((value) => {
     const span = document.createElement("span");
     span.textContent = value;
     byline.append(span);
@@ -1194,10 +1191,16 @@ function makeArticleHeader(item) {
   actions.className = "article-actions";
   if (isDatabaseManaged(item)) {
     const favorite = makeFavoriteButton(item, "article-favorite-button");
-    const favoriteLabel = document.createElement("span");
-    favoriteLabel.dataset.favoriteLabel = "";
-    favoriteLabel.textContent = item.favorite ? "取消收藏" : "收藏";
-    favorite.append(favoriteLabel);
+    const labels = document.createElement("span");
+    labels.className = "favorite-label";
+    const off = document.createElement("span");
+    off.dataset.favoriteOff = "";
+    off.textContent = "收藏";
+    const on = document.createElement("span");
+    on.dataset.favoriteOn = "";
+    on.textContent = "取消收藏";
+    labels.append(off, on);
+    favorite.append(labels);
     actions.append(favorite);
   }
   if (item.original_url) {
@@ -1233,7 +1236,7 @@ function makeArticleHeader(item) {
     actions.append(remove);
   }
   if (actions.childElementCount) copy.append(actions);
-  hero.append(copy);
+  hero.append(cover, copy);
   return hero;
 }
 
@@ -1365,18 +1368,16 @@ async function openArticle(entryId, push = true, transitionSource = null, citati
         const transition = document.startViewTransition(() => {
           const hero = renderArticleData(data, entryId, push);
           rendered = true;
-          transitionTarget = hero;
+          transitionTarget = hero.querySelector(".article-cover") || hero;
           transitionTarget.style.viewTransitionName = "active-album-cover";
         });
         transition.finished.then(cleanTransitionNames, cleanTransitionNames);
       } catch (_error) {
         cleanTransitionNames();
         if (!rendered) renderArticleData(data, entryId, push);
-        showArticleFallbackEntry();
       }
     } else {
       renderArticleData(data, entryId, push);
-      if (sourceIsUsable) showArticleFallbackEntry();
     }
     if (citation) window.setTimeout(() => focusCitation(citation), 50);
   } catch (error) {
@@ -1423,7 +1424,6 @@ function renderPanelState() {
   const mobile = window.matchMedia("(max-width: 959px)").matches;
   shell.classList.toggle("is-sidebar-collapsed", desktopSidebar && state.sidebarCollapsed);
   if (!mobile) shell.classList.toggle("chat-overlay-open", !state.chatCollapsed);
-  $("#chat-restore")?.classList.add("hidden");
   $("#chat-toggle").setAttribute("aria-expanded", String(mobile ? state.activeDrawer === "chat" : !state.chatCollapsed));
   if (!$("#filter-popover").classList.contains("hidden")) positionFilterPopover();
 }
@@ -1505,14 +1505,30 @@ function commandMatches() {
     .slice(0, 12);
 }
 
+function syncCommandActiveState(root) {
+  $$(".command-result", root).forEach((button, index) => {
+    const active = index === state.commandIndex;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+}
+
 function renderCommandResults() {
   const root = $("#command-results");
   const items = commandMatches();
   state.commandIndex = Math.max(0, Math.min(state.commandIndex, items.length - 1));
+  const existing = $$(".command-result", root);
+  const sameList = existing.length === items.length
+    && items.every((item, index) => existing[index]?.dataset.entryId === item.entry_id);
+  if (sameList) {
+    syncCommandActiveState(root);
+    return;
+  }
   root.replaceChildren(...items.map((item, index) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `command-result${index === state.commandIndex ? " active" : ""}`;
+    button.dataset.entryId = item.entry_id;
     button.setAttribute("role", "option");
     button.setAttribute("aria-selected", String(index === state.commandIndex));
     const copy = document.createElement("div");
@@ -1522,7 +1538,11 @@ function renderCommandResults() {
     meta.textContent = `${item.author} · ${item.content_type_label}`;
     copy.append(title, meta);
     button.append(makeCover(item, "item-thumbnail"), copy);
-    button.addEventListener("mouseenter", () => { state.commandIndex = index; renderCommandResults(); });
+    button.addEventListener("mouseenter", () => {
+      if (state.commandIndex === index) return;
+      state.commandIndex = index;
+      renderCommandResults();
+    });
     button.addEventListener("click", () => {
       $("#command-dialog").close();
       openArticle(item.entry_id);
@@ -1724,9 +1744,10 @@ function makeCitation(citation, index) {
   return row;
 }
 
-function makeMessage(role, content, html = "", citations = []) {
+function makeMessage(role, content, html = "", citations = [], isNew = false) {
   const node = document.createElement("div");
   node.className = `message ${role}`;
+  if (isNew) node.classList.add("is-new");
   if (role === "assistant" && html) node.innerHTML = html;
   else node.textContent = content;
   if (role !== "system") {
@@ -1821,8 +1842,8 @@ async function sendChat(text) {
   $("#chat-persistent-error").classList.add("hidden");
   const box = $("#chat-messages");
   $(".chat-welcome", box)?.remove();
-  box.append(makeMessage("user", text));
-  const answer = makeMessage("assistant", "");
+  box.append(makeMessage("user", text, "", [], true));
+  const answer = makeMessage("assistant", "", "", [], true);
   answer.textContent = "";
   box.append(answer);
   box.scrollTop = box.scrollHeight;
@@ -1946,59 +1967,6 @@ async function saveInspiration() {
   }
 }
 
-function containsDouyinURL(value) {
-  const matches = value.match(/https?:\/\/[^\s<>\]\[)(]+/giu) || [];
-  return matches.some((raw) => {
-    const candidate = raw.replace(/[.,;:!?'"，。；：！？）]+$/u, "");
-    try {
-      const host = new URL(candidate).hostname.toLowerCase();
-      return ["douyin.com", "iesdouyin.com"].some(
-        (suffix) => host === suffix || host.endsWith(`.${suffix}`),
-      );
-    } catch (_error) {
-      return false;
-    }
-  });
-}
-
-function openCaptureDialog() {
-  $("#capture-share-text").value = "";
-  $("#capture-error").classList.add("hidden");
-  $("#capture-dialog").showModal();
-  window.setTimeout(() => $("#capture-share-text").focus(), 0);
-}
-
-function setCaptureSubmitting(submitting) {
-  const button = $("#confirm-capture");
-  button.disabled = submitting;
-  button.textContent = submitting ? "正在加入…" : "加入写入队列";
-}
-
-async function queueCapture() {
-  const shareText = $("#capture-share-text").value.trim();
-  const errorNode = $("#capture-error");
-  errorNode.classList.add("hidden");
-  if (!containsDouyinURL(shareText)) {
-    errorNode.textContent = "请粘贴有效的抖音链接或分享文案";
-    errorNode.classList.remove("hidden");
-    return;
-  }
-  setCaptureSubmitting(true);
-  try {
-    await api("/api/captures", {
-      method: "POST",
-      body: JSON.stringify({share_text: shareText}),
-    });
-    $("#capture-dialog").close();
-    toast("已加入写入队列");
-  } catch (error) {
-    errorNode.textContent = error.message;
-    errorNode.classList.remove("hidden");
-  } finally {
-    setCaptureSubmitting(false);
-  }
-}
-
 function closeChatMenu() {
   $("#chat-menu").classList.add("hidden");
   $("#chat-menu-toggle").setAttribute("aria-expanded", "false");
@@ -2056,13 +2024,6 @@ function bindEvents() {
     else closeImportsPopover();
   });
   $("#imports-close")?.addEventListener("click", closeImportsPopover);
-  $("#confirm-capture")?.addEventListener("click", (event) => {
-    event.preventDefault();
-    if (!$("#capture-form").reportValidity()) return;
-    queueCapture();
-  });
-  $("#capture-share-text")?.addEventListener("input", () => $("#capture-error").classList.add("hidden"));
-  $("#capture-dialog")?.addEventListener("close", () => $("#imports-toggle")?.focus());
   $("#topic-select-toggle").addEventListener("click", () => {
     if (!state.topicSelectionMode) {
       state.topicSelectionMode = true;
@@ -2137,7 +2098,6 @@ function bindEvents() {
   $("#nav-toggle").addEventListener("click", () => setSidebarOpen(true));
   $("#chat-toggle").addEventListener("click", () => setChatPanelOpen(true));
   $("#chat-close").addEventListener("click", () => setChatPanelOpen(false));
-  $("#chat-restore").addEventListener("click", () => setChatPanelOpen(true));
   $("#drawer-backdrop").addEventListener("click", closeDrawers);
   $("#chat-menu-toggle").addEventListener("click", () => {
     const open = $("#chat-menu").classList.contains("hidden");

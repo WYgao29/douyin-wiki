@@ -59,14 +59,14 @@
     const items = [...data.items].sort((a, b) => Number(Boolean(b.requires_user_action)) - Number(Boolean(a.requires_user_action)));
     root.replaceChildren(...items.map((job) => {
       const row = D.node("article", null, "job-row");
-      if (job.requires_user_action) row.classList.add("is-waiting");
       row.tabIndex = 0;
       row.setAttribute("role", "link");
       const title = D.node("h2", job.kind_label || job.kind);
       const status = D.node("span", job.state_label, "status-pill");
       status.dataset.state = job.status;
       const message = D.node("p", job.message_for_user);
-      const meta = D.node("small", `${job.stage_label} · ${Math.round((job.progress || 0) * 100)}% · ${job.updated_display || ""}`);
+      const updated = String(job.updated_display || "").replace(/（北京时间）/g, "").trim();
+      const meta = D.node("small", `${job.stage_label} · ${Math.round((job.progress || 0) * 100)}%${updated ? ` · ${updated}` : ""}`);
       row.append(title, status, message, meta);
       if (job.requires_user_action && job.next_action) {
         const action = actionButton(job.next_action, job.id);

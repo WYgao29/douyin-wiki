@@ -1,115 +1,103 @@
-"use strict";
+(() => {
+  "use strict";
+  const D = window.Douku;
+  if (!D) return;
 
-const $ = (selector) => document.querySelector(selector);
-let currentSettings = null;
+  let currentSettings = null;
+  let bound = false;
 
-async function api(url, options = {}) {
-  const response = await fetch(url, {
-    headers: {"Content-Type": "application/json", ...(options.headers || {})},
-    ...options,
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const detail = Array.isArray(body.detail)
-      ? body.detail.map((item) => String(item.msg || "输入内容无效")
-        .replace(/^Value error,\s*/i, "")
-        .replace(/^Field required$/i, "请填写全部必填内容")).join("；")
-      : body.detail;
-    throw new Error(detail || "请求失败");
+  function showMessage(message, kind = "info") {
+    const node = D.$("analysis-message");
+    if (!node) return;
+    node.textContent = message;
+    node.className = `settings-message ${kind}`;
   }
-  return body;
-}
 
-function toast(message) {
-  const node = $("#toast");
-  node.textContent = message;
-  node.classList.add("show");
-  window.setTimeout(() => node.classList.remove("show"), 2400);
-}
-
-function showMessage(message, kind = "info") {
-  const node = $("#settings-message");
-  node.textContent = message;
-  node.className = `settings-message ${kind}`;
-}
-
-function selectedMode() {
-  return document.querySelector("input[name='analysis-mode']:checked");
-}
-
-function updateProviderPanel() {
-  const panel = $("#provider-model-panel");
-  const needsProvider = selectedMode()?.value === "provider";
-  panel.classList.toggle("hidden", !needsProvider);
-  if (!needsProvider || !currentSettings) {
-    return;
+  function selectedMode() {
+    return document.querySelector("#analysis-view input[name='analysis-mode']:checked");
   }
-  if (currentSettings.configured) {
-    $("#provider-model-title").textContent = "将使用对话模型";
-    $("#provider-model-copy").textContent = `${currentSettings.model} · ${currentSettings.base_url}`;
-  } else {
-    $("#provider-model-title").textContent = "需要先配置对话模型";
-    $("#provider-model-copy").textContent = "后台整理会调用同一套模型接口。网关 Agent 和本地模式不需要这一步。";
-  }
-}
 
-function renderStatus(settings) {
-  currentSettings = settings;
-  document.querySelectorAll("input[name='analysis-mode']").forEach((input) => {
-    input.checked = input.value === settings.analysis_mode;
-  });
-  const mode = settings.analysis_modes.find((item) => item.value === settings.analysis_mode);
-  const ready = Boolean(mode?.web_can_complete);
-  $("#analysis-status-dot").classList.toggle("ready", ready);
-  $("#analysis-status-title").textContent = settings.analysis_mode_label;
-  $("#analysis-status-copy").textContent = mode?.web_copy || "请选择一种分析方式。";
-  updateProviderPanel();
-}
-
-async function loadSettings() {
-  try {
-    renderStatus(await api("/api/settings/model"));
-  } catch (error) {
-    showMessage(error.message, "error");
+  function updateProviderPanel() {
+    const panel = D.$("provider-model-panel");
+    if (!panel) return;
+    const needsProvider = selectedMode()?.value === "provider";
+    panel.classList.toggle("hidden", !needsProvider);
+    if (!needsProvider || !currentSettings) return;
+    if (currentSettings.configured) {
+      D.$("provider-model-title").textContent = "将使用对话模型";
+      D.$("provider-model-copy").textContent = `${currentSettings.model} · ${currentSettings.base_url}`;
+    } else {
+      D.$("provider-model-title").textContent = "需要先配置对话模型";
+      D.$("provider-model-copy").textContent = "后台整理会调用同一套模型接口。网关 Agent 和本地模式不需要这一步。";
+    }
   }
-}
 
-async function saveAnalysisMode() {
-  const selected = selectedMode();
-  if (!selected) {
-    showMessage("请先选择一种分析方式。", "warning");
-    return;
-  }
-  const button = $("#save-analysis-mode");
-  button.disabled = true;
-  showMessage("正在保存分析方式…");
-  try {
-    const result = await api("/api/settings/analysis-mode", {
-      method: "POST",
-      body: JSON.stringify({mode: selected.value}),
+  function renderStatus(settings) {
+    currentSettings = settings;
+    document.querySelectorAll("#analysis-view input[name='analysis-mode']").forEach((input) => {
+      input.checked = input.value === settings.analysis_mode;
     });
-    await loadSettings();
-    const extra = result.warning ? ` ${result.warning}` : "";
-    showMessage(
-      `${result.status}。${result.web_copy}。${result.worker_reload || ""}${extra}`,
-      result.warning ? "warning" : "success",
-    );
-    toast("分析方式已保存");
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    button.disabled = false;
+    const mode = settings.analysis_modes.find((item) => item.value === settings.analysis_mode);
+    const ready = Boolean(mode?.web_can_complete);
+    D.$("analysis-status-dot").classList.toggle("ready", ready);
+    D.$("analysis-status-title").textContent = settings.analysis_mode_label;
+    D.$("analysis-status-copy").textContent = mode?.web_copy || "请选择一种分析方式。";
+    updateProviderPanel();
   }
-}
 
-document.addEventListener("DOMContentLoaded", () => {
-  $("#save-analysis-mode").addEventListener("click", saveAnalysisMode);
-  document.querySelectorAll("input[name='analysis-mode']").forEach((input) => {
-    input.addEventListener("change", updateProviderPanel);
+  async function loadSettings() {
+    try {
+      renderStatus(await D.api("/api/settings/model"));
+    } catch (error) {
+      showMessage(error.message, "error");
+    }
+  }
+
+  async function saveAnalysisMode() {
+    const selected = selectedMode();
+    if (!selected) {
+      showMessage("请先选择一种分析方式。", "warning");
+      return;
+    }
+    const button = D.$("save-analysis-mode");
+    button.disabled = true;
+    showMessage("正在保存分析方式…");
+    try {
+      const result = await D.api("/api/settings/analysis-mode", {
+        method: "POST",
+        body: JSON.stringify({mode: selected.value}),
+      });
+      await loadSettings();
+      const extra = result.warning ? ` ${result.warning}` : "";
+      showMessage(
+        `${result.status}。${result.web_copy}。${result.worker_reload || ""}${extra}`,
+        result.warning ? "warning" : "success",
+      );
+      D.toast("分析方式已保存");
+    } catch (error) {
+      showMessage(error.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function bind() {
+    if (bound) return;
+    bound = true;
+    D.$("save-analysis-mode")?.addEventListener("click", saveAnalysisMode);
+    document.querySelectorAll("#analysis-view input[name='analysis-mode']").forEach((input) => {
+      input.addEventListener("change", updateProviderPanel);
+    });
+  }
+
+  window.addEventListener("douku:route", async (event) => {
+    if (event.detail.path !== "/settings/analysis") return;
+    D.hideAllViews();
+    D.setPage("analysis");
+    D.setNav("analysis-nav");
+    D.$("analysis-view").classList.remove("hidden");
+    document.title = "导入分析 · 抖库";
+    bind();
+    await loadSettings();
   });
-  document.querySelectorAll("[data-theme-select]").forEach((select) => {
-    select.addEventListener("change", (event) => window.DoukuTheme?.set(event.target.value));
-  });
-  window.DoukuTheme?.apply();
-  loadSettings();
-});
+})();

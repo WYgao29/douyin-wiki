@@ -457,8 +457,9 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "导入单条" in page.text
         assert "导入博主" in page.text
         assert "导入收藏" in page.text
-        assert 'id="capture-dialog"' in page.text
-        assert 'id="capture-share-text"' in page.text
+        assert 'id="imports-single-view"' in page.text
+        assert 'id="single-share"' in page.text
+        assert 'id="capture-dialog"' not in page.text
         assert "/static/icons.svg#" in page.text
         assert "cdn." not in page.text
 
@@ -481,13 +482,19 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert ".editorial-cover" not in stylesheet.text
         assert ".article-hero.has-cover" not in stylesheet.text
         assert ".article-cover-frame" not in stylesheet.text
+        assert ".article-cover" in stylesheet.text
+        assert "font-family: var(--font-reading)" in stylesheet.text
         assert ".article-body { max-inline-size: 40rem" in stylesheet.text
         assert "::view-transition-group(active-album-cover)" in stylesheet.text
+        assert "view-transition-name: app-sidebar" in stylesheet.text
+        assert ".message.is-new" in stylesheet.text
         script = client.get("/static/app.js")
         assert script.status_code == 200
         assert 'uiVersion: "douyin-wiki.ui-version"' in script.text
         assert 'const UI_PREFERENCE_VERSION = "2"' in script.text
         assert 'makeCover(item, "gallery-cover")' in script.text
+        assert 'makeCover(item, "article-cover")' in script.text
+        assert 'hero.querySelector(".article-cover")' in script.text
         assert "makeEditorialCover" not in script.text
         assert "article-cover-frame" not in script.text
         assert "image.width = 900" not in script.text
@@ -895,22 +902,28 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         page = client.get("/settings/model")
         assert page.status_code == 200
         assert "data-theme-select" in page.text
-        assert 'id="settings-main"' in page.text
+        assert 'id="app-shell"' in page.text
+        assert 'id="model-view"' in page.text
+        assert 'id="analysis-view"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.2.11" in page.text
+        assert "/static/model-settings.js?v=0.2.14" in page.text
         assert "对话模型" in page.text
-        assert 'name="analysis-mode"' not in page.text
-        assert "保存分析方式" not in page.text
+        assert 'name="analysis-mode"' in page.text
+        assert "保存分析方式" in page.text
         assert 'href="/settings/analysis"' in page.text
+        assert 'data-route="/settings/model"' in page.text
         assert "settings-info-panel" not in page.text
+        assert "settings-shell" not in page.text
 
         analysis = client.get("/settings/analysis")
         assert analysis.status_code == 200
+        assert 'id="app-shell"' in analysis.text
         assert "导入后的分析方式" in analysis.text
         assert 'value="provider"' in analysis.text
-        assert "/static/analysis-settings.js?v=0.2.11" in analysis.text
+        assert "/static/analysis-settings.js?v=0.2.14" in analysis.text
         assert 'href="/settings/model"' in analysis.text
+        assert 'data-route="/settings/analysis"' in analysis.text
 
 
 def test_chat_stream_persists_history_and_usage(tmp_path: Path, monkeypatch) -> None:

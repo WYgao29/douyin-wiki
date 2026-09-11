@@ -46,25 +46,20 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 - 导航图标为 28px 圆角灰底瓷贴；仅当前项用主色实心 + 白图形。Chrome 单色，封面才是彩的。
 - 侧栏分组：资料（资料库/最近/收藏/灵感）→ 已保存视图 → 标签 → 操作（导入/任务/专题/废纸篓）→ 设置。
 - 对话栏默认收起，桌面从右侧 overlay 滑入，不占第三列。
-- hover 不位移导航文字；可点按元素 `:active` 为 `scale(.97)`。
-- 页面加载：导航仅做 280ms 透明度级联，不做位移动画。
+- hover 不位移导航文字，且包在 `@media (hover: hover) and (pointer: fine)`；可点按元素 `:active` 为 `scale(.97)`。
+- 页面加载：导航不做入场动画。⌘K 命令面板无动画。
 
 ## 视图过渡（卡片 → 文章）
 
 `app.js openArticle()` 使用 `document.startViewTransition`（Safari 18+/Chrome），
-不支持时回退 `article-fallback-enter` 动画。关键规则（`app.css`）：
+不支持时直接切换，不整页淡入。关键规则（`app.css`）：
 
-- 源卡片封面与文章页 `hero` 共享 `viewTransitionName: "active-album-cover"`，
-  组动画 560ms iOS 缓出
-- **旧封面 200ms 快速淡出**：正文首图在服务端渲染时被移除
-  （`rendering._remove_private_lines`），过渡目标是宽文字头部，旧照片若慢淡出
-  会被拉成长条"拖影"
-- **根图层新旧各 240ms 淡入/淡出**：旧根不可 `animation: none`
-  （会全程可见并在结束时瞬间消失 = 首页闪动），也不宜默认慢交叉淡化
-  （整页透底 = 闪动）
+- 专辑墙封面与文章页 `.article-cover` 共享 `viewTransitionName: "active-album-cover"`，
+  两者都是 3:4，组动画 280ms `--ease-standard`，旧/新封面不做交叉淡化
+- 侧栏、顶栏、对话栏有独立 `view-transition-name`，过渡期间保持原地
+- 根图层仅 160ms 淡入淡出（正文区域），`mix-blend-mode: normal`
 - 过渡快照生成前调用 `hideCardOverlays()` 隐藏卡片浮动按钮
   （收藏/专题指示器），避免其留在根图层形成"残影"；结束恢复 `visibility`
-- 伪元素快照加 `mix-blend-mode: normal` 防止混合闪烁
 
 ## 品牌资产
 
@@ -78,7 +73,7 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 - 弹窗：背景 `blur(10px) saturate(160%)` 磨砂，`dialog-enter` 弹性入场
 - 浮层（筛选/对话菜单）：opacity + `scale(.97)` 的 CSS transition，可中断
 - 消息气泡：用户=主色实心，AI=白底 + `--shadow-card`；发送钮为 32px
-  渐变圆形 + 纤细 SF 箭头，hover `scale(1.06)`、按下 `scale(.92)`
+  圆形，按下 `scale(.97)`，hover 不覆盖 transform
 - 所有动效受全局 `prefers-reduced-motion` 规则约束
 
 ## 测试契约
@@ -86,7 +81,7 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 `tests/test_web.py` 断言的前端契约（改动时需同步维护）：
 
 - CSS 含 `--color-canvas`、`[data-theme="dark"]`、`.gallery-cover`、
-  `aspect-ratio: 3 / 4`、`.article-body { max-inline-size: 40rem`、
+  `.article-cover`、`aspect-ratio: 3 / 4`、`.article-body { max-inline-size: 40rem`、
   `::view-transition-group(active-album-cover)`
 - HTML 含各 `aria-label`（资料库导航/抖库 AI 对话/专辑墙视图等）、
   `data-theme-select`、`id="chat-close"`、`id="applied-filters"`
