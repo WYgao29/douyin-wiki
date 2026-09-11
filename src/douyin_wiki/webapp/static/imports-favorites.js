@@ -147,6 +147,7 @@
     }
     D.hideAllViews();
     D.setPage("imports-favorites");
+    D.setNav("imports-nav");
     view.classList.remove("hidden");
     document.title = "我的收藏 · 抖库";
     const params = new URLSearchParams(location.search);

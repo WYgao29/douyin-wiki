@@ -110,6 +110,7 @@
     if (event.detail.path !== "/imports/creators") return;
     D.hideAllViews();
     D.setPage("imports-creators");
+    D.setNav("imports-nav");
     D.$("imports-creators-view").classList.remove("hidden");
     document.title = "博主导入 · 抖库";
     const params = new URLSearchParams(location.search);

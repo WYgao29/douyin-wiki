@@ -22,8 +22,9 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 - 毛玻璃：`--glass-canvas` / `--glass-surface` + `--glass-blur`（
   `saturate(180%) blur(20px)`），用于侧栏、顶栏、对话面板、Toast
 - 动效：`--duration-fast/normal/panel` = 140/200/280ms，
-  `--ease-standard: cubic-bezier(.32,.72,0,1)`（iOS 缓出），
-  `--ease-spring: cubic-bezier(.5,1.35,.4,1)`（弹簧）
+  `--ease-out: cubic-bezier(.23,1,.32,1)`（UI 入场），
+  `--ease-standard: cubic-bezier(.32,.72,0,1)`（抽屉），
+  `--ease-hover: ease`（颜色/边框）。命令面板零动画。导航选中不缩放。
 - 导航瓷贴色：`--nav-library/recent/favorite/inspiration/topic/trash/video/image/settings`，
   亮暗双主题各有色值（iOS 系统色）
 
@@ -42,13 +43,11 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 
 ## 侧栏瓷贴语言
 
-- 每个导航项声明 `--tile: var(--nav-*)`，图标为 28px 圆角瓷贴
-  （`color-mix(in srgb, var(--tile) 13%, transparent)` 底 + tile 色图形）
-- hover：整行染 tile 色 10%、瓷贴加深至 22% 并 `scale(1.1) translateY(-1px)`、
-  文字右移 2px
-- active：瓷贴变实心 tile 色 + 白图形，并播放 `tile-pop` 弹簧（.75→1.12→1）
-- 页面加载：导航逐项滑入（40ms 级联，`nav-item-enter`）
-- 顶栏按钮复用同一语言：`--tile` 声明 + hover 染色 + 图标上浮 + 按下 `scale(.94)`
+- 导航图标为 28px 圆角灰底瓷贴；仅当前项用主色实心 + 白图形。Chrome 单色，封面才是彩的。
+- 侧栏分组：资料（资料库/最近/收藏/灵感）→ 已保存视图 → 标签 → 操作（导入/任务/专题/废纸篓）→ 设置。
+- 对话栏默认收起，桌面从右侧 overlay 滑入，不占第三列。
+- hover 不位移导航文字；可点按元素 `:active` 为 `scale(.97)`。
+- 页面加载：导航仅做 280ms 透明度级联，不做位移动画。
 
 ## 视图过渡（卡片 → 文章）
 
@@ -77,7 +76,7 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 ## 材质与组件
 
 - 弹窗：背景 `blur(10px) saturate(160%)` 磨砂，`dialog-enter` 弹性入场
-- 浮层（筛选/对话菜单）：`popover-enter` 180ms 从右上展开
+- 浮层（筛选/对话菜单）：opacity + `scale(.97)` 的 CSS transition，可中断
 - 消息气泡：用户=主色实心，AI=白底 + `--shadow-card`；发送钮为 32px
   渐变圆形 + 纤细 SF 箭头，hover `scale(1.06)`、按下 `scale(.92)`
 - 所有动效受全局 `prefers-reduced-motion` 规则约束
