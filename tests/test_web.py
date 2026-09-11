@@ -451,6 +451,9 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'id="destructive-dialog"' in page.text
         assert 'id="imports-toggle"' in page.text
         assert 'id="auth-nav"' in page.text
+        assert "已保存视图" not in page.text
+        assert "全部视频" not in page.text
+        assert "全部图文" not in page.text
         assert "导入单条" in page.text
         assert "导入博主" in page.text
         assert "导入收藏" in page.text
@@ -895,8 +898,19 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.2.4" in page.text
+        assert "/static/model-settings.js?v=0.2.11" in page.text
+        assert "对话模型" in page.text
+        assert 'name="analysis-mode"' not in page.text
+        assert "保存分析方式" not in page.text
+        assert 'href="/settings/analysis"' in page.text
         assert "settings-info-panel" not in page.text
+
+        analysis = client.get("/settings/analysis")
+        assert analysis.status_code == 200
+        assert "导入后的分析方式" in analysis.text
+        assert 'value="provider"' in analysis.text
+        assert "/static/analysis-settings.js?v=0.2.11" in analysis.text
+        assert 'href="/settings/model"' in analysis.text
 
 
 def test_chat_stream_persists_history_and_usage(tmp_path: Path, monkeypatch) -> None:
@@ -1073,6 +1087,44 @@ def test_model_settings_save_to_keychain_without_changing_gateway_mode(
         tested = client.post("/api/settings/model/test", json={})
         assert tested.status_code == 200
         assert tested.json()["usage"]["total_tokens"] == 7
+
+
+def test_web_can_switch_analysis_mode_without_silent_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, service = _web_fixture(tmp_path)
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr("douyin_wiki.webapp.app.get_secret", lambda account: "")
+    app = create_app(
+        config,
+        config_path=config_path,
+        service=service,
+        start_watcher=False,
+    )
+    with TestClient(app) as client:
+        before = client.get("/api/settings/model").json()
+        assert before["analysis_mode"] == "gateway"
+        assert {item["value"] for item in before["analysis_modes"]} == {
+            "gateway",
+            "provider",
+            "local",
+        }
+        switched = client.post("/api/settings/analysis-mode", json={"mode": "provider"})
+        assert switched.status_code == 200
+        assert switched.json()["analysis_mode"] == "provider"
+        assert switched.json()["web_can_complete"] is True
+        assert load_config(config_path).analysis_mode.value == "provider"
+        saved_model = client.post(
+            "/api/settings/model",
+            json={
+                "base_url": "http://127.0.0.1:8000/v1",
+                "model": "local-test",
+            },
+        )
+        assert saved_model.status_code == 200
+        assert saved_model.json()["analysis_mode"] == "provider"
+        rejected = client.post("/api/settings/analysis-mode", json={"mode": "cloud"})
+        assert rejected.status_code == 422
 
 
 def test_model_settings_rejects_remote_http_before_secret_and_saves_loopback(

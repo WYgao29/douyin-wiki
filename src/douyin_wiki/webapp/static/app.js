@@ -354,9 +354,6 @@ function renderFilters() {
   $$(".nav-item[data-section]").forEach((node) => node.classList.toggle("active", node.dataset.section === state.section));
   $("#topics-nav").classList.remove("active");
   $("#trash-nav").classList.remove("active");
-  $$(".saved-view-button").forEach((node) => node.classList.toggle(
-    "active", state.sources.length === 1 && state.sources[0] === node.dataset.savedView,
-  ));
   renderSidebarTags();
   renderAppliedFilters();
   renderToolbarState();
@@ -614,7 +611,6 @@ function makeListItem(item) {
   link.append(makeCover(item, "item-thumbnail"), copy, tags);
   article.append(link);
   if (isDatabaseManaged(item)) {
-    article.append(makeFavoriteButton(item, "card-favorite-button"));
     article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
     if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
   }
@@ -680,7 +676,6 @@ function makeGalleryCard(item, index, animateNew) {
   link.append(cover, copy);
   article.append(link);
   if (isDatabaseManaged(item)) {
-    article.append(makeFavoriteButton(item, "card-favorite-button"));
     article.classList.toggle("topic-selected", state.selectedEntryIds.has(item.entry_id));
     if (state.topicSelectionMode) article.append(makeSelectionIndicator(item.entry_id));
   }
@@ -810,11 +805,28 @@ function closeImportsPopover() {
   $("#imports-toggle")?.setAttribute("aria-expanded", "false");
 }
 
+function positionImportsPopover() {
+  const toggle = $("#imports-toggle");
+  const popover = $("#imports-popover");
+  if (!toggle || !popover) return;
+  const rect = toggle.getBoundingClientRect();
+  const viewportPadding = 16;
+  const gap = 8;
+  const width = Math.min(360, Math.max(0, window.innerWidth - viewportPadding * 2));
+  const left = Math.max(
+    viewportPadding,
+    Math.min(rect.right - width, window.innerWidth - width - viewportPadding),
+  );
+  popover.style.setProperty("--filter-popover-top", `${rect.bottom + gap}px`);
+  popover.style.setProperty("--filter-popover-left", `${left}px`);
+}
+
 function openImportsPopover() {
   const popover = $("#imports-popover");
   if (!popover) return;
   popover.classList.remove("hidden");
   $("#imports-toggle").setAttribute("aria-expanded", "true");
+  positionImportsPopover();
   popover.focus();
 }
 
@@ -1321,7 +1333,7 @@ function hideCardOverlays(source) {
   const card = source.closest(".gallery-card");
   if (!card) return () => {};
   const hidden = [];
-  card.querySelectorAll(".card-favorite-button, .topic-selection-indicator").forEach((node) => {
+  card.querySelectorAll(".topic-selection-indicator").forEach((node) => {
     hidden.push(node);
     node.style.visibility = "hidden";
   });
@@ -2029,6 +2041,11 @@ function handleGlobalKeydown(event) {
 function bindEvents() {
   $$(".nav-item[data-section]").forEach((node) => node.addEventListener("click", () => {
     state.section = node.dataset.section;
+    state.authors = [];
+    state.types = [];
+    state.tags = [];
+    state.sources = [];
+    state.inspirationOnly = false;
     renderFilters();
     showLibrary(false);
     writeStateToURL("push");
@@ -2083,14 +2100,6 @@ function bindEvents() {
     event.preventDefault();
     createTopicFromSelection();
   });
-  $$(".saved-view-button").forEach((node) => node.addEventListener("click", () => {
-    const source = node.dataset.savedView;
-    state.sources = state.sources.length === 1 && state.sources[0] === source ? [] : [source];
-    state.section = "all";
-    renderFilters();
-    renderLibrary();
-    writeStateToURL();
-  }));
   let searchTimer = 0;
   $("#search-input").addEventListener("input", (event) => {
     state.query = event.target.value.trim();
@@ -2234,6 +2243,8 @@ function bindEvents() {
     if (window.matchMedia("(min-width: 1280px)").matches) closeDrawers(false);
     renderPanelState();
     if (state.libraryLoaded) renderLibrary();
+    if (!$("#filter-popover")?.classList.contains("hidden")) positionFilterPopover();
+    if (!$("#imports-popover")?.classList.contains("hidden")) positionImportsPopover();
   });
 }
 

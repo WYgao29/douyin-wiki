@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from watchfiles import awatch
 
+from ..adapters.llm import FallbackAnalysisProvider, OpenAICompatibleProvider
 from ..adapters.share import extract_douyin_url
 from ..config import (
     AppConfig,
@@ -32,6 +33,7 @@ from ..config import (
 from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
 from ..localization import add_display_labels, label_entry_status
 from ..models import (
+    AnalysisMode,
     CaptureOptions,
     InspirationDraft,
     InspirationInput,
@@ -47,7 +49,31 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.2.4"
+WEB_VERSION = "0.2.11"
+
+ANALYSIS_MODE_INFO = {
+    "gateway": {
+        "label": "网关 Agent",
+        "web_copy": "等待外部 Agent 接续",
+        "detail": (
+            "下载和本地提取由后台完成；校正和分析要等 OpenClaw/Hermes 等 Agent。"
+            "网页不能单独完成入库整理。"
+        ),
+        "web_can_complete": False,
+    },
+    "provider": {
+        "label": "后台模型接口",
+        "web_copy": "后台模型接口自动整理",
+        "detail": "导入后由 Worker 使用对话模型页的接口自动校正和分析，可能消耗 Token。",
+        "web_can_complete": True,
+    },
+    "local": {
+        "label": "本地模式",
+        "web_copy": "本地模式，不调用外部模型",
+        "detail": "不调用外部模型，使用本地降级整理。适合无网络或不想消耗 Token 的场景。",
+        "web_can_complete": True,
+    },
+}
 
 
 class CaptureSubmissionRequest(BaseModel):
@@ -100,6 +126,11 @@ class ConfirmDestructiveActionRequest(BaseModel):
 
 class SetFavoriteRequest(BaseModel):
     favorite: bool
+
+
+class AnalysisModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: AnalysisMode
 
 
 class ModelSettingsRequest(BaseModel):
@@ -445,12 +476,20 @@ def create_app(
             },
         )
 
+    @app.get("/settings/analysis", response_class=HTMLResponse)
+    async def analysis_settings_page(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "analysis_settings.html",
+            {"page_title": "导入分析", "web_version": WEB_VERSION},
+        )
+
     @app.get("/settings/model", response_class=HTMLResponse)
     async def model_settings_page(request: Request):
         return templates.TemplateResponse(
             request,
             "model_settings.html",
-            {"page_title": "模型设置", "web_version": WEB_VERSION},
+            {"page_title": "对话模型", "web_version": WEB_VERSION},
         )
 
     @app.get("/api/library")
@@ -907,11 +946,12 @@ def create_app(
             ),
             "configured": current_provider.configured,
             "analysis_mode": current_config.analysis_mode.value,
-            "analysis_mode_label": {
-                "gateway": "网关 Agent",
-                "provider": "模型接口",
-                "local": "本地模式",
-            }[current_config.analysis_mode.value],
+            "analysis_mode_label": ANALYSIS_MODE_INFO[current_config.analysis_mode.value][
+                "label"
+            ],
+            "analysis_modes": [
+                {"value": value, **info} for value, info in ANALYSIS_MODE_INFO.items()
+            ],
         }
 
     @app.post("/api/settings/model")
@@ -977,11 +1017,48 @@ def create_app(
             "api_key_configured": key_present,
             "api_key_required": key_required,
             "analysis_mode": updated.analysis_mode.value,
-            "analysis_mode_label": {
-                "gateway": "网关 Agent",
-                "provider": "模型接口",
-                "local": "本地模式",
-            }[updated.analysis_mode.value],
+            "analysis_mode_label": ANALYSIS_MODE_INFO[updated.analysis_mode.value]["label"],
+        }
+
+    @app.post("/api/settings/analysis-mode")
+    async def save_analysis_mode(payload: AnalysisModeRequest):
+        async with settings_lock:
+            config_path_value = Path(app.state.config_path)
+            current_config = (
+                load_config(config_path_value)
+                if config_path_value.exists()
+                else app.state.config
+            )
+            updated = current_config.model_copy(update={"analysis_mode": payload.mode})
+            if config_path_value.exists():
+                await asyncio.to_thread(
+                    update_config_values,
+                    config_path_value,
+                    {None: {"analysis_mode": payload.mode.value}},
+                )
+            else:
+                await asyncio.to_thread(
+                    write_config, updated, config_path_value, overwrite=True
+                )
+            app.state.config = updated
+            core.config = updated
+            if payload.mode == AnalysisMode.PROVIDER:
+                core.analysis = OpenAICompatibleProvider(updated.llm)
+            else:
+                core.analysis = FallbackAnalysisProvider()
+            reload_result = operations.request_worker_reload()
+        info = ANALYSIS_MODE_INFO[payload.mode.value]
+        warning = None
+        if payload.mode == AnalysisMode.PROVIDER and not app.state.chat_provider.configured:
+            warning = "已改为后台模型接口，但对话模型尚未配置完整。请先到对话模型页保存接口和模型。"
+        return {
+            "status": "分析方式已保存",
+            "analysis_mode": payload.mode.value,
+            "analysis_mode_label": info["label"],
+            "web_copy": info["web_copy"],
+            "web_can_complete": info["web_can_complete"],
+            "worker_reload": reload_result.get("status"),
+            "warning": warning,
         }
 
     @app.post("/api/settings/model/test")

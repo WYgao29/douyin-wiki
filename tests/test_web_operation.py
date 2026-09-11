@@ -265,6 +265,10 @@ def test_spa_routes_and_same_origin_still_enforced(tmp_path) -> None:
             assert page.status_code == 200
             assert "shared.js" in page.text
             assert "cdn." not in page.text
+        system = client.get("/settings/system")
+        assert "清理过期媒体" in system.text
+        assert "system-overview" in system.text
+        assert "运行检查" in system.text
         blocked = client.post(
             "/api/auth/sessions",
             json={"channel": "video"},
