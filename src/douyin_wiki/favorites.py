@@ -24,7 +24,13 @@ class FavoritesService:
         self.store = FavoritesStore(core.database)
 
     def start(
-        self, *, folder_ids=None, include_images=False, directory_only=False, gateway_context=None
+        self,
+        *,
+        folder_ids=None,
+        include_images=False,
+        directory_only=False,
+        gateway_context=None,
+        update_mode: str = "incremental",
     ):
         if folder_ids is not None:
             if not folder_ids or any(not isinstance(v, str) or not v.strip() for v in folder_ids):
@@ -32,14 +38,19 @@ class FavoritesService:
             folder_ids = list(dict.fromkeys(folder_ids))
         if directory_only and folder_ids:
             raise ValueError("读取目录不能同时指定收藏夹")
+        if update_mode not in {"incremental", "full"}:
+            raise ValueError("更新方式必须是 incremental 或 full")
         options = {
             "folder_ids": folder_ids,
             "include_images": bool(include_images),
             "directory_only": bool(directory_only),
+            "update_mode": update_mode,
         }
         job_id = self.store.create(
             CaptureRequest(share_text=FAVORITES_URL, gateway_context=gateway_context), options
         )
+        if update_mode == "incremental" and not directory_only:
+            self.store.seed_from_previous(job_id, folder_ids=folder_ids)
         return self.database.get_job(job_id)
 
     async def process(self, job):
@@ -187,13 +198,17 @@ class FavoritesService:
         )
         return result
 
-    def get(self, job_id: str, *, page=1, limit=50, folder_id=None, query=""):
+    def get(self, job_id: str, *, page=1, limit=50, folder_id=None, query="", only_new=False):
         if page < 1 or not 1 <= limit <= 1000:
             raise ValueError("page 必须大于零，limit 必须在 1 到 1000 之间")
         run = self.store.load(job_id)
         job = self.database.get_job(job_id)
         items = self._items(job_id, run)
+        previous_ids = self.store.previous_work_ids(job_id)
+        for item in items:
+            item["is_new"] = item["work_id"] not in previous_ids
         summary = self._summary(items, run["options"])
+        summary["new"] = sum(1 for item in items if item.get("is_new"))
         if run["confirmed"]:
             job = self._refresh_with(job_id, run, items, summary)
         filtered = [
@@ -201,6 +216,7 @@ class FavoritesService:
             for i in items
             if (not folder_id or folder_id in i.get("folder_ids", []))
             and (not query or query.casefold() in (i["title"] + " " + i["author"]).casefold())
+            and (not only_new or i.get("is_new"))
         ]
         snapshot = run["snapshot"]
         start = (page - 1) * limit

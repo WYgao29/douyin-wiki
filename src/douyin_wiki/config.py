@@ -128,6 +128,9 @@ class AppConfig(BaseModel):
     @property
     def browser_profile_dir(self) -> Path:
         """Persistent profile used only by 抖库 browser automation."""
+        override = os.environ.get("DOUYIN_WIKI_BROWSER_PROFILE")
+        if override:
+            return Path(override).expanduser()
         return Path.home() / "Library" / "Application Support" / "douyin-wiki" / "browser-profile"
 
 

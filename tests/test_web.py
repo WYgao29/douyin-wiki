@@ -449,7 +449,11 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'id="trash-nav"' in page.text
         assert 'id="trash-view"' in page.text
         assert 'id="destructive-dialog"' in page.text
-        assert 'id="capture-toggle"' in page.text
+        assert 'id="imports-toggle"' in page.text
+        assert 'id="auth-nav"' in page.text
+        assert "导入单条" in page.text
+        assert "导入博主" in page.text
+        assert "导入收藏" in page.text
         assert 'id="capture-dialog"' in page.text
         assert 'id="capture-share-text"' in page.text
         assert "/static/icons.svg#" in page.text
@@ -891,7 +895,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="settings-main"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.1.9" in page.text
+        assert "/static/model-settings.js?v=0.2.4" in page.text
         assert "settings-info-panel" not in page.text
 
 

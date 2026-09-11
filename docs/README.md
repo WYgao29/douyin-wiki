@@ -12,3 +12,4 @@
 用户安装、运行、CLI、专题和发行包说明以仓库根目录的 [README](../README.md) 为准。
 
 - [收藏批量导入](favorites-import.md)：网页、CLI/MCP、登录、恢复及当前验证边界。
+- [Web 主入口改造方案](design/web-primary-operation-plan.md)：授权中心、导入中心、任务中心和系统维护的目标信息架构。日常操作默认走 Web；真实抖音端到端验收尚未执行。

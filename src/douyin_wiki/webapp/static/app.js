@@ -805,17 +805,38 @@ function clearSearchAndFilters() {
   loadLibrary();
 }
 
-function showLibrary(push = true) {
-  state.currentEntry = "";
-  state.currentArticleItem = null;
-  state.currentTopic = "";
+function closeImportsPopover() {
+  $("#imports-popover")?.classList.add("hidden");
+  $("#imports-toggle")?.setAttribute("aria-expanded", "false");
+}
+
+function openImportsPopover() {
+  const popover = $("#imports-popover");
+  if (!popover) return;
+  popover.classList.remove("hidden");
+  $("#imports-toggle").setAttribute("aria-expanded", "true");
+  popover.focus();
+}
+
+function hideLegacyViews() {
+  window.Douku?.hideAllViews();
   $("#article-view").classList.add("hidden");
   $("#topics-view").classList.add("hidden");
   $("#topic-view").classList.add("hidden");
   $("#trash-view").classList.add("hidden");
+  $("#library-view").classList.add("hidden");
+}
+
+function showLibrary(push = true) {
+  state.currentEntry = "";
+  state.currentArticleItem = null;
+  state.currentTopic = "";
+  hideLegacyViews();
   $("#library-view").classList.remove("hidden");
+  window.Douku?.setPage("library");
   $("#topics-nav").classList.remove("active");
   $("#trash-nav").classList.remove("active");
+  $$(".nav-item[data-section]").forEach((node) => node.classList.toggle("active", node.dataset.section === state.section));
   if (push) history.pushState({}, "", currentLibraryURL());
   document.title = "资料库 · 抖库";
   renderLibrary();
@@ -867,11 +888,9 @@ async function showTopics(push = true) {
   state.currentArticleItem = null;
   state.currentTopic = "";
   state.topicSelectionMode = false;
-  $("#library-view").classList.add("hidden");
-  $("#article-view").classList.add("hidden");
-  $("#topic-view").classList.add("hidden");
-  $("#trash-view").classList.add("hidden");
+  hideLegacyViews();
   $("#topics-view").classList.remove("hidden");
+  window.Douku?.setPage("topics");
   $$(".nav-item[data-section]").forEach((node) => node.classList.remove("active"));
   $("#topics-nav").classList.add("active");
   $("#trash-nav").classList.remove("active");
@@ -968,11 +987,9 @@ async function showTrash(push = true) {
   state.currentArticleItem = null;
   state.currentTopic = "";
   state.topicSelectionMode = false;
-  $("#library-view").classList.add("hidden");
-  $("#article-view").classList.add("hidden");
-  $("#topics-view").classList.add("hidden");
-  $("#topic-view").classList.add("hidden");
+  hideLegacyViews();
   $("#trash-view").classList.remove("hidden");
+  window.Douku?.setPage("trash");
   $$(".nav-item").forEach((node) => node.classList.remove("active"));
   $("#trash-nav").classList.add("active");
   if (push) history.pushState({}, "", "/trash");
@@ -1119,11 +1136,9 @@ async function openTopic(topicId, push = true) {
     state.currentEntry = "";
     state.currentTopic = topicId;
     renderTopicData(value);
-    $("#library-view").classList.add("hidden");
-    $("#article-view").classList.add("hidden");
-    $("#topics-view").classList.add("hidden");
-    $("#trash-view").classList.add("hidden");
+    hideLegacyViews();
     $("#topic-view").classList.remove("hidden");
+    window.Douku?.setPage("topic");
     $$(".nav-item[data-section]").forEach((node) => node.classList.remove("active"));
     $("#topics-nav").classList.add("active");
     $("#trash-nav").classList.remove("active");
@@ -1234,11 +1249,9 @@ function renderArticleData(data, entryId, push) {
   body.innerHTML = data.html;
   const hero = makeArticleHeader(data.item);
   root.replaceChildren(hero, body);
-  $("#library-view").classList.add("hidden");
-  $("#topics-view").classList.add("hidden");
-  $("#topic-view").classList.add("hidden");
-  $("#trash-view").classList.add("hidden");
+  hideLegacyViews();
   $("#article-view").classList.remove("hidden");
+  window.Douku?.setPage("article");
   if (push) history.pushState({entryId}, "", `/articles/${encodeURIComponent(entryId)}`);
   document.title = `${data.item.title} · 抖库`;
   renderLibrary();
@@ -2008,6 +2021,7 @@ function handleGlobalKeydown(event) {
   if (event.key === "Escape") {
     if (state.activeDrawer) closeDrawers();
     closeFilterPopover();
+    closeImportsPopover();
     closeChatMenu();
   }
 }
@@ -2021,14 +2035,27 @@ function bindEvents() {
   }));
   $("#topics-nav").addEventListener("click", () => showTopics());
   $("#trash-nav").addEventListener("click", () => showTrash());
-  $("#capture-toggle").addEventListener("click", openCaptureDialog);
-  $("#confirm-capture").addEventListener("click", (event) => {
+  $$("[data-route]").forEach((node) => node.addEventListener("click", (event) => {
+    const path = node.getAttribute("data-route") || node.getAttribute("href");
+    if (!path || !path.startsWith("/")) return;
+    event.preventDefault();
+    closeImportsPopover();
+    window.Douku?.navigate(path);
+  }));
+  $$("[data-back='library']").forEach((node) => node.addEventListener("click", () => showLibrary()));
+  $("#back-jobs")?.addEventListener("click", () => window.Douku?.navigate("/jobs"));
+  $("#imports-toggle")?.addEventListener("click", () => {
+    if ($("#imports-popover").classList.contains("hidden")) openImportsPopover();
+    else closeImportsPopover();
+  });
+  $("#imports-close")?.addEventListener("click", closeImportsPopover);
+  $("#confirm-capture")?.addEventListener("click", (event) => {
     event.preventDefault();
     if (!$("#capture-form").reportValidity()) return;
     queueCapture();
   });
-  $("#capture-share-text").addEventListener("input", () => $("#capture-error").classList.add("hidden"));
-  $("#capture-dialog").addEventListener("close", () => $("#capture-toggle").focus());
+  $("#capture-share-text")?.addEventListener("input", () => $("#capture-error").classList.add("hidden"));
+  $("#capture-dialog")?.addEventListener("close", () => $("#imports-toggle")?.focus());
   $("#topic-select-toggle").addEventListener("click", () => {
     if (!state.topicSelectionMode) {
       state.topicSelectionMode = true;
@@ -2173,19 +2200,29 @@ function bindEvents() {
     if (event.key === "ArrowUp" && length) { event.preventDefault(); state.commandIndex = (state.commandIndex - 1 + length) % length; renderCommandResults(); }
     if (event.key === "Enter" && length) { event.preventDefault(); $("#command-results .command-result.active")?.click(); }
   });
+  window.addEventListener("douku:route", (event) => {
+    if (event.detail.path !== "/imports") return;
+    hideLegacyViews();
+    window.Douku?.setPage("imports");
+    $("#imports-view").classList.remove("hidden");
+    document.title = "导入内容 · 抖库";
+  });
   $$('[data-theme-select]').forEach((select) => select.addEventListener("change", (event) => window.DoukuTheme?.set(event.target.value)));
   document.addEventListener("keydown", handleGlobalKeydown);
   document.addEventListener("click", (event) => {
     if (!event.target.closest("#filter-popover, #filter-toggle, #all-tags-button")) closeFilterPopover();
+    if (!event.target.closest("#imports-popover, #imports-toggle")) closeImportsPopover();
     if (!event.target.closest("#chat-menu, #chat-menu-toggle")) closeChatMenu();
   }, {capture: true});
   window.addEventListener("popstate", () => {
-    const match = window.location.pathname.match(/^\/articles\/([^/]+)$/);
-    const topicMatch = window.location.pathname.match(/^\/topics\/([^/]+)$/);
+    const path = window.location.pathname;
+    const match = path.match(/^\/articles\/([^/]+)$/);
+    const topicMatch = path.match(/^\/topics\/([^/]+)$/);
     if (match) openArticle(decodeURIComponent(match[1]), false);
     else if (topicMatch) openTopic(decodeURIComponent(topicMatch[1]), false);
-    else if (window.location.pathname === "/topics") showTopics(false);
-    else if (window.location.pathname === "/trash") showTrash(false);
+    else if (path === "/topics") showTopics(false);
+    else if (path === "/trash") showTrash(false);
+    else if (window.Douku?.isOperationPath(path)) window.Douku.navigate(path + window.location.search, false);
     else {
       readStateFromURL();
       $("#search-input").value = state.query;
@@ -2213,6 +2250,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   else if (state.currentEntry) await openArticle(state.currentEntry, false);
   else if (window.location.pathname === "/topics") await showTopics(false);
   else if (window.location.pathname === "/trash") await showTrash(false);
+  else if (window.Douku?.isOperationPath(window.location.pathname)) {
+    window.Douku.navigate(window.location.pathname + window.location.search, false);
+  }
   await loadSessions();
   const events = new EventSource("/api/library/events");
   events.addEventListener("library", async () => {
