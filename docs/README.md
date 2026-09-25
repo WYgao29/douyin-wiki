@@ -13,3 +13,4 @@
 
 - [收藏批量导入](favorites-import.md)：网页、CLI/MCP、登录、恢复及当前验证边界。
 - [Web 主入口改造方案](design/web-primary-operation-plan.md)：授权中心、导入中心、任务中心和系统维护的目标信息架构。日常操作默认走 Web；真实抖音端到端验收尚未执行。
+- [画面检索（Indexed sidecar）方案](design/visual-search-indexed-plan.md)：v1.14。非法命中丢弃；第 1 期不识别单独删 zvec。尚未编码。

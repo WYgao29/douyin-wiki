@@ -102,7 +102,7 @@ class DouyinWikiService:
         self.database = Database(config.database_path)
         self.vault = VaultWriter(config.vault_path)
         self.resolver = resolver or DouyinShareResolver()
-        self.downloader = downloader or YtDlpDownloader(config.media)
+        self.downloader = downloader or YtDlpDownloader(config.media, config.browser_profile_dir)
         self.image_note_downloader = image_note_downloader or PlaywrightImageNoteDownloader(
             config.media, config.browser_profile_dir
         )
@@ -2625,7 +2625,24 @@ class DouyinWikiService:
             audio_path = assets_dir / "audio.wav"
             frames_dir = assets_dir / "frames"
             async with self.media_semaphore:
-                await self.media.extract_audio(video_path, audio_path)
+                # Prefer pre-downloaded separate audio (audio.mp4) over extracting from video.
+                separate_audio = assets_dir / "audio.mp4"
+                if separate_audio.exists():
+                    # Convert separate audio to whisper-friendly WAV.
+                    try:
+                        await self.media.extract_audio(separate_audio, audio_path)
+                    except ExternalToolError:
+                        # Conversion failed, fall back to video file.
+                        separate_audio = None
+                else:
+                    separate_audio = None
+                if separate_audio is None and "transcript_skipped" not in artifacts:
+                    try:
+                        await self.media.extract_audio(video_path, audio_path)
+                    except ExternalToolError:
+                        # Video has no audio stream and no separate audio available.
+                        artifacts["transcript_skipped"] = "no_audio_available"
+                        separate_audio = None  # ensure cleanup below is a no-op
                 try:
                     transcript = await self.transcriber.transcribe(audio_path, work_dir / "whisper")
                     frames = await self.media.extract_frames(

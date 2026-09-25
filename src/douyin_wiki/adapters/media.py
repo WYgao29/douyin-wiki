@@ -217,8 +217,9 @@ def download_preferred_cover(info: dict[str, Any], target_dir: Path) -> Path | N
 
 
 class YtDlpDownloader:
-    def __init__(self, settings: MediaSettings) -> None:
+    def __init__(self, settings: MediaSettings, profile_dir: Path) -> None:
         self.settings = settings
+        self.profile_dir = profile_dir
 
     def _browser_spec(self) -> str:
         browser = self.settings.browser
@@ -337,29 +338,138 @@ class YtDlpDownloader:
             action="douyin-wiki auth status --video-url <抖音视频URL>",
         )
 
-    async def download(self, url: str, video_id: str, target_dir: Path) -> VideoMetadata:
-        return await asyncio.to_thread(self._download_sync, url, video_id, target_dir)
+    async def _capture_cdn_url(self, url: str) -> tuple[str, str | None] | None:
+        """Use Playwright to navigate to the video page and capture the video (+ optional audio) CDN URLs."""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return None
 
-    def _download_sync(self, url: str, video_id: str, target_dir: Path) -> VideoMetadata:
+        profile_dir = self.profile_dir
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        video_urls: list[str] = []
+        audio_urls: list[str] = []
+
+        try:
+            async with async_playwright() as p:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    headless=True,
+                )
+                try:
+                    page = context.pages[0] if context.pages else await context.new_page()
+
+                    def on_response(response: Any) -> None:
+                        resp_url = response.url
+                        if "douyinvod.com" not in resp_url:
+                            return
+                        # Audio segments contain "audio" or "audiomp4" or "media-audio" patterns.
+                        if any(tag in resp_url for tag in ("audio", "audiomp4", "media-audio")):
+                            audio_urls.append(resp_url)
+                        elif any(tag in resp_url for tag in ("media-video", "video")):
+                            video_urls.append(resp_url)
+
+                    page.on("response", on_response)
+                    await page.goto(url, wait_until="load", timeout=60_000)
+                    # Wait for video playback to start and both streams to be requested.
+                    await page.wait_for_timeout(10_000)
+
+                    # Prefer highest-quality video URL (contains "media-video" and .mp4).
+                    for candidate in video_urls:
+                        if "media-video" in candidate and ".mp4" in candidate:
+                            return candidate, audio_urls[0] if audio_urls else None
+                    for candidate in video_urls:
+                        if "media-video" in candidate:
+                            return candidate, audio_urls[0] if audio_urls else None
+                    if video_urls:
+                        return video_urls[0], audio_urls[0] if audio_urls else None
+                    return None
+                finally:
+                    await context.close()
+        except Exception:
+            return None
+
+    async def download(self, url: str, video_id: str, target_dir: Path) -> VideoMetadata:
         target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: Use Playwright to capture CDN video + audio URLs from the video page.
+        cdn_result = await self._capture_cdn_url(url)
+
+        video_url: str
+        audio_url: str | None
+        if cdn_result is None:
+            video_url = url
+            audio_url = None
+        else:
+            video_url, audio_url = cdn_result
+
+        # Step 2: Download via yt-dlp using the CDN URL + referer trick.
         output_template = str(target_dir / "original.%(ext)s")
         command = [
             "yt-dlp",
             "--no-playlist",
-            "--cookies-from-browser",
-            self._browser_spec(),
             "--write-info-json",
             "--write-thumbnail",
             "--convert-thumbnails",
             "jpg",
-            "--merge-output-format",
-            "mp4",
             "--output",
             output_template,
-            url,
         ]
-        result = _run(command, timeout=7200)
-        _require_success(result, "yt-dlp")
+        if cdn_result is not None:
+            command += ["--referer", "https://www.douyin.com/"]
+            command.append(video_url)
+            if audio_url:
+                # Also grab audio into a separate file; we'll merge after.
+                audio_template = str(target_dir / "audio.%(ext)s")
+                audio_command = [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--output",
+                    audio_template,
+                    "--referer", "https://www.douyin.com/",
+                    audio_url,
+                ]
+                audio_result = await asyncio.to_thread(_run, audio_command, timeout=7200)
+                # If audio download fails, continue with video-only.
+                if audio_result.returncode == 0:
+                    audio_files = list(target_dir.glob("audio.*"))
+                    audio_files = [f for f in audio_files if f.suffix.lower() not in {".json", ".jpg", ".part"}]
+                    video_files = list(target_dir.glob("original.*"))
+                    video_files = [f for f in video_files if f.suffix.lower() not in {".json", ".jpg", ".part"}]
+                    if audio_files and video_files:
+                        merged = target_dir / "merged.mp4"
+                        merge_result = await asyncio.to_thread(
+                            _run,
+                            [
+                                "ffmpeg", "-y",
+                                "-i", str(video_files[0]),
+                                "-i", str(audio_files[0]),
+                                "-c:v", "copy", "-c:a", "aac",
+                                "-shortest",
+                                str(merged),
+                            ],
+                            timeout=600,
+                        )
+                        if merge_result.returncode == 0 and merged.exists():
+                            # Replace original video with merged version.
+                            original_video = video_files[0]
+                            original_video.unlink()
+                            merged.rename(original_video)
+                            # Clean up audio file.
+                            for f in audio_files:
+                                f.unlink()
+        else:
+            # Fallback: use cookies from browser (may fail for some videos)
+            command.insert(2, "--cookies-from-browser")
+            command.insert(3, self._browser_spec())
+            command.append(url)
+
+        if not (target_dir / "original.mp4").exists():
+            command.append("--merge-output-format")
+            command.append("mp4")
+            result = await asyncio.to_thread(_run, command, timeout=7200)
+            _require_success(result, "yt-dlp")
 
         info_files = list(target_dir.glob("original.info.json"))
         info: dict[str, Any] = {}
