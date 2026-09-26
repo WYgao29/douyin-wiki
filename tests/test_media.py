@@ -401,6 +401,24 @@ def test_cdn_url_selection_rejects_unrelated_when_play_addr_known() -> None:
     )
 
 
+def test_cdn_url_selection_rejects_work_id_only_when_play_addr_known() -> None:
+    """Ad CDN that only embeds work_id must not count as matched once play_addr known."""
+    work_id = "7672717300746907078"
+    ad_with_work_id = f"https://v9.douyinvod.com/ad/{work_id}/media-video/full.mp4"
+    rows = _unique_candidate_rows([(ad_with_work_id, "video/mp4", 200)])
+    assert (
+        _pick_best_cdn_url(
+            rows,
+            expected_work_id=work_id,
+            anchor_urls=[
+                "https://v3.douyinvod.com/target/media-video/seg?video_id=v0200targeturi0001"
+            ],
+            uri_markers={"v0200targeturi0001"},
+        )
+        is None
+    )
+
+
 def test_cdn_url_selection_boosts_work_id_marker_in_url() -> None:
     work_id = "7672717300746907078"
     bound = f"https://v3.douyinvod.com/path/{work_id}/media-video/seg"
@@ -528,8 +546,134 @@ async def test_capture_rebinds_cdn_to_aweme_play_addr(
         async def wait_for_event(self, _event: str, timeout: float = 0):
             raise TimeoutError("timeout")
 
-        async def wait_for_timeout(self, _ms: int):
+        async def wait_for_timeout(self, ms: int):
+            await asyncio.sleep(max(ms, 0) / 1000)
+
+    class FakeContext:
+        pages: list = []
+
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
             return None
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **kwargs):
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(
+        "playwright.async_api.async_playwright", lambda: FakePlaywright()
+    )
+    captured = await downloader._capture_cdn_url(
+        f"https://www.douyin.com/video/{work_id}"
+    )
+    assert captured is not None
+    assert captured.video_url == target
+    assert captured.info.get("id") == work_id
+
+
+@pytest.mark.asyncio
+async def test_capture_keeps_collecting_for_late_target_after_mime_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """MIME video+audio must not stop observation before a late target CDN arrives."""
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+    work_id = "7672717300746907078"
+    target = "https://v3.douyinvod.com/target/media-video/seg"
+    ad = "https://v9.douyinvod.com/ad/media-video/full.mp4"
+
+    class FakeResponse:
+        def __init__(self, url: str, payload: dict, *, content_type: str, status: int = 200):
+            self.url = url
+            self.status = status
+            self.headers = {"content-type": content_type}
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+    class FakePage:
+        def __init__(self):
+            self._handler = None
+            self._late_fired = False
+
+        def on(self, event: str, handler):
+            assert event == "response"
+            self._handler = handler
+
+        async def goto(self, url: str, **kwargs):
+            assert self._handler is not None
+            # Only ad MIME pair up front — target arrives later during wait loop.
+            self._handler(FakeResponse(ad, {}, content_type="video/mp4"))
+            self._handler(
+                FakeResponse(
+                    "https://v9.douyinvod.com/ad/media-audio/a",
+                    {},
+                    content_type="audio/mp4",
+                )
+            )
+
+        async def title(self):
+            return "目标作品 - 抖音"
+
+        async def evaluate(self, _script: str):
+            return {"description": "", "author": "", "authorHref": ""}
+
+        async def wait_for_event(self, _event: str, timeout: float = 0):
+            if not self._late_fired and self._handler is not None:
+                self._late_fired = True
+                self._handler(FakeResponse(target, {}, content_type="video/mp4"))
+                self._handler(
+                    FakeResponse(
+                        "https://v3.douyinvod.com/target/media-audio/a",
+                        {},
+                        content_type="audio/mp4",
+                    )
+                )
+                self._handler(
+                    FakeResponse(
+                        f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={work_id}",
+                        {
+                            "aweme_detail": {
+                                "aweme_id": work_id,
+                                "desc": "目标作品",
+                                "author": {
+                                    "nickname": "作者",
+                                    "sec_uid": "MS4wLjABAAAAbound",
+                                    "uid": "1",
+                                },
+                                "video": {
+                                    "duration": 5000,
+                                    "play_addr": {
+                                        "uri": "v0200targeturi0001",
+                                        "url_list": [
+                                            f"{target}?video_id=v0200targeturi0001",
+                                        ],
+                                    },
+                                    "cover": {
+                                        "url_list": ["https://example.invalid/c.jpg"]
+                                    },
+                                },
+                            }
+                        },
+                        content_type="application/json",
+                    )
+                )
+                return FakeResponse(target, {}, content_type="video/mp4")
+            raise TimeoutError("timeout")
+
+        async def wait_for_timeout(self, ms: int):
+            await asyncio.sleep(max(ms, 0) / 1000)
 
     class FakeContext:
         pages: list = []
@@ -720,8 +864,8 @@ async def test_capture_awaits_aweme_payload_tasks_before_merge(
         async def wait_for_event(self, _event: str, timeout: float = 0):
             raise TimeoutError("timeout")
 
-        async def wait_for_timeout(self, _ms: int):
-            return None
+        async def wait_for_timeout(self, ms: int):
+            await asyncio.sleep(max(ms, 0) / 1000)
 
     class FakeContext:
         pages: list = []
@@ -828,8 +972,8 @@ async def test_capture_does_not_stall_on_hung_aweme_json(
         async def wait_for_event(self, _event: str, timeout: float = 0):
             raise TimeoutError("timeout")
 
-        async def wait_for_timeout(self, _ms: int):
-            return None
+        async def wait_for_timeout(self, ms: int):
+            await asyncio.sleep(max(ms, 0) / 1000)
 
     class FakeContext:
         pages: list = []
@@ -859,7 +1003,7 @@ async def test_capture_does_not_stall_on_hung_aweme_json(
 
     captured = await asyncio.wait_for(
         downloader._capture_cdn_url(f"https://www.douyin.com/video/{work_id}"),
-        timeout=8.0,
+        timeout=12.0,
     )
     assert captured is not None
     assert captured.video_url is not None

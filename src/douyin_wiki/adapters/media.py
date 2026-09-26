@@ -263,8 +263,8 @@ def _cdn_binding_bonus(
             bonus += 200
             matched = True
     if expected_work_id and expected_work_id in lowered:
+        # Score only: work_id substring must not satisfy require_match by itself.
         bonus += 100
-        matched = True
     if require_match and markers and not matched:
         bonus -= 1000
     return bonus, matched
@@ -918,19 +918,77 @@ class YtDlpDownloader:
                     deadline = asyncio.get_running_loop().time() + 15.0
                     video_url: str | None = None
                     audio_url: str | None = None
+                    # MIME-only video+audio must not end observation before aweme
+                    # anchors exist; keep collecting so a late target douyinvod can
+                    # still enter candidates. Exit early only on a bound match, or
+                    # after a short settle / near deadline when anchors are absent.
+                    mime_pair_since: float | None = None
+                    loop_video_anchors: list[str] = []
+                    loop_video_markers: set[str] = set()
+                    loop_audio_anchors: list[str] = []
+                    loop_audio_markers: set[str] = set()
                     while asyncio.get_running_loop().time() < deadline:
-                        video_url = _pick_best_cdn_url(
-                            _unique_candidate_rows(video_candidates)
-                        )
-                        audio_url = _pick_best_cdn_url(
-                            _unique_candidate_rows(audio_candidates), audio=True
-                        )
-                        # Once video is present, wait a short extra window for audio.
-                        if video_url and (
-                            audio_url
-                            or asyncio.get_running_loop().time() + 3.0 >= deadline
-                        ):
-                            break
+                        now = asyncio.get_running_loop().time()
+                        if payloads and not loop_video_markers:
+                            # Prefer a detail that actually carries play_addr markers;
+                            # a stub envelope must not freeze markers empty forever.
+                            for payload in payloads:
+                                detail = _find_video_aweme_detail(
+                                    payload, expected_work_id=expected_work_id
+                                )
+                                if not detail:
+                                    continue
+                                (
+                                    loop_video_anchors,
+                                    loop_video_markers,
+                                ) = _collect_aweme_media_anchors(detail, audio=False)
+                                (
+                                    loop_audio_anchors,
+                                    loop_audio_markers,
+                                ) = _collect_aweme_media_anchors(detail, audio=True)
+                                if loop_video_markers:
+                                    break
+
+                        near_deadline = now + 3.0 >= deadline
+                        if loop_video_markers:
+                            video_url = _pick_best_cdn_url(
+                                _unique_candidate_rows(video_candidates),
+                                expected_work_id=expected_work_id,
+                                anchor_urls=loop_video_anchors,
+                                uri_markers=loop_video_markers,
+                            )
+                            audio_url = _pick_best_cdn_url(
+                                _unique_candidate_rows(audio_candidates),
+                                audio=True,
+                                expected_work_id=expected_work_id,
+                                anchor_urls=loop_audio_anchors,
+                                uri_markers=loop_audio_markers,
+                            )
+                            # Bound pick available: stop once video is matched
+                            # (audio may still be catching up near deadline).
+                            if video_url and (audio_url or near_deadline):
+                                break
+                        else:
+                            video_url = _pick_best_cdn_url(
+                                _unique_candidate_rows(video_candidates)
+                            )
+                            audio_url = _pick_best_cdn_url(
+                                _unique_candidate_rows(audio_candidates), audio=True
+                            )
+                            if video_url and audio_url:
+                                if mime_pair_since is None:
+                                    mime_pair_since = now
+                                pending_json = any(
+                                    not task.done() for task in payload_tasks
+                                )
+                                # Keep collecting after MIME pair so late target
+                                # CDN can arrive; stretch settle while aweme JSON
+                                # is still in flight (capped), else 1.5s is enough.
+                                settle = 4.0 if pending_json else 1.5
+                                if near_deadline or (now - mime_pair_since >= settle):
+                                    break
+                            elif video_url and near_deadline:
+                                break
                         try:
                             await page.wait_for_event("response", timeout=500)
                         except Exception as exc:
