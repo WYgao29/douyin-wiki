@@ -108,12 +108,33 @@ def _analysis_response_schema() -> dict[str, Any]:
 def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Rewrite a Pydantic JSON schema into an OpenAI ``strict``-compatible shape.
 
-    OpenAI/oMLX ``json_schema`` + ``strict: true`` rejects ``anyOf`` nullables,
-    missing ``required`` entries, free ``additionalProperties``, and remote
-    ``$ref`` nodes. Inline defs, require every property, and encode nullability
-    as ``type: [T, "null"]``.
+    OpenAI/oMLX ``json_schema`` + ``strict: true`` rejects nullable ``anyOf``,
+    missing ``required`` entries, free ``additionalProperties``, remote ``$ref``,
+    and several keywords backends reject (``const``, ``default``, ``title``,
+    ``discriminator``, ``maxLength``/``maxItems``/``minItems``, …). Inline defs,
+    require every property, encode nullability as ``type: [T, "null"]``, keep
+    multi-way unions (e.g. ``content_card``) as ``anyOf``, and map ``const`` to
+    ``enum``.
     """
     import copy
+
+    strip_keys = {
+        "default",
+        "discriminator",
+        "title",
+        "maxLength",
+        "minLength",
+        "maxItems",
+        "minItems",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "uniqueItems",
+    }
 
     root = copy.deepcopy(schema)
     defs = root.pop("$defs", None) or root.pop("definitions", None) or {}
@@ -130,13 +151,21 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
         if "$ref" in node:
             target = convert(resolve(node["$ref"]))
             for key, value in node.items():
-                if key == "$ref":
+                if key == "$ref" or key in strip_keys or key == "const":
                     continue
                 target[key] = convert(value) if isinstance(value, dict) else value
+            if "const" in node and "enum" not in target:
+                target["enum"] = [node["const"]]
             return target
 
         out: dict[str, Any] = {}
         for key, value in node.items():
+            if key in strip_keys:
+                continue
+            if key == "const":
+                if "enum" not in out and "enum" not in node:
+                    out["enum"] = [value]
+                continue
             if key in {"anyOf", "oneOf"}:
                 variants = [convert(item) for item in value]
                 non_null = [
@@ -145,7 +174,8 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
                     if not (isinstance(item, dict) and item.get("type") == "null")
                 ]
                 has_null = len(non_null) != len(variants)
-                if key == "anyOf" and has_null and len(non_null) == 1:
+                # Collapse Optional/nullable unions; keep multi-way unions (content_card).
+                if has_null and len(non_null) == 1:
                     base = dict(non_null[0])
                     type_value = base.get("type")
                     if isinstance(type_value, str):
@@ -158,7 +188,11 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
                     elif "items" in base:
                         base["type"] = ["array", "null"]
                     for extra_key, extra_value in node.items():
-                        if extra_key in {"anyOf", "oneOf"} or extra_key in base:
+                        if (
+                            extra_key in {"anyOf", "oneOf", "const"}
+                            or extra_key in strip_keys
+                            or extra_key in base
+                        ):
                             continue
                         base[extra_key] = extra_value
                     out.update(base)
@@ -191,9 +225,7 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
                 out["type"] = "object"
         return out
 
-    result = convert(root)
-    result.pop("title", None)
-    return result
+    return convert(root)
 
 
 class AnalysisProvider(ABC):

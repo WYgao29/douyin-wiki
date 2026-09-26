@@ -2625,7 +2625,21 @@ class DouyinWikiService:
             audio_path = assets_dir / "audio.wav"
             frames_dir = assets_dir / "frames"
             async with self.media_semaphore:
-                audio_sources = [assets_dir / "audio.mp4", video_path]
+                # Prefer audio.mp4; also accept other retained audio.* from CDN merge.
+                retained_audio = [
+                    path
+                    for path in sorted(
+                        assets_dir.glob("audio.*"),
+                        key=lambda item: (
+                            0 if item.suffix.lower() == ".mp4" else 1,
+                            item.name,
+                        ),
+                    )
+                    if path.is_file()
+                    and path.suffix.lower()
+                    not in {".wav", ".json", ".part", ".jpg", ".jpeg", ".png", ".webp"}
+                ]
+                audio_sources = [*retained_audio, video_path]
                 audio_ready = False
                 for source in audio_sources:
                     if not source.exists():

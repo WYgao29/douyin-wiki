@@ -1232,9 +1232,30 @@ def test_analysis_response_schema_is_openai_strict_compatible() -> None:
     assert "$defs" not in schema
     assert "$ref" not in json.dumps(schema)
 
-    def walk(node: object) -> None:
+    forbidden = {
+        "const",
+        "default",
+        "discriminator",
+        "title",
+        "$defs",
+        "definitions",
+        "maxLength",
+        "minLength",
+        "maxItems",
+        "minItems",
+    }
+    content_card = schema["properties"]["content_card"]
+    assert "anyOf" in content_card
+    assert len(content_card["anyOf"]) >= 2
+    assert "discriminator" not in content_card
+
+    def walk(node: object, *, under_properties: bool = False) -> None:
         if isinstance(node, dict):
             assert "$ref" not in node
+            # Property names may literally be "title"; only forbid schema keywords.
+            if not under_properties:
+                for key in forbidden:
+                    assert key not in node, key
             if "properties" in node:
                 assert set(node.get("required") or []) == set(node["properties"])
                 assert node.get("additionalProperties") is False
@@ -1246,12 +1267,69 @@ def test_analysis_response_schema_is_openai_strict_compatible() -> None:
                         isinstance(value, dict) and value.get("type") == "null"
                         for value in variants
                     )
-                )
-            for value in node.values():
-                walk(value)
+                ), "nullable anyOf-of-2 must be collapsed to type:[T,null]"
+            for key, value in node.items():
+                walk(value, under_properties=(key == "properties"))
         elif isinstance(node, list):
             for value in node:
                 walk(value)
 
     walk(schema)
+    # Discriminator kind fields become enum, not const.
+    kinds = [
+        variant["properties"]["kind"]
+        for variant in content_card["anyOf"]
+        if isinstance(variant, dict) and "properties" in variant
+    ]
+    assert kinds and all("const" not in kind for kind in kinds)
+    assert {"tutorial", "explanation", "other"} <= {
+        (kind.get("enum") or [None])[0] for kind in kinds
+    }
+
+
+@pytest.mark.asyncio
+async def test_json_schema_400_falls_back_to_json_object(monkeypatch) -> None:
+    requests: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                text='{"error":{"message":"Invalid parameter: response_format schema"}}',
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"segments":[],"review_issues":[]}'}}
+                ]
+            },
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "omlx-local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="Qwen3.6-35B-A3B-4bit",
+            response_format="json_schema",
+        )
+    )
+
+    result = await provider._json_call(
+        "analyze work", "input", response_schema=_analysis_response_schema()
+    )
+
+    assert result == {"segments": [], "review_issues": []}
+    assert len(requests) == 2
+    assert requests[0]["response_format"]["type"] == "json_schema"
+    assert requests[0]["response_format"]["json_schema"]["strict"] is True
+    assert requests[1]["response_format"] == {"type": "json_object"}
 

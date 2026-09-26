@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -256,7 +257,7 @@ async def test_cdn_download_merges_audio_after_both_streams_exist(
     assert metadata.author == "测试作者"
     assert metadata.creator_sec_uid == "MS4wLjABAAAAtest"
     assert metadata.description == "作品简介"
-    # Keep independent audio track for ASR after merge.
+    # Keep independent audio.mp4 for ASR after merge.
     assert (tmp_path / "audio.mp4").exists()
 
 
@@ -335,7 +336,224 @@ def test_cdn_url_selection_prefers_full_media_mime() -> None:
             ("https://v3.douyinvod.com/path/media-video/seg?x=1", "video/mp4", 206),
         ]
     )
+    video_rows = [row for row in rows if "media-video" in row[0]]
+    assert len(video_rows) == 1
+    assert video_rows[0][1] == "video/mp4"
+    assert video_rows[0][2] == 200
+    # Reverse observation order: 200+MIME must still beat a later 206 empty MIME.
+    rows_reversed = _unique_candidate_rows(
+        [
+            ("https://v3.douyinvod.com/path/media-video/seg", "video/mp4", 200),
+            ("https://v3.douyinvod.com/path/media-video/seg", "", 206),
+        ]
+    )
+    assert rows_reversed == [
+        ("https://v3.douyinvod.com/path/media-video/seg", "video/mp4", 200)
+    ]
     video = _pick_best_cdn_url(rows)
     audio = _pick_best_cdn_url(rows, audio=True)
     assert video is not None and "media-video" in video and "audio" not in video
     assert audio is not None and "media-audio" in audio
+
+@pytest.mark.asyncio
+async def test_cdn_download_renames_retained_audio_to_mp4(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            audio_url="https://cdn.douyinvod.com/media-audio.m4a",
+            page_title="测试作品",
+            info={
+                "channel": "测试作者",
+                "description": "作品简介",
+                "creator_sec_uid": "MS4wLjABAAAAtest",
+                "channel_url": "https://www.douyin.com/user/MS4wLjABAAAAtest",
+                "thumbnails": [{"id": "cover", "url": "https://example.invalid/cover.jpg"}],
+            },
+        )
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffmpeg":
+            Path(command[-1]).write_bytes(b"merged")
+        elif "media-video.mp4" in command[-1]:
+            (tmp_path / "original.mp4").write_bytes(b"video")
+        elif "media-audio.m4a" in command[-1]:
+            (tmp_path / "audio.m4a").write_bytes(b"audio")
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert (tmp_path / "audio.mp4").exists()
+    assert not (tmp_path / "audio.m4a").exists()
+
+
+@pytest.mark.asyncio
+async def test_cdn_download_fetches_secondary_info_when_creator_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            page_title="仅有标题",
+            info={"title": "仅有标题"},
+        )
+
+    async def secondary(_url: str, _target_dir: Path):
+        return {
+            "channel": "补全作者",
+            "creator_sec_uid": "MS4wLjABAAAAfilled",
+            "channel_url": "https://www.douyin.com/user/MS4wLjABAAAAfilled",
+            "thumbnails": [{"id": "cover", "url": "https://example.invalid/cover.jpg"}],
+            "description": "补全简介",
+        }
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+    monkeypatch.setattr(downloader, "_fetch_info_json", secondary)
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if "media-video.mp4" in command[-1]:
+            (tmp_path / "original.mp4").write_bytes(b"video")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    metadata = await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert metadata.author == "补全作者"
+    assert metadata.creator_sec_uid == "MS4wLjABAAAAfilled"
+    assert metadata.description == "补全简介"
+
+
+@pytest.mark.asyncio
+async def test_capture_awaits_aweme_payload_tasks_before_merge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ensure delayed response.json() tasks finish before payloads are read."""
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+    work_id = "7672717300746907078"
+    released = asyncio.Event()
+    order: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, url: str, payload: dict, *, content_type: str, status: int = 200):
+            self.url = url
+            self.status = status
+            self.headers = {"content-type": content_type}
+            self._payload = payload
+
+        async def json(self):
+            await released.wait()
+            order.append("json")
+            return self._payload
+
+    class FakePage:
+        def __init__(self):
+            self._handler = None
+
+        def on(self, event: str, handler):
+            assert event == "response"
+            self._handler = handler
+
+        async def goto(self, url: str, **kwargs):
+            assert self._handler is not None
+            # Video+audio CDN so the wait loop can exit; aweme JSON is delayed.
+            self._handler(
+                FakeResponse(
+                    "https://v3.douyinvod.com/path/media-video/seg",
+                    {},
+                    content_type="video/mp4",
+                )
+            )
+            self._handler(
+                FakeResponse(
+                    "https://v3.douyinvod.com/path/media-audio/a",
+                    {},
+                    content_type="audio/mp4",
+                )
+            )
+            self._handler(
+                FakeResponse(
+                    f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={work_id}",
+                    {
+                        "aweme_detail": {
+                            "aweme_id": work_id,
+                            "desc": "接口标题",
+                            "author": {
+                                "nickname": "接口作者",
+                                "sec_uid": "MS4wLjABAAAAapi",
+                                "uid": "1",
+                            },
+                            "video": {
+                                "duration": 5000,
+                                "cover": {"url_list": ["https://example.invalid/c.jpg"]},
+                            },
+                        }
+                    },
+                    content_type="application/json",
+                )
+            )
+
+        async def title(self):
+            order.append("title")
+            return "页面标题 - 抖音"
+
+        async def evaluate(self, _script: str):
+            return {"description": "", "author": "", "authorHref": ""}
+
+        async def wait_for_event(self, _event: str, timeout: float = 0):
+            raise TimeoutError("timeout")
+
+        async def wait_for_timeout(self, _ms: int):
+            return None
+
+    class FakeContext:
+        pages: list = []
+
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **kwargs):
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(
+        "playwright.async_api.async_playwright", lambda: FakePlaywright()
+    )
+
+    async def delayed_release():
+        await asyncio.sleep(0.05)
+        order.append("release")
+        released.set()
+
+    releaser = asyncio.create_task(delayed_release())
+    captured = await downloader._capture_cdn_url(
+        f"https://www.douyin.com/video/{work_id}"
+    )
+    await releaser
+    assert captured is not None
+    assert captured.video_url is not None
+    assert captured.info.get("channel") == "接口作者"
+    assert captured.info.get("creator_sec_uid") == "MS4wLjABAAAAapi"
+    # json must complete before page title read (await gather precedes title()).
+    assert order.index("json") < order.index("title")
+

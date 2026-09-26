@@ -100,7 +100,7 @@ def _dedupe_cdn_urls(urls: list[str]) -> list[str]:
 def _unique_candidate_rows(
     candidates: list[tuple[str, str, int]],
 ) -> list[tuple[str, str, int]]:
-    """Dedupe CDN candidates by host+path, preferring higher status then richer MIME."""
+    """Dedupe CDN candidates by host+path, preferring 200+MIME over 206 empty MIME."""
     best: dict[str, tuple[str, str, int]] = {}
     for url, content_type, status in candidates:
         identity = _cdn_url_identity(url)
@@ -111,9 +111,10 @@ def _unique_candidate_rows(
             best[identity] = (url, content_type, status)
             continue
         _, cur_type, cur_status = current
-        prefer_complete = status == 200 and cur_status != 200
-        prefer_richer_type = status == cur_status and len(content_type) > len(cur_type)
-        if prefer_complete or prefer_richer_type:
+        # Complete responses beat partial ones; at equal status prefer richer MIME.
+        if status == 200 and cur_status != 200:
+            best[identity] = (url, content_type, status)
+        elif status == cur_status and len(content_type) > len(cur_type):
             best[identity] = (url, content_type, status)
     return list(best.values())
 
@@ -601,6 +602,7 @@ class YtDlpDownloader:
         video_candidates: list[tuple[str, str, int]] = []
         audio_candidates: list[tuple[str, str, int]] = []
         payloads: list[Any] = []
+        payload_tasks: list[asyncio.Task[Any]] = []
 
         try:
             async with self._locked_profile(), async_playwright() as playwright:
@@ -655,7 +657,9 @@ class YtDlpDownloader:
                                 )
 
                         try:
-                            asyncio.get_running_loop().create_task(_store())
+                            payload_tasks.append(
+                                asyncio.get_running_loop().create_task(_store())
+                            )
                         except RuntimeError:
                             return
 
@@ -681,14 +685,17 @@ class YtDlpDownloader:
                         try:
                             await page.wait_for_event("response", timeout=500)
                         except Exception as exc:
-                            # Timeouts are expected while waiting for CDN; other
-                            # wait errors should not abort capture.
-                            if type(exc).__name__ not in {"TimeoutError", "Error"}:
+                            # Timeouts are expected while polling CDN; do not treat
+                            # bare Playwright Error as silent noise.
+                            if type(exc).__name__ != "TimeoutError":
                                 logger.debug(
                                     "等待 CDN 响应时出现异常：%s",
                                     type(exc).__name__,
                                 )
                             await page.wait_for_timeout(250)
+
+                    if payload_tasks:
+                        await asyncio.gather(*payload_tasks, return_exceptions=True)
 
                     page_title = (
                         (await page.title()).strip().removesuffix(" - 抖音").strip()
@@ -898,7 +905,11 @@ class YtDlpDownloader:
             for path in video_files:
                 path.unlink()
             merged.replace(final_video)
-            # Keep independent audio.* for ASR; service prefers assets_dir/audio.mp4.
+            # Keep independent audio.mp4 for ASR (service looks for that name).
+            preferred_audio = target_dir / "audio.mp4"
+            if audio_files[0].resolve() != preferred_audio.resolve():
+                preferred_audio.unlink(missing_ok=True)
+                audio_files[0].replace(preferred_audio)
 
         info_files = list(target_dir.glob("original.info.json"))
         info: dict[str, Any] = {}
@@ -913,7 +924,14 @@ class YtDlpDownloader:
                     str(info.get("channel_url") or info.get("uploader_url") or "")
                 )
             )
-            if not has_creator or not info.get("thumbnails"):
+            has_identity = bool(info.get("title") or info.get("description"))
+            has_author = bool(info.get("channel") or info.get("uploader"))
+            if (
+                not has_creator
+                or not info.get("thumbnails")
+                or not has_identity
+                or not has_author
+            ):
                 secondary = await self._fetch_info_json(url, target_dir)
                 info = _merge_info(info, secondary)
         preferred_cover = download_preferred_cover(info, target_dir)
