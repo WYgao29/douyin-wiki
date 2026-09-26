@@ -51,6 +51,29 @@ TRANSCRIPT_CORRECTION_SCHEMA = {
 }
 
 
+def _looks_like_json_schema_rejection(body_text: str) -> bool:
+    """True when a 400 body likely rejects strict json_schema response_format.
+
+    Backends vary (oMLX / OpenAI-compatible forks). Match schema-related tokens
+    without requiring one exact phrase, and without treating every 400 as a
+    schema problem (e.g. bad max_tokens / unknown model).
+    """
+    lowered = (body_text or "").lower()
+    if not lowered.strip():
+        # Some local servers return empty 400 bodies for unsupported formats.
+        return True
+    markers = (
+        "json_schema",
+        "response_format",
+        "strict",
+        "schema",
+        "keyword",
+        "additionalproperties",
+        "additional_properties",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _analysis_response_schema() -> dict[str, Any]:
     schema = AnalysisResult.model_json_schema()
     # Legacy fields remain readable in stored entries but need not be generated.
@@ -84,17 +107,13 @@ def _analysis_response_schema() -> dict[str, Any]:
         "entities",
         "contradictions",
     ]
-    schema["properties"]["takeaways"]["minItems"] = 1
-    schema["properties"]["knowledge_atoms"]["maxItems"] = 30
-
+    # Do not write minItems/maxItems/maxLength here: OpenAI-strict stripping
+    # removes them, so pre-strict bounds would be dead writes. Keep only
+    # additionalProperties=False which survives (and is required by strict).
     def bound(node: Any) -> None:
         if isinstance(node, dict):
             if node.get("type") == "object":
                 node["additionalProperties"] = False
-            if node.get("type") == "array":
-                node.setdefault("maxItems", 12)
-            if node.get("type") == "string":
-                node.setdefault("maxLength", 1000)
             for value in node.values():
                 bound(value)
         elif isinstance(node, list):
@@ -312,9 +331,9 @@ class OpenAICompatibleProvider(AnalysisProvider):
                         if (
                             isinstance(current, dict)
                             and current.get("type") == "json_schema"
+                            and _looks_like_json_schema_rejection(response.text)
                         ):
-                            # Any 400 on strict json_schema: backends vary in wording
-                            # (schema / strict / unsupported). Degrade once to json_object.
+                            # Schema/strict rejection only — do not mask unrelated 400s.
                             body["response_format"] = {"type": "json_object"}
                             response = await client.post(url, headers=headers, json=body)
                         elif (

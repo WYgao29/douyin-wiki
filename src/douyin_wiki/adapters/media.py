@@ -228,8 +228,10 @@ def _info_from_aweme_detail(detail: dict[str, Any]) -> dict[str, Any]:
     duration = None
     if duration_ms is not None:
         try:
-            raw = float(duration_ms)
-            duration = raw / 1000.0 if raw > 1000 else raw
+            # Douyin aweme `video.duration` is milliseconds. Do not use a
+            # `> 1000` seconds/ms guess — a 40-minute video reported in seconds
+            # would be wrongly divided into ~2.4s.
+            duration = float(duration_ms) / 1000.0
         except (TypeError, ValueError):
             duration = None
     cover_urls = _cover_urls_from_aweme(detail)
@@ -347,6 +349,21 @@ def _chromium_cookie_databases(settings: MediaSettings) -> list[Path]:
     return candidates
 
 
+def _playwright_profile_cookie_databases(profile_dir: Path) -> list[Path]:
+    """Locate Cookie DBs under the dedicated Playwright user-data-dir."""
+    candidates: list[Path] = []
+    for relative in (
+        Path("Default/Network/Cookies"),
+        Path("Default/Cookies"),
+        Path("Network/Cookies"),
+        Path("Cookies"),
+    ):
+        path = profile_dir / relative
+        if path.is_file() and path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
 def _inspect_chromium_auth_cookies(databases: list[Path]) -> tuple[str, int, Path | None]:
     """Return local cookie state while never decrypting or returning cookie values."""
     if not databases:
@@ -456,10 +473,29 @@ class YtDlpDownloader:
                 await asyncio.to_thread(_release_file_lock, lock_file)
 
     def _browser_spec(self) -> str:
+        """System Chrome/Edge spec — last-resort yt-dlp cookie source only."""
         browser = self.settings.browser
         if self.settings.browser_profile:
             browser = f"{browser}:{self.settings.browser_profile}"
         return browser
+
+    def _preferred_yt_dlp_cookie_spec(self) -> tuple[str, str, str]:
+        """Prefer dedicated Playwright profile cookies over system Chrome.
+
+        Returns ``(cookies_from_browser_value, cookie_source, source_kind)`` where
+        ``source_kind`` is ``playwright_profile`` or ``system_browser``.
+
+        yt-dlp accepts an absolute Chromium profile path as
+        ``chromium:/path/to/Default``; pointing at ``Default`` makes Local State
+        resolve to the Playwright user-data-dir for decryption.
+        """
+        profile_dbs = _playwright_profile_cookie_databases(self.profile_dir)
+        if profile_dbs:
+            default = self.profile_dir / "Default"
+            spec = f"chromium:{default if default.is_dir() else self.profile_dir}"
+            return spec, str(self.profile_dir), "playwright_profile"
+        chrome = self._browser_spec()
+        return chrome, f"{chrome} browser cookie store", "system_browser"
 
     async def check_auth(self, *, video_url: str | None = None) -> AuthCheckResult:
         if video_url:
@@ -476,13 +512,35 @@ class YtDlpDownloader:
         return await asyncio.to_thread(self._check_auth_sync, video_url)
 
     def _check_auth_sync(self, video_url: str | None) -> AuthCheckResult:
-        browser_spec = self._browser_spec()
-        state, cookie_count, database = _inspect_chromium_auth_cookies(
+        cookie_spec, preferred_source, source_kind = self._preferred_yt_dlp_cookie_spec()
+        profile_state, profile_count, _ = _inspect_chromium_auth_cookies(
+            _playwright_profile_cookie_databases(self.profile_dir)
+        )
+        chrome_state, _chrome_count, chrome_db = _inspect_chromium_auth_cookies(
             _chromium_cookie_databases(self.settings)
         )
-        source = f"{browser_spec} browser cookie store"
-        if database is not None:
-            source = str(database.parent)
+        if source_kind == "playwright_profile":
+            state, cookie_count = profile_state, profile_count
+            source = preferred_source
+        else:
+            state, cookie_count = chrome_state, _chrome_count
+            source = preferred_source
+            if chrome_db is not None:
+                source = str(chrome_db.parent)
+
+        dual_note = ""
+        if source_kind == "playwright_profile" and chrome_state == "available":
+            dual_note = (
+                "（主路径：专用 Playwright Profile；系统 Chrome 另有登录 Cookie，"
+                "仅作 yt-dlp 最后回退）"
+            )
+        elif source_kind == "system_browser" and profile_state in {"missing", "expired"}:
+            dual_note = (
+                "（专用 Playwright Profile 尚无可用会话；"
+                "当前回退系统浏览器 Cookie。"
+                "主下载走 CDN 时请运行 douyin-wiki auth douyin "
+                "写入专用 Profile）"
+            )
 
         if video_url:
             probe_url = _validate_douyin_probe_url(video_url)
@@ -491,7 +549,7 @@ class YtDlpDownloader:
                     "yt-dlp",
                     "--no-playlist",
                     "--cookies-from-browser",
-                    browser_spec,
+                    cookie_spec,
                     "--simulate",
                     "--no-warnings",
                     "--print",
@@ -501,13 +559,18 @@ class YtDlpDownloader:
                 timeout=120,
             )
             if result.returncode == 0:
+                where = (
+                    "专用 Playwright Profile"
+                    if source_kind == "playwright_profile"
+                    else "本机浏览器会话"
+                )
                 return AuthCheckResult(
                     scope="video",
                     state="ready",
                     ok=True,
                     server_verified=True,
                     cookie_source=source,
-                    message="yt-dlp 已使用本机浏览器会话成功访问该抖音作品",
+                    message=f"yt-dlp 已使用{where}成功访问该抖音作品{dual_note}",
                 )
             message = (result.stderr or result.stdout or "").lower()
             if _looks_like_auth_failure(message) and state != "available":
@@ -517,8 +580,12 @@ class YtDlpDownloader:
                     ok=False,
                     server_verified=True,
                     cookie_source=source,
-                    message="视频探测失败，且未检测到有效登录 Cookie",
-                    action="douyin-wiki auth video",
+                    message=f"视频探测失败，且未检测到有效登录 Cookie{dual_note}",
+                    action=(
+                        "douyin-wiki auth douyin"
+                        if source_kind == "playwright_profile"
+                        else "douyin-wiki auth video"
+                    ),
                 )
             local_message = {
                 "available": "检测到未过期的抖音登录 Cookie",
@@ -532,11 +599,21 @@ class YtDlpDownloader:
                 ok=False,
                 server_verified=False,
                 cookie_source=source,
-                message=f"{local_message}；yt-dlp 未能提取该作品，无法判定是否需要重新登录",
-                action=None if state == "available" else "douyin-wiki auth video",
+                message=(
+                    f"{local_message}；yt-dlp 未能提取该作品，"
+                    f"无法判定是否需要重新登录{dual_note}"
+                ),
+                action=None
+                if state == "available"
+                else (
+                    "douyin-wiki auth douyin"
+                    if source_kind == "playwright_profile"
+                    else "douyin-wiki auth video"
+                ),
             )
 
-        if self.settings.browser.lower() not in CHROMIUM_DATA_DIRS:
+        browser_key = self.settings.browser.lower()
+        if source_kind == "system_browser" and browser_key not in CHROMIUM_DATA_DIRS:
             return AuthCheckResult(
                 scope="video",
                 state="unavailable",
@@ -552,17 +629,31 @@ class YtDlpDownloader:
             "missing": "没有检测到抖音登录 Cookie",
             "error": "浏览器 Cookie 数据库存在，但当前进程无法读取",
         }
+        action = None
+        if state != "available":
+            # Prefer seeding the dedicated Playwright profile (CDN primary path).
+            action = (
+                "douyin-wiki auth douyin"
+                if profile_state != "available"
+                else "douyin-wiki auth video"
+            )
         return AuthCheckResult(
             scope="video",
             state=state,
             ok=state == "available",
             server_verified=False,
             cookie_source=source,
-            message=messages[state],
-            action=None if state == "available" else "douyin-wiki auth video",
+            message=f"{messages[state]}{dual_note}",
+            action=action,
         )
 
     async def authenticate(self) -> AuthCheckResult:
+        """Open system browser to seed last-resort yt-dlp cookies.
+
+        Primary video download uses the dedicated Playwright profile (CDN path).
+        Prefer ``douyin-wiki auth douyin`` to seed that profile; this command only
+        refreshes the configured system browser Cookie DB used as yt-dlp fallback.
+        """
         browser = self.settings.browser.lower()
         app_name = BROWSER_APPS.get(browser)
         if app_name is None:
@@ -579,8 +670,12 @@ class YtDlpDownloader:
             ok=False,
             server_verified=False,
             cookie_source=f"{self._browser_spec()} browser cookie store",
-            message="已打开视频下载使用的浏览器；请完成抖音登录后运行 auth status",
-            action="douyin-wiki auth status --video-url <抖音视频URL>",
+            message=(
+                "已打开系统浏览器（仅作 yt-dlp 最后回退的 Cookie 来源）。"
+                "主下载/CDN 路径请改用 douyin-wiki auth douyin "
+                "登录专用 Playwright Profile；完成后运行 auth status"
+            ),
+            action="douyin-wiki auth douyin",
         )
 
     async def _capture_cdn_url(self, url: str) -> CapturedCdnMedia | None:
@@ -780,6 +875,7 @@ class YtDlpDownloader:
         """Secondary metadata-only yt-dlp pass for CDN downloads that lack info.json."""
         target_dir.mkdir(parents=True, exist_ok=True)
         output_template = str(target_dir / "original.%(ext)s")
+        cookie_spec, _, _ = self._preferred_yt_dlp_cookie_spec()
         command = [
             "yt-dlp",
             "--no-playlist",
@@ -789,7 +885,7 @@ class YtDlpDownloader:
             "--convert-thumbnails",
             "jpg",
             "--cookies-from-browser",
-            self._browser_spec(),
+            cookie_spec,
             "--no-warnings",
             "--output",
             output_template,
@@ -842,10 +938,11 @@ class YtDlpDownloader:
             command += ["--referer", "https://www.douyin.com/"]
             command.append(video_url)
         else:
-            # Fallback: use cookies from browser (may fail for some videos)
+            # Fallback: prefer dedicated Playwright profile cookies; system Chrome last.
+            cookie_spec, _, _ = self._preferred_yt_dlp_cookie_spec()
             command[2:2] = [
                 "--cookies-from-browser",
-                self._browser_spec(),
+                cookie_spec,
                 "--write-info-json",
                 "--write-thumbnail",
                 "--convert-thumbnails",
@@ -858,14 +955,22 @@ class YtDlpDownloader:
         try:
             _require_success(result, "yt-dlp")
         except CookieRequiredError as exc:
-            local_state, _, _ = _inspect_chromium_auth_cookies(
-                _chromium_cookie_databases(self.settings)
-            )
+            _, preferred_source, source_kind = self._preferred_yt_dlp_cookie_spec()
+            if source_kind == "playwright_profile":
+                local_state, _, _ = _inspect_chromium_auth_cookies(
+                    _playwright_profile_cookie_databases(self.profile_dir)
+                )
+            else:
+                local_state, _, _ = _inspect_chromium_auth_cookies(
+                    _chromium_cookie_databases(self.settings)
+                )
             if cdn_result is None and local_state == "available" and "fresh cookies" in (
                 result.stderr or ""
             ).lower():
                 raise ExternalToolError(
-                    "yt-dlp 未能提取抖音作品；本机已有未过期登录 Cookie，不能判定为需要重新登录",
+                    "yt-dlp 未能提取抖音作品；"
+                    f"{preferred_source} 已有未过期登录 Cookie，"
+                    "不能判定为需要重新登录",
                     details=exc.details,
                 ) from exc
             raise
@@ -897,6 +1002,9 @@ class YtDlpDownloader:
             audio_files = media_files("audio")
             if not audio_files:
                 raise ExternalToolError("yt-dlp 未生成音频文件")
+            # Same selection rule as final media_path: largest candidate wins.
+            video_path = max(video_files, key=lambda path: path.stat().st_size)
+            audio_path = max(audio_files, key=lambda path: path.stat().st_size)
             merged = target_dir / "merged.mp4"
             merge_result = await asyncio.to_thread(
                 _run,
@@ -904,9 +1012,9 @@ class YtDlpDownloader:
                     "ffmpeg",
                     "-y",
                     "-i",
-                    str(video_files[0]),
+                    str(video_path),
                     "-i",
-                    str(audio_files[0]),
+                    str(audio_path),
                     "-map",
                     "0:v:0",
                     "-map",
@@ -927,9 +1035,9 @@ class YtDlpDownloader:
             merged.replace(final_video)
             # Keep independent audio.mp4 for ASR (service looks for that name).
             preferred_audio = target_dir / "audio.mp4"
-            if audio_files[0].resolve() != preferred_audio.resolve():
+            if audio_path.resolve() != preferred_audio.resolve():
                 preferred_audio.unlink(missing_ok=True)
-                audio_files[0].replace(preferred_audio)
+                audio_path.replace(preferred_audio)
 
         info_files = list(target_dir.glob("original.info.json"))
         info: dict[str, Any] = {}

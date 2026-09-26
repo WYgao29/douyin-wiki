@@ -22,6 +22,7 @@ from ..models import (
     SourceKind,
 )
 from .image_note import _page_auth_blocked, _usable_auth_cookies
+from .media import _playwright_profile_cookie_databases
 from .share import DouyinShareResolver, extract_creator_sec_uid, extract_douyin_url
 
 
@@ -342,9 +343,14 @@ class DouyinCreatorAdapter:
         return None
 
     def _yt_dlp_creator_sec_uid(self, url: str) -> str | None:
-        browser = self.settings.browser
-        if self.settings.browser_profile:
-            browser = f"{browser}:{self.settings.browser_profile}"
+        # Prefer dedicated Playwright profile cookies; system Chrome last resort.
+        if _playwright_profile_cookie_databases(self.profile_dir):
+            default = self.profile_dir / "Default"
+            browser = f"chromium:{default if default.is_dir() else self.profile_dir}"
+        else:
+            browser = self.settings.browser
+            if self.settings.browser_profile:
+                browser = f"{browser}:{self.settings.browser_profile}"
         try:
             result = subprocess.run(
                 [

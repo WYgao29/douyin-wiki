@@ -22,6 +22,10 @@
 
 ### 修复
 
+- 视频侧路径（auth 探测、`_fetch_info_json`、yt-dlp CDN 回退）优先使用专用 Playwright Profile Cookie，系统 Chrome 仅作最后手段；`check_auth` 文案标明双来源，README 改为 CDN 优先。
+- aweme `video.duration` 一律按毫秒换算；CDN 合并音视频与最终选片一致取最大文件。
+- OpenAI-strict schema 不再预写会被剥离的 min/maxItems；json_schema 仅在 schema 相关 400 时回退 json_object。
+
 - 卡片进入文章的视图过渡不再出现封面拖影与首页闪动：旧封面快速淡出、根图层短促平滑切换，卡片浮动按钮随卡片一体退场。
 - 顶栏在窄窗口下搜索框快捷键提示不再溢出挤压按钮。
 

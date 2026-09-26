@@ -13,8 +13,10 @@ from douyin_wiki.adapters.media import (
     VisionOCR,
     YtDlpDownloader,
     _chromium_cookie_databases,
+    _info_from_aweme_detail,
     _inspect_chromium_auth_cookies,
     _pick_best_cdn_url,
+    _playwright_profile_cookie_databases,
     _preferred_cover_urls,
     _require_success,
     _unique_candidate_rows,
@@ -655,3 +657,144 @@ async def test_capture_does_not_stall_on_hung_aweme_json(
     assert captured is not None
     assert captured.video_url is not None
     assert captured.audio_url is not None
+
+def test_aweme_duration_is_always_milliseconds() -> None:
+    """Aweme video.duration is ms; long second-like values must not be kept raw."""
+    short = _info_from_aweme_detail(
+        {"aweme_id": "1", "author": {}, "video": {"duration": 5000}, "desc": "x"}
+    )
+    assert short["duration"] == 5.0
+    long_minutes = _info_from_aweme_detail(
+        {
+            "aweme_id": "2",
+            "author": {},
+            "video": {"duration": 40 * 60 * 1000},
+            "desc": "y",
+        }
+    )
+    assert long_minutes["duration"] == 2400.0
+
+
+def test_playwright_profile_cookie_databases(tmp_path: Path) -> None:
+    profile = tmp_path / "browser-profile"
+    database = profile / "Default" / "Cookies"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"")
+    assert _playwright_profile_cookie_databases(profile) == [database]
+
+
+@pytest.mark.asyncio
+async def test_side_paths_prefer_playwright_profile_cookies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile_dir = tmp_path / "browser-profile"
+    cookie_db = profile_dir / "Default" / "Cookies"
+    cookie_db.parent.mkdir(parents=True)
+    with sqlite3.connect(cookie_db) as connection:
+        connection.execute(
+            "CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".douyin.com", "sessionid", 99_999_999_999_999_999),
+        )
+
+    # System Chrome also has cookies — must not be preferred.
+    chrome_profile = tmp_path / "ChromeDefault"
+    chrome_db = chrome_profile / "Network" / "Cookies"
+    chrome_db.parent.mkdir(parents=True)
+    with sqlite3.connect(chrome_db) as connection:
+        connection.execute(
+            "CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".douyin.com", "sessionid", 99_999_999_999_999_999),
+        )
+
+    downloader = YtDlpDownloader(
+        MediaSettings(browser="chrome", browser_profile=str(chrome_profile)),
+        profile_dir,
+    )
+    spec, source, kind = downloader._preferred_yt_dlp_cookie_spec()
+    assert kind == "playwright_profile"
+    assert source == str(profile_dir)
+    assert spec == f"chromium:{profile_dir / 'Default'}"
+
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="123\n", stderr="")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+
+    async def no_cdn(_url: str):
+        return None
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", no_cdn)
+    result = await downloader.check_auth(
+        video_url="https://www.douyin.com/video/123"
+    )
+    assert result.ok is True
+    assert result.cookie_source == str(profile_dir)
+    assert "专用 Playwright Profile" in result.message
+    assert "--cookies-from-browser" in seen[0]
+    assert seen[0][seen[0].index("--cookies-from-browser") + 1] == spec
+
+    # _fetch_info_json also uses the preferred spec.
+    seen.clear()
+    await downloader._fetch_info_json("https://www.douyin.com/video/123", tmp_path / "out")
+    assert seen and seen[0][seen[0].index("--cookies-from-browser") + 1] == spec
+
+
+@pytest.mark.asyncio
+async def test_cdn_merge_picks_largest_video_and_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            audio_url="https://cdn.douyinvod.com/media-audio.mp4",
+            page_title="测试作品",
+            info={
+                "title": "测试作品",
+                "description": "简介",
+                "channel": "作者",
+                "creator_sec_uid": "MS4wLjABAAAAtest",
+                "channel_url": "https://www.douyin.com/user/MS4wLjABAAAAtest",
+                "thumbnails": [{"id": "cover", "url": "https://example.invalid/cover.jpg"}],
+            },
+        )
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+
+    async def no_secondary(_url: str, _target_dir: Path):
+        return {}
+
+    monkeypatch.setattr(downloader, "_fetch_info_json", no_secondary)
+    merge_inputs: list[str] = []
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffmpeg":
+            # Locate both -i operands.
+            indexes = [i for i, part in enumerate(command) if part == "-i"]
+            merge_inputs.extend([command[i + 1] for i in indexes[:2]])
+            Path(command[-1]).write_bytes(b"merged-large")
+        elif "media-video.mp4" in command[-1]:
+            (tmp_path / "original.webm").write_bytes(b"tiny")
+            (tmp_path / "original.mp4").write_bytes(b"video-bytes-larger")
+        elif "media-audio.mp4" in command[-1]:
+            (tmp_path / "audio.m4a").write_bytes(b"a")
+            (tmp_path / "audio.mp4").write_bytes(b"audio-bytes-larger!!")
+        else:
+            raise AssertionError(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert merge_inputs[0].endswith("original.mp4")
+    assert merge_inputs[1].endswith("audio.mp4")
+

@@ -19,8 +19,8 @@
 - 从博主主页或任意单条作品反查博主，先清点全部公开作品，再由用户选择后批量采集。
 - 博主同步只在用户手动触发时执行；不会创建每日或定时主页同步任务。
 - 博主作品按“待入库、已入库、未入库”分区；所有用户可见日期时间统一使用北京时间。
-- 使用浏览器 fresh cookies 调用 `yt-dlp` 下载视频。
-- 使用独立 Playwright 浏览器会话采集图文正文和原分辨率图片，不接触日常 Chrome Profile。
+- 视频优先用专用 Playwright Profile 拦截 CDN 地址再下载；失败时才回退 `yt-dlp`（优先读专用 Profile Cookie，系统 Chrome 仅作最后手段）。
+- 图文与博主采集同样使用独立 Playwright 浏览器会话，不接触日常 Chrome Profile。
 - 通过 `ffmpeg`、MLX Whisper/Whisper CLI 和 macOS Vision 完成本地转录与 OCR。
 - 默认由 OpenClaw/Hermes 当前会话模型校正与分析文字；原视频不上传给模型。
 - 本地 Worker 在转录后暂停，通过持久任务事件把校正、人工确认和完成结果交回原会话。
@@ -161,23 +161,22 @@ uv run douyin-wiki auth status
 uv run douyin-wiki auth status --video-url 'https://www.douyin.com/video/作品ID'
 ```
 
-视频使用配置中的日常浏览器 Cookie。以下命令只打开对应浏览器，不读取、复制或输出 Cookie；
-登录后再次运行 `auth status --video-url`，再重试原任务：
-
-```bash
-uv run douyin-wiki auth video
-uv run douyin-wiki jobs retry JOB_ID
-```
-
-图文使用独立 Playwright Profile；完成一次专用浏览器登录后重试原任务：
+主路径（视频 CDN、图文、博主）共用抖库专用 Playwright Profile。先完成专用浏览器登录，再重试原任务：
 
 ```bash
 uv run douyin-wiki auth douyin
 uv run douyin-wiki jobs retry JOB_ID
 ```
 
-`auth status` 只返回状态、Cookie 来源和修复动作，从不返回 Cookie 值。没有指定视频 URL 时，
-视频检查只读 Chromium Cookie 数据库中的域名、Cookie 名和过期时间，不解密 Cookie 值；
+`auth video` 仅打开配置中的系统浏览器，给 yt-dlp 最后回退准备 Cookie；日常请优先 `auth douyin`。
+两处命令都不读取、复制或输出 Cookie 值。
+
+```bash
+uv run douyin-wiki auth video
+```
+
+`auth status` 只返回状态、Cookie 来源和修复动作，从不返回 Cookie 值。视频侧路径会优先检查专用 Profile，
+并在文案中标明与系统 Chrome 的双来源关系；本地检查只读 Cookie 名/域名/过期时间，不解密 Cookie 值。
 最终服务器可用性仍会在实际下载时验证。专用浏览器目录与用户日常 Chrome Profile 完全分离。
 静态图文只执行图片下载和逐图 Vision OCR，不调用 yt-dlp、ffmpeg、Whisper 或逐字稿校正；
 背景音乐只保存曲名和作者元数据。
@@ -193,8 +192,8 @@ poll_seconds = 5
 
 设为 `enabled = false` 只关闭系统弹框，不会禁用 `auth video`、`auth douyin` 或任务手工重试。
 选择“稍后处理”只保留任务暂停状态，不会在同一次失败中循环弹框。
-自动流程不会读取、复制或显示 Cookie 值、密码和 Local Storage。视频授权使用配置中的日常浏览器；
-图文与博主授权使用抖库专用 Playwright Profile。同一授权通道同时只显示一个引导窗口。
+自动流程不会读取、复制或显示 Cookie 值、密码和 Local Storage。视频 CDN / 图文 / 博主授权共用抖库专用 Playwright Profile；
+系统浏览器 Cookie 仅作 yt-dlp 回退。同一授权通道同时只显示一个引导窗口。
 
 ### 博主批量采集
 

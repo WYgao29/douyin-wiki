@@ -208,7 +208,7 @@ class DouyinWikiService:
         if scope == "video":
             adapter = self.downloader
             kwargs = {"video_url": video_url}
-            source = self.config.media.browser
+            source = str(self.config.browser_profile_dir)
         elif scope == "image_note":
             adapter = self.image_note_downloader
             kwargs = {}

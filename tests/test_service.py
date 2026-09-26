@@ -1446,3 +1446,40 @@ async def test_json_schema_400_falls_back_without_response_format_substring(
     assert len(requests) == 2
     assert requests[1]["response_format"] == {"type": "json_object"}
 
+@pytest.mark.asyncio
+async def test_json_schema_non_schema_400_does_not_fallback(monkeypatch) -> None:
+    """Unrelated 400s (e.g. bad max_tokens) must not silently degrade format."""
+    requests: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(
+            400,
+            text='{"error":{"message":"max_tokens is too large for this model"}}',
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "omlx-local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="Qwen3.6-35B-A3B-4bit",
+            response_format="json_schema",
+            max_retries=0,
+        )
+    )
+
+    with pytest.raises(ExternalToolError):
+        await provider._json_call(
+            "analyze work", "input", response_schema=_analysis_response_schema()
+        )
+
+    assert len(requests) == 1
+    assert requests[0]["response_format"]["type"] == "json_schema"
+
