@@ -4,7 +4,7 @@ import os
 import tomllib
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -46,6 +46,10 @@ class LLMSettings(BaseModel):
     api_key_env: str = "DOUYIN_WIKI_LLM_API_KEY"
     timeout_seconds: float = 120
     max_retries: int = 2
+    response_format: Literal["json_object", "json_schema"] = "json_object"
+    enable_thinking: bool | None = None
+    thinking_budget: int | None = Field(default=None, ge=0)
+    max_output_tokens: int | None = Field(default=None, ge=256, le=32768)
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -185,6 +189,19 @@ def _toml_string(value: object) -> str:
 
 def render_default_config(config: AppConfig | None = None) -> str:
     cfg = config or AppConfig()
+    llm_extras = "".join(
+        [
+            f"enable_thinking = {str(cfg.llm.enable_thinking).lower()}\n"
+            if cfg.llm.enable_thinking is not None
+            else "",
+            f"thinking_budget = {cfg.llm.thinking_budget}\n"
+            if cfg.llm.thinking_budget is not None
+            else "",
+            f"max_output_tokens = {cfg.llm.max_output_tokens}\n"
+            if cfg.llm.max_output_tokens is not None
+            else "",
+        ]
+    )
     profile = (
         f"\nbrowser_profile = {_toml_string(cfg.media.browser_profile)}"
         if cfg.media.browser_profile
@@ -201,6 +218,8 @@ model = {_toml_string(cfg.llm.model)}
 api_key_env = {_toml_string(cfg.llm.api_key_env)}
 timeout_seconds = {cfg.llm.timeout_seconds}
 max_retries = {cfg.llm.max_retries}
+response_format = {_toml_string(cfg.llm.response_format)}
+{llm_extras}
 
 [embeddings]
 provider = {_toml_string(cfg.embeddings.provider)}

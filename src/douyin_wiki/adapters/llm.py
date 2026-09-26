@@ -20,6 +20,89 @@ from ..models import (
 from ..secrets import get_secret
 
 PROMPT_VERSION = "v2.2-timeline-chapters"
+TRANSCRIPT_CORRECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}, "text": {"type": "string"}},
+                "required": ["id", "text"],
+                "additionalProperties": False,
+            },
+        },
+        "review_issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "segment_id": {"type": "integer"},
+                    "reason": {"type": "string"},
+                    "suggestions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["segment_id", "reason", "suggestions"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["segments", "review_issues"],
+    "additionalProperties": False,
+}
+
+
+def _analysis_response_schema() -> dict[str, Any]:
+    schema = AnalysisResult.model_json_schema()
+    # Legacy fields remain readable in stored entries but need not be generated.
+    for name in (
+        "summary",
+        "core_points",
+        "evidence",
+        "steps",
+        "applicable_scenarios",
+        "risks",
+        "claims",
+        "ai_judgment",
+    ):
+        schema["properties"].pop(name, None)
+    schema["required"] = [
+        "analysis_version",
+        "title",
+        "one_liner",
+        "relevance_to_inspiration",
+        "takeaways",
+        "content_type",
+        "facets",
+        "content_card",
+        "chapters",
+        "knowledge_atoms",
+        "actions",
+        "open_questions",
+        "reminders",
+        "tags",
+        "concepts",
+        "entities",
+        "contradictions",
+    ]
+    schema["properties"]["takeaways"]["minItems"] = 1
+    schema["properties"]["knowledge_atoms"]["maxItems"] = 30
+
+    def bound(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object":
+                node["additionalProperties"] = False
+            if node.get("type") == "array":
+                node.setdefault("maxItems", 12)
+            if node.get("type") == "string":
+                node.setdefault("maxLength", 1000)
+            for value in node.values():
+                bound(value)
+        elif isinstance(node, list):
+            for value in node:
+                bound(value)
+
+    bound(schema)
+    return schema
 
 
 class AnalysisProvider(ABC):
@@ -62,7 +145,9 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 f"请配置 llm.model；云端接口还需配置环境变量 {self.settings.api_key_env}"
             )
 
-    async def _json_call(self, system: str, user: str) -> dict[str, Any]:
+    async def _json_call(
+        self, system: str, user: str, *, response_schema: dict[str, Any]
+    ) -> dict[str, Any]:
         self._require_configured()
         url = f"{self.settings.base_url.rstrip('/')}/chat/completions"
         body: dict[str, Any] = {
@@ -72,8 +157,25 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 {"role": "user", "content": user},
             ],
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
+            "response_format": (
+                {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "douyin_wiki_result",
+                        "strict": True,
+                        "schema": response_schema,
+                    },
+                }
+                if self.settings.response_format == "json_schema"
+                else {"type": "json_object"}
+            ),
         }
+        if self.settings.enable_thinking is not None:
+            body["enable_thinking"] = self.settings.enable_thinking
+        if self.settings.thinking_budget is not None:
+            body["thinking_budget"] = self.settings.thinking_budget
+        if self.settings.max_output_tokens is not None:
+            body["max_tokens"] = self.settings.max_output_tokens
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -82,18 +184,23 @@ class OpenAICompatibleProvider(AnalysisProvider):
             try:
                 async with httpx.AsyncClient(timeout=self.settings.timeout_seconds) as client:
                     response = await client.post(url, headers=headers, json=body)
-                    if response.status_code == 400 and "response_format" in response.text:
+                    if (
+                        self.settings.response_format == "json_object"
+                        and response.status_code == 400
+                        and "response_format" in response.text
+                    ):
                         body.pop("response_format", None)
                         response = await client.post(url, headers=headers, json=body)
                     response.raise_for_status()
                     payload = response.json()
                     usage = payload.get("usage") or {}
                     self.last_usage = {
-                        key: int(value)
-                        for key, value in usage.items()
-                        if isinstance(value, int)
+                        key: int(value) for key, value in usage.items() if isinstance(value, int)
                     }
-                    content = payload["choices"][0]["message"]["content"]
+                    choice = payload["choices"][0]
+                    if choice.get("finish_reason") == "length":
+                        raise ValueError("模型输出达到 token 上限")
+                    content = choice["message"]["content"]
                     return _parse_json_content(content)
             except (
                 httpx.HTTPError,
@@ -135,6 +242,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     },
                     ensure_ascii=False,
                 ),
+                response_schema=TRANSCRIPT_CORRECTION_SCHEMA,
             )
             by_id: dict[int, str] = {}
             for item in result.get("segments", []):
@@ -210,6 +318,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 },
                 ensure_ascii=False,
             ),
+            response_schema=_analysis_response_schema(),
         )
         return AnalysisResult.model_validate(result)
 
@@ -233,6 +342,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 },
                 ensure_ascii=False,
             ),
+            response_schema=_analysis_response_schema(),
         )
 
 
@@ -301,7 +411,10 @@ def _parse_json_content(content: str) -> dict[str, Any]:
     cleaned = content.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
-    return json.loads(cleaned)
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("模型没有返回 JSON 对象")
+    return parsed
 
 
 def _analysis_system_prompt() -> str:

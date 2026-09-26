@@ -8,10 +8,11 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from douyin_wiki.adapters.embeddings import EmbeddingService
-from douyin_wiki.adapters.llm import OpenAICompatibleProvider
+from douyin_wiki.adapters.llm import OpenAICompatibleProvider, _parse_json_content
 from douyin_wiki.config import EmbeddingSettings, LLMSettings
 from douyin_wiki.errors import CookieRequiredError, ExternalToolError, JobStateError
 from douyin_wiki.models import (
@@ -1166,3 +1167,51 @@ def test_provider_mode_forwards_configured_loopback_api_key(monkeypatch) -> None
 
     assert provider.configured is True
     assert provider.api_key == "omlx-local-key"
+
+
+@pytest.mark.asyncio
+async def test_provider_can_request_strict_json_schema_for_omlx(monkeypatch) -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"segments":[],"review_issues":[]}'}}]},
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "omlx-local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="Qwen3.6-35B-A3B-4bit",
+            response_format="json_schema",
+            enable_thinking=False,
+            thinking_budget=0,
+            max_output_tokens=4096,
+        )
+    )
+
+    result = await provider._json_call(
+        "correct transcript", "input", response_schema={"type": "object"}
+    )
+
+    assert result == {"segments": [], "review_issues": []}
+    assert requests[0].headers["authorization"] == "Bearer omlx-local-key"
+    body = json.loads(requests[0].content)
+    assert body["response_format"]["type"] == "json_schema"
+    assert body["response_format"]["json_schema"]["schema"] == {"type": "object"}
+    assert body["enable_thinking"] is False
+    assert body["thinking_budget"] == 0
+    assert body["max_tokens"] == 4096
+
+
+def test_provider_rejects_json_array_when_object_is_required() -> None:
+    with pytest.raises(ValueError, match="JSON 对象"):
+        _parse_json_content("[]")
