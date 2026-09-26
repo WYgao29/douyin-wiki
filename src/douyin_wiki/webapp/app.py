@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -399,14 +400,35 @@ def create_app(
             warnings.append(f"操作已完成，但网页更新通知失败：{exc}")
         return {**result, "warnings": warnings}
 
+    def _local_write_origin_ok(request: Request) -> bool:
+        """Require Origin or Referer to match this local host when either is sent.
+
+        The app binds to 127.0.0.1/localhost only. Browser writes send Origin
+        (fetch/XHR) or Referer (form posts); both must match http(s)://{Host}.
+        Requests with neither header (curl and other local API clients) are
+        allowed so legitimate automation keeps working.
+        """
+        host = (request.headers.get("host") or "").strip()
+        if not host:
+            return False
+        allowed = {f"http://{host}", f"https://{host}"}
+        origin = (request.headers.get("origin") or "").strip().rstrip("/")
+        if origin:
+            return origin in allowed
+        referer = (request.headers.get("referer") or "").strip()
+        if referer:
+            parsed = urlsplit(referer)
+            if not parsed.scheme or not parsed.netloc:
+                return False
+            return f"{parsed.scheme}://{parsed.netloc}" in allowed
+        return True
+
     @app.middleware("http")
     async def same_origin(request: Request, call_next):
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-            origin = request.headers.get("origin")
-            if origin:
-                host = request.headers.get("host", "")
-                if origin.rstrip("/") != f"http://{host}":
-                    return JSONResponse({"detail": "拒绝跨来源请求"}, status_code=403)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _local_write_origin_ok(
+            request
+        ):
+            return JSONResponse({"detail": "拒绝跨来源请求"}, status_code=403)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"

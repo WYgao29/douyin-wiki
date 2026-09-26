@@ -21,6 +21,7 @@ from douyin_wiki.adapters.media import (
     _require_success,
     _unique_candidate_rows,
     download_preferred_cover,
+    preferred_yt_dlp_cookie_spec,
 )
 from douyin_wiki.config import MediaSettings
 from douyin_wiki.errors import (
@@ -681,6 +682,46 @@ def test_playwright_profile_cookie_databases(tmp_path: Path) -> None:
     database.parent.mkdir(parents=True)
     database.write_bytes(b"")
     assert _playwright_profile_cookie_databases(profile) == [database]
+
+
+def test_cookie_spec_falls_back_when_profile_has_no_usable_session(tmp_path: Path) -> None:
+    """Cookie DB file existence alone must not beat system Chrome with a live session."""
+    profile_dir = tmp_path / "browser-profile"
+    empty_db = profile_dir / "Default" / "Cookies"
+    empty_db.parent.mkdir(parents=True)
+    with sqlite3.connect(empty_db) as connection:
+        connection.execute(
+            "CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER)"
+        )
+
+    chrome_profile = tmp_path / "ChromeDefault"
+    chrome_db = chrome_profile / "Network" / "Cookies"
+    chrome_db.parent.mkdir(parents=True)
+    with sqlite3.connect(chrome_db) as connection:
+        connection.execute(
+            "CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".douyin.com", "sessionid", 99_999_999_999_999_999),
+        )
+
+    settings = MediaSettings(browser="chrome", browser_profile=str(chrome_profile))
+    spec, source, kind = preferred_yt_dlp_cookie_spec(profile_dir, settings)
+    assert kind == "system_browser"
+    assert spec == f"chrome:{chrome_profile}"
+    assert "browser cookie store" in source
+
+    # Usable Playwright cookies still win over system Chrome.
+    with sqlite3.connect(empty_db) as connection:
+        connection.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".douyin.com", "sessionid", 99_999_999_999_999_999),
+        )
+    spec, source, kind = preferred_yt_dlp_cookie_spec(profile_dir, settings)
+    assert kind == "playwright_profile"
+    assert source == str(profile_dir)
+    assert spec == f"chromium:{profile_dir / 'Default'}"
 
 
 @pytest.mark.asyncio

@@ -1038,6 +1038,32 @@ def test_local_host_and_same_origin_are_enforced(tmp_path: Path) -> None:
             headers={"origin": "https://evil.example"},
         )
         assert blocked.status_code == 403
+        blocked_referer = client.post(
+            "/api/chat/sessions",
+            json={"scope": "library"},
+            headers={"referer": "https://evil.example/attack"},
+        )
+        assert blocked_referer.status_code == 403
+        # Matching Origin is accepted.
+        assert (
+            client.post(
+                "/api/chat/sessions",
+                json={"scope": "library"},
+                headers={"origin": "http://testserver"},
+            ).status_code
+            == 201
+        )
+        # Matching Referer (no Origin) is accepted — classic form posts.
+        assert (
+            client.post(
+                "/api/chat/sessions",
+                json={"scope": "library"},
+                headers={"referer": "http://testserver/"},
+            ).status_code
+            == 201
+        )
+        # Neither Origin nor Referer — local API clients (curl) still work.
+        assert client.post("/api/chat/sessions", json={"scope": "library"}).status_code == 201
 
 
 def test_creator_sources_are_visible_and_machine_files_are_excluded(tmp_path: Path) -> None:

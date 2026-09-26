@@ -886,6 +886,7 @@ class VaultWriter:
         machine_paths.extend((self.vault_path / "creators").glob("*/.data/sources/*.md"))
         for machine_path in sorted(machine_paths):
             try:
+                self._reject_vault_symlinks(machine_path, field="machine_path")
                 loaded = self._load_entry(machine_path)
             except Exception as exc:
                 self._append_load_error(self.last_entry_load_errors, machine_path, exc)
@@ -1044,6 +1045,7 @@ class VaultWriter:
         seen_ids: set[str] = set()
         for machine_path in machine_paths:
             try:
+                self._reject_vault_symlinks(machine_path, field="creator.machine_path")
                 machine_frontmatter, machine_body = self._parse_document_strict(machine_path)
                 payload_match = re.search(r"```yaml\s*\n(?P<payload>.*?)\n```", machine_body, re.S)
                 if not payload_match:
@@ -1108,6 +1110,7 @@ class VaultWriter:
         seen_ids: set[str] = set()
         for machine_path in machine_paths:
             try:
+                self._reject_vault_symlinks(machine_path, field="topic.machine_path")
                 frontmatter, _ = self._parse_document_strict(machine_path)
                 topic = ResearchTopic.model_validate(frontmatter)
                 self._safe_id(topic.id, field="topic.id")
@@ -1754,6 +1757,25 @@ class VaultWriter:
             }
         )
 
+    def _reject_vault_symlinks(self, target: Path, *, field: str = "path") -> None:
+        """Reject any symlink along a vault-relative lexical path.
+
+        Matches delete-path policy in ``DouyinWikiService._entry_managed_paths``:
+        vault-internal symlinks are refused outright so write/scan cannot follow
+        or rewrite through them, while ``resolve()`` still blocks escapes.
+        """
+        configured_root = self.vault_path.absolute()
+        absolute = target if target.is_absolute() else configured_root / target
+        try:
+            relative = absolute.absolute().relative_to(configured_root)
+        except ValueError as exc:
+            raise ValueError(f"{field} 超出 Vault 范围") from exc
+        cursor = configured_root
+        for part in relative.parts:
+            cursor /= part
+            if cursor.is_symlink():
+                raise ValueError(f"{field} 包含 Vault 内部符号链接")
+
     def _safe_relative_path(self, value: Any, *, field: str) -> str:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field} 必须是非空相对路径")
@@ -1762,6 +1784,7 @@ class VaultWriter:
         path = Path(value)
         if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
             raise ValueError(f"{field} 必须是安全相对路径")
+        self._reject_vault_symlinks(self.vault_path.absolute() / path, field=field)
         root = self.vault_path.resolve()
         resolved = (root / path).resolve()
         if resolved != root and root not in resolved.parents:
@@ -1793,8 +1816,8 @@ class VaultWriter:
             raise ValueError("YAML frontmatter 顶层必须是对象")
         return frontmatter, match.group("body")
 
-    @staticmethod
-    def _atomic_write(path: Path, content: str) -> None:
+    def _atomic_write(self, path: Path, content: str) -> None:
+        self._reject_vault_symlinks(path, field="write_path")
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:

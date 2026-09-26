@@ -22,6 +22,8 @@
 
 ### 修复
 
+- Web 写请求在带 Origin/Referer 时校验为本机 Host；二者皆无时仍允许本地 API 客户端。Vault 写入/扫描与删除一致拒绝内部符号链接。yt-dlp Cookie 仅在 Playwright Profile 有可用抖音会话时优先，否则回退系统浏览器；creator 与 media 共用同一选择逻辑。json_schema 400 回退不再把空响应体或过宽关键词当作 schema 拒绝。
+
 - 视频侧路径（auth 探测、`_fetch_info_json`、yt-dlp CDN 回退）优先使用专用 Playwright Profile Cookie，系统 Chrome 仅作最后手段；`check_auth` 文案标明双来源，README 改为 CDN 优先。
 - aweme `video.duration` 一律按毫秒换算；CDN 合并音视频与最终选片一致取最大文件。
 - OpenAI-strict schema 不再预写会被剥离的 min/maxItems；json_schema 仅在 schema 相关 400 时回退 json_object。

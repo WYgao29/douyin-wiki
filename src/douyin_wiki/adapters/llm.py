@@ -54,24 +54,23 @@ TRANSCRIPT_CORRECTION_SCHEMA = {
 def _looks_like_json_schema_rejection(body_text: str) -> bool:
     """True when a 400 body likely rejects strict json_schema response_format.
 
-    Backends vary (oMLX / OpenAI-compatible forks). Match schema-related tokens
-    without requiring one exact phrase, and without treating every 400 as a
-    schema problem (e.g. bad max_tokens / unknown model).
+    Backends vary (oMLX / OpenAI-compatible forks). Prefer explicit format tokens
+    over bare words like ``schema`` / ``keyword`` / empty bodies, so unrelated
+    400s (bad max_tokens, unknown model, blank errors) are not masked.
     """
-    lowered = (body_text or "").lower()
-    if not lowered.strip():
-        # Some local servers return empty 400 bodies for unsupported formats.
-        return True
+    lowered = (body_text or "").lower().strip()
+    if not lowered:
+        return False
     markers = (
         "json_schema",
         "response_format",
-        "strict",
-        "schema",
-        "keyword",
         "additionalproperties",
         "additional_properties",
     )
-    return any(marker in lowered for marker in markers)
+    if any(marker in lowered for marker in markers):
+        return True
+    # e.g. "strict mode does not support this keyword"
+    return "strict" in lowered and ("keyword" in lowered or "schema" in lowered)
 
 
 def _analysis_response_schema() -> dict[str, Any]:

@@ -454,6 +454,35 @@ def download_preferred_cover(info: dict[str, Any], target_dir: Path) -> Path | N
     return None
 
 
+def preferred_yt_dlp_cookie_spec(
+    profile_dir: Path, settings: MediaSettings
+) -> tuple[str, str, str]:
+    """Prefer dedicated Playwright profile cookies over system Chrome.
+
+    Returns ``(cookies_from_browser_value, cookie_source, source_kind)`` where
+    ``source_kind`` is ``playwright_profile`` or ``system_browser``.
+
+    Prefer the Playwright profile only when it has usable (non-expired) Douyin
+    auth cookies; a Cookie DB file alone is not enough. Otherwise fall back to
+    the configured system browser — last resort for yt-dlp.
+
+    yt-dlp accepts an absolute Chromium profile path as
+    ``chromium:/path/to/Default``; pointing at ``Default`` makes Local State
+    resolve to the Playwright user-data-dir for decryption.
+    """
+    profile_dbs = _playwright_profile_cookie_databases(profile_dir)
+    if profile_dbs:
+        state, _, _ = _inspect_chromium_auth_cookies(profile_dbs)
+        if state == "available":
+            default = profile_dir / "Default"
+            spec = f"chromium:{default if default.is_dir() else profile_dir}"
+            return spec, str(profile_dir), "playwright_profile"
+    browser = settings.browser
+    if settings.browser_profile:
+        browser = f"{browser}:{settings.browser_profile}"
+    return browser, f"{browser} browser cookie store", "system_browser"
+
+
 class YtDlpDownloader:
     def __init__(self, settings: MediaSettings, profile_dir: Path) -> None:
         self.settings = settings
@@ -480,22 +509,7 @@ class YtDlpDownloader:
         return browser
 
     def _preferred_yt_dlp_cookie_spec(self) -> tuple[str, str, str]:
-        """Prefer dedicated Playwright profile cookies over system Chrome.
-
-        Returns ``(cookies_from_browser_value, cookie_source, source_kind)`` where
-        ``source_kind`` is ``playwright_profile`` or ``system_browser``.
-
-        yt-dlp accepts an absolute Chromium profile path as
-        ``chromium:/path/to/Default``; pointing at ``Default`` makes Local State
-        resolve to the Playwright user-data-dir for decryption.
-        """
-        profile_dbs = _playwright_profile_cookie_databases(self.profile_dir)
-        if profile_dbs:
-            default = self.profile_dir / "Default"
-            spec = f"chromium:{default if default.is_dir() else self.profile_dir}"
-            return spec, str(self.profile_dir), "playwright_profile"
-        chrome = self._browser_spec()
-        return chrome, f"{chrome} browser cookie store", "system_browser"
+        return preferred_yt_dlp_cookie_spec(self.profile_dir, self.settings)
 
     async def check_auth(self, *, video_url: str | None = None) -> AuthCheckResult:
         if video_url:

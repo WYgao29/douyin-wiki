@@ -1483,3 +1483,64 @@ async def test_json_schema_non_schema_400_does_not_fallback(monkeypatch) -> None
     assert len(requests) == 1
     assert requests[0]["response_format"]["type"] == "json_schema"
 
+
+@pytest.mark.asyncio
+async def test_json_schema_empty_400_does_not_fallback(monkeypatch) -> None:
+    """Blank 400 bodies are too ambiguous to treat as schema rejection."""
+    requests: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(400, text="")
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "omlx-local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="Qwen3.6-35B-A3B-4bit",
+            response_format="json_schema",
+            max_retries=0,
+        )
+    )
+
+    with pytest.raises(ExternalToolError):
+        await provider._json_call(
+            "analyze work", "input", response_schema=_analysis_response_schema()
+        )
+
+    assert len(requests) == 1
+    assert requests[0]["response_format"]["type"] == "json_schema"
+
+
+def test_vault_rejects_internal_symlinks_on_write_and_scan(tmp_path: Path) -> None:
+    vault_root = tmp_path / "vault"
+    vault_root.mkdir()
+    writer = VaultWriter(vault_root)
+    writer.initialize(initialize_git=False)
+
+    sources = vault_root / "wiki" / ".data" / "sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    real = sources / "111111111111.md"
+    real.write_text("---\ntype: source\n---\n", encoding="utf-8")
+    link = sources / "222222222222.md"
+    link.symlink_to(real)
+
+    with pytest.raises(ValueError, match="符号链接"):
+        writer._atomic_write(link, "hijack\n")
+
+    with pytest.raises(ValueError, match="符号链接"):
+        writer._safe_relative_path(
+            "wiki/.data/sources/222222222222.md", field="source_page"
+        )
+
+    loaded = writer.load_entries()
+    assert loaded == []
+    assert any("符号链接" in item["error"] for item in writer.last_entry_load_errors)
+
