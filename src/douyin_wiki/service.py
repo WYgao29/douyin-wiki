@@ -2625,26 +2625,35 @@ class DouyinWikiService:
             audio_path = assets_dir / "audio.wav"
             frames_dir = assets_dir / "frames"
             async with self.media_semaphore:
-                # Prefer pre-downloaded separate audio (audio.mp4) over extracting from video.
-                separate_audio = assets_dir / "audio.mp4"
-                if separate_audio.exists():
-                    # Convert separate audio to whisper-friendly WAV.
+                audio_sources = [assets_dir / "audio.mp4", video_path]
+                audio_ready = False
+                for source in audio_sources:
+                    if not source.exists():
+                        continue
                     try:
-                        await self.media.extract_audio(separate_audio, audio_path)
-                    except ExternalToolError:
-                        # Conversion failed, fall back to video file.
-                        separate_audio = None
-                else:
-                    separate_audio = None
-                if separate_audio is None and "transcript_skipped" not in artifacts:
-                    try:
-                        await self.media.extract_audio(video_path, audio_path)
-                    except ExternalToolError:
-                        # Video has no audio stream and no separate audio available.
-                        artifacts["transcript_skipped"] = "no_audio_available"
-                        separate_audio = None  # ensure cleanup below is a no-op
+                        await self.media.extract_audio(source, audio_path)
+                    except ExternalToolError as exc:
+                        audio_path.unlink(missing_ok=True)
+                        if source == video_path:
+                            detail = str(exc.details.get("stderr", "")).lower()
+                            no_audio = (
+                                "does not contain any stream" in detail
+                                or "没有音轨" in str(exc)
+                            )
+                            if not no_audio:
+                                raise
+                        continue
+                    if audio_path.is_file() and audio_path.stat().st_size > 0:
+                        audio_ready = True
+                        break
+                    audio_path.unlink(missing_ok=True)
+                if not audio_ready:
+                    artifacts["transcript_skipped"] = "no_audio_available"
                 try:
-                    transcript = await self.transcriber.transcribe(audio_path, work_dir / "whisper")
+                    transcript = (
+                        await self.transcriber.transcribe(audio_path, work_dir / "whisper")
+                        if audio_ready else []
+                    )
                     frames = await self.media.extract_frames(
                         video_path,
                         frames_dir,
@@ -2671,6 +2680,11 @@ class DouyinWikiService:
                     **(
                         {"ocr_warning": artifacts["ocr_warning"]}
                         if artifacts.get("ocr_warning")
+                        else {}
+                    ),
+                    **(
+                        {"transcript_skipped": artifacts["transcript_skipped"]}
+                        if artifacts.get("transcript_skipped")
                         else {}
                     ),
                 },

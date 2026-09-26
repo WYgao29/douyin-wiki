@@ -57,7 +57,7 @@ async def test_ui_inventory_requires_separate_confirm_and_partial_acceptance(
     root = Path(__file__).parents[1] / "src/douyin_wiki/webapp"
     template = (root / "templates/app.html").read_text()
     begin = template.index('      <section id="imports-favorites-view"')
-    end = template.index('      <section id="jobs-view"')
+    end = template.index('<section id="jobs-view"', begin)
     html = '<meta charset="utf-8">' + template[begin:end]
     data = {
         "job_id": "fixture-parent",

@@ -228,6 +228,17 @@ class YtDlpDownloader:
         return browser
 
     async def check_auth(self, *, video_url: str | None = None) -> AuthCheckResult:
+        if video_url:
+            probe_url = _validate_douyin_probe_url(video_url)
+            if await self._capture_cdn_url(probe_url):
+                return AuthCheckResult(
+                    scope="video",
+                    state="ready",
+                    ok=True,
+                    server_verified=True,
+                    cookie_source=str(self.profile_dir),
+                    message="专用浏览器已访问作品并获取视频媒体地址",
+                )
         return await asyncio.to_thread(self._check_auth_sync, video_url)
 
     def _check_auth_sync(self, video_url: str | None) -> AuthCheckResult:
@@ -265,14 +276,14 @@ class YtDlpDownloader:
                     message="yt-dlp 已使用本机浏览器会话成功访问该抖音作品",
                 )
             message = (result.stderr or result.stdout or "").lower()
-            if _looks_like_auth_failure(message):
+            if _looks_like_auth_failure(message) and state != "available":
                 return AuthCheckResult(
                     scope="video",
                     state="needs_login",
                     ok=False,
                     server_verified=True,
                     cookie_source=source,
-                    message="抖音拒绝了当前浏览器会话，需要重新登录",
+                    message="视频探测失败，且未检测到有效登录 Cookie",
                     action="douyin-wiki auth video",
                 )
             local_message = {
@@ -283,11 +294,11 @@ class YtDlpDownloader:
             }[state]
             return AuthCheckResult(
                 scope="video",
-                state=state,
-                ok=state == "available",
+                state="unverified" if state == "available" else state,
+                ok=False,
                 server_verified=False,
                 cookie_source=source,
-                message=f"{local_message}；指定作品探测失败，无法确认服务器状态",
+                message=f"{local_message}；yt-dlp 未能提取该作品，无法判定是否需要重新登录",
                 action=None if state == "available" else "douyin-wiki auth video",
             )
 
@@ -338,8 +349,8 @@ class YtDlpDownloader:
             action="douyin-wiki auth status --video-url <抖音视频URL>",
         )
 
-    async def _capture_cdn_url(self, url: str) -> tuple[str, str | None] | None:
-        """Use Playwright to navigate to the video page and capture the video (+ optional audio) CDN URLs."""
+    async def _capture_cdn_url(self, url: str) -> tuple[str, str | None, str | None] | None:
+        """Capture video and optional audio URLs while Playwright opens the work page."""
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -362,7 +373,10 @@ class YtDlpDownloader:
 
                     def on_response(response: Any) -> None:
                         resp_url = response.url
-                        if "douyinvod.com" not in resp_url:
+                        host = (urlsplit(resp_url).hostname or "").lower()
+                        if not (host == "douyinvod.com" or host.endswith(".douyinvod.com")):
+                            return
+                        if response.status not in {200, 206}:
                             return
                         # Audio segments contain "audio" or "audiomp4" or "media-audio" patterns.
                         if any(tag in resp_url for tag in ("audio", "audiomp4", "media-audio")):
@@ -374,16 +388,17 @@ class YtDlpDownloader:
                     await page.goto(url, wait_until="load", timeout=60_000)
                     # Wait for video playback to start and both streams to be requested.
                     await page.wait_for_timeout(10_000)
+                    page_title = (await page.title()).strip().removesuffix(" - 抖音").strip()
 
                     # Prefer highest-quality video URL (contains "media-video" and .mp4).
                     for candidate in video_urls:
                         if "media-video" in candidate and ".mp4" in candidate:
-                            return candidate, audio_urls[0] if audio_urls else None
+                            return candidate, audio_urls[0] if audio_urls else None, page_title
                     for candidate in video_urls:
                         if "media-video" in candidate:
-                            return candidate, audio_urls[0] if audio_urls else None
+                            return candidate, audio_urls[0] if audio_urls else None, page_title
                     if video_urls:
-                        return video_urls[0], audio_urls[0] if audio_urls else None
+                        return video_urls[0], audio_urls[0] if audio_urls else None, page_title
                     return None
                 finally:
                     await context.close()
@@ -398,89 +413,93 @@ class YtDlpDownloader:
 
         video_url: str
         audio_url: str | None
+        page_title: str | None = None
         if cdn_result is None:
             video_url = url
             audio_url = None
         else:
-            video_url, audio_url = cdn_result
+            video_url, audio_url, page_title = cdn_result
 
-        # Step 2: Download via yt-dlp using the CDN URL + referer trick.
+        # Download the video before merging a separately served audio stream.
         output_template = str(target_dir / "original.%(ext)s")
         command = [
             "yt-dlp",
             "--no-playlist",
-            "--write-info-json",
-            "--write-thumbnail",
-            "--convert-thumbnails",
-            "jpg",
             "--output",
             output_template,
         ]
         if cdn_result is not None:
             command += ["--referer", "https://www.douyin.com/"]
             command.append(video_url)
-            if audio_url:
-                # Also grab audio into a separate file; we'll merge after.
-                audio_template = str(target_dir / "audio.%(ext)s")
-                audio_command = [
-                    "yt-dlp",
-                    "--no-playlist",
-                    "--output",
-                    audio_template,
-                    "--referer", "https://www.douyin.com/",
-                    audio_url,
-                ]
-                audio_result = await asyncio.to_thread(_run, audio_command, timeout=7200)
-                # If audio download fails, continue with video-only.
-                if audio_result.returncode == 0:
-                    audio_files = list(target_dir.glob("audio.*"))
-                    audio_files = [f for f in audio_files if f.suffix.lower() not in {".json", ".jpg", ".part"}]
-                    video_files = list(target_dir.glob("original.*"))
-                    video_files = [f for f in video_files if f.suffix.lower() not in {".json", ".jpg", ".part"}]
-                    if audio_files and video_files:
-                        merged = target_dir / "merged.mp4"
-                        merge_result = await asyncio.to_thread(
-                            _run,
-                            [
-                                "ffmpeg", "-y",
-                                "-i", str(video_files[0]),
-                                "-i", str(audio_files[0]),
-                                "-c:v", "copy", "-c:a", "aac",
-                                "-shortest",
-                                str(merged),
-                            ],
-                            timeout=600,
-                        )
-                        if merge_result.returncode == 0 and merged.exists():
-                            # Replace original video with merged version.
-                            original_video = video_files[0]
-                            original_video.unlink()
-                            merged.rename(original_video)
-                            # Clean up audio file.
-                            for f in audio_files:
-                                f.unlink()
         else:
             # Fallback: use cookies from browser (may fail for some videos)
-            command.insert(2, "--cookies-from-browser")
-            command.insert(3, self._browser_spec())
+            command[2:2] = [
+                "--cookies-from-browser", self._browser_spec(),
+                "--write-info-json", "--write-thumbnail", "--convert-thumbnails", "jpg",
+                "--merge-output-format", "mp4",
+            ]
             command.append(url)
-
-        if not (target_dir / "original.mp4").exists():
-            command.append("--merge-output-format")
-            command.append("mp4")
-            result = await asyncio.to_thread(_run, command, timeout=7200)
+        result = await asyncio.to_thread(_run, command, timeout=7200)
+        try:
             _require_success(result, "yt-dlp")
+        except CookieRequiredError as exc:
+            local_state, _, _ = _inspect_chromium_auth_cookies(
+                _chromium_cookie_databases(self.settings)
+            )
+            if cdn_result is None and local_state == "available" and "fresh cookies" in (
+                result.stderr or ""
+            ).lower():
+                raise ExternalToolError(
+                    "yt-dlp 未能提取抖音作品；本机已有未过期登录 Cookie，不能判定为需要重新登录",
+                    details=exc.details,
+                ) from exc
+            raise
+
+        def media_files(prefix: str) -> list[Path]:
+            return [
+                path for path in target_dir.glob(f"{prefix}.*")
+                if path.is_file()
+                and path.suffix.lower() not in {".json", ".jpg", ".jpeg", ".png", ".webp", ".part"}
+            ]
+
+        video_files = media_files("original")
+        if not video_files:
+            raise ExternalToolError("yt-dlp 未生成视频文件")
+        if audio_url:
+            audio_command = [
+                "yt-dlp", "--no-playlist", "--output", str(target_dir / "audio.%(ext)s"),
+                "--referer", "https://www.douyin.com/", audio_url,
+            ]
+            audio_result = await asyncio.to_thread(_run, audio_command, timeout=7200)
+            _require_success(audio_result, "yt-dlp 音频下载")
+            audio_files = media_files("audio")
+            if not audio_files:
+                raise ExternalToolError("yt-dlp 未生成音频文件")
+            merged = target_dir / "merged.mp4"
+            merge_result = await asyncio.to_thread(
+                _run,
+                [
+                    "ffmpeg", "-y", "-i", str(video_files[0]), "-i", str(audio_files[0]),
+                    "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", str(merged),
+                ],
+                timeout=600,
+            )
+            _require_success(merge_result, "ffmpeg 合并音视频")
+            if not merged.is_file() or merged.stat().st_size == 0:
+                raise ExternalToolError("ffmpeg 未生成合并后的视频")
+            final_video = target_dir / "original.mp4"
+            for path in video_files:
+                path.unlink()
+            merged.replace(final_video)
+            for path in audio_files:
+                path.unlink()
 
         info_files = list(target_dir.glob("original.info.json"))
         info: dict[str, Any] = {}
         if info_files:
             info = json.loads(info_files[0].read_text(encoding="utf-8"))
         preferred_cover = download_preferred_cover(info, target_dir)
-        candidates = [
-            path
-            for path in target_dir.glob("original.*")
-            if path.suffix.lower() not in {".json", ".jpg", ".jpeg", ".png", ".webp", ".part"}
-        ]
+        candidates = media_files("original")
         if not candidates:
             raise ExternalToolError("yt-dlp 未生成视频文件")
         media_path = max(candidates, key=lambda path: path.stat().st_size)
@@ -500,10 +519,10 @@ class YtDlpDownloader:
         elif fallback_thumbnail:
             thumbnail_kind = "origin_cover"
         return VideoMetadata(
-            video_id=str(info.get("id") or video_id),
+            video_id=video_id if cdn_result is not None else str(info.get("id") or video_id),
             original_url=url,
             canonical_url=f"https://www.douyin.com/video/{video_id}",
-            title=info.get("title") or info.get("description") or "抖音视频",
+            title=page_title or info.get("title") or info.get("description") or "抖音视频",
             # Douyin exposes the human-readable display name as ``channel`` while
             # ``uploader`` can be the numeric account id.
             author=info.get("channel") or info.get("uploader"),

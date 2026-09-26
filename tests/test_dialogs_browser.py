@@ -16,19 +16,22 @@ async def offline_page():
             await browser.close()
 
 
-async def test_capture_dialog_cancel_buttons_close_without_required_input(offline_page):
+async def test_single_import_requires_a_link_before_submitting(offline_page):
     page = offline_page
     root = Path(__file__).parents[1] / "src/douyin_wiki/webapp"
     template = (root / "templates/app.html").read_text()
-    begin = template.index('  <dialog id="capture-dialog"')
-    end = template.index('  <dialog id="inspiration-dialog"')
+    begin = template.index('<section id="imports-single-view"')
+    end = template.index('<section id="imports-creators-view"', begin)
     await page.set_content(template[begin:end])
-
-    dialog = page.locator("#capture-dialog")
-    await dialog.evaluate("(node) => node.showModal()")
-    await page.get_by_role("button", name="取消", exact=True).click()
-    assert not await dialog.is_visible()
-
-    await dialog.evaluate("(node) => node.showModal()")
-    await page.get_by_role("button", name="关闭写入窗口").click()
-    assert not await dialog.is_visible()
+    await page.evaluate("""() => {
+      window.submitCount = 0;
+      document.getElementById('single-form').addEventListener('submit', event => {
+        event.preventDefault();
+        window.submitCount += 1;
+      });
+    }""")
+    await page.get_by_role("button", name="确认提交").click()
+    assert await page.evaluate("window.submitCount") == 0
+    await page.locator("#single-share").fill("https://www.douyin.com/video/123")
+    await page.get_by_role("button", name="确认提交").click()
+    assert await page.evaluate("window.submitCount") == 1

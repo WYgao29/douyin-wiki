@@ -4,8 +4,8 @@ import json
 import warnings
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from .config import load_config
 from .errors import DouyinWikiError
@@ -51,10 +51,10 @@ sync_creator 时执行，不得自动或定时访问博主主页。
 """
 
 
-class DouyinWikiMCP(FastMCP):
-    async def call_tool(self, name: str, arguments: dict[str, Any]):
+class DouyinWikiMCP(MCPServer):
+    async def call_tool(self, name: str, arguments: dict[str, Any], context=None):
         try:
-            return await super().call_tool(name, arguments)
+            return await super().call_tool(name, arguments, context=context)
         except ToolError as exc:
             cause: BaseException | None = exc
             while cause is not None and not isinstance(cause, DouyinWikiError):

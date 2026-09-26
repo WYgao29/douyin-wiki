@@ -299,6 +299,44 @@ async def test_end_to_end_capture_writes_vault_and_searches(service) -> None:
 
 
 @pytest.mark.asyncio
+async def test_video_without_audio_still_extracts_frames_without_transcribing(service) -> None:
+    class NoAudioProcessor(FakeMediaProcessor):
+        async def extract_audio(self, video_path: Path, audio_path: Path) -> Path:
+            raise ExternalToolError("视频没有音轨")
+
+    class UnexpectedTranscriber:
+        async def transcribe(self, audio_path: Path, output_dir: Path):
+            raise AssertionError("无音轨时不应调用转录")
+
+    service.media = NoAudioProcessor()
+    service.transcriber = UnexpectedTranscriber()
+    job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+
+    completed = await Worker(service).run_once()
+
+    assert completed.id == job.id
+    assert completed.artifacts["transcript_raw"] == []
+    assert completed.artifacts["transcript_skipped"] == "no_audio_available"
+    assert completed.artifacts["ocr"]
+
+
+@pytest.mark.asyncio
+async def test_video_audio_tool_failure_is_not_mistaken_for_missing_audio(service) -> None:
+    class BrokenAudioProcessor(FakeMediaProcessor):
+        async def extract_audio(self, video_path: Path, audio_path: Path) -> Path:
+            raise ExternalToolError("缺少外部工具：ffmpeg")
+
+    service.media = BrokenAudioProcessor()
+    job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+
+    failed = await Worker(service).run_once()
+
+    assert failed.id == job.id
+    assert failed.status == JobStatus.FAILED
+    assert failed.error_code == "external_tool_error"
+
+
+@pytest.mark.asyncio
 async def test_duplicate_video_appends_inspiration_without_redownload(service) -> None:
     downloader = service.downloader
     service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/", [InspirationInput(text="灵感一")])

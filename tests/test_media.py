@@ -170,10 +170,132 @@ async def test_video_auth_probe_never_returns_cookie_values(
             ["yt-dlp"], 0, stdout="7672717300746907078\n", stderr=""
         ),
     )
-    downloader = YtDlpDownloader(MediaSettings(browser="chrome", browser_profile=str(profile)))
+    downloader = YtDlpDownloader(
+        MediaSettings(browser="chrome", browser_profile=str(profile)), tmp_path / "browser"
+    )
+    async def no_cdn(_url: str):
+        return None
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", no_cdn)
     result = await downloader.check_auth(
         video_url="https://www.douyin.com/video/7672717300746907078"
     )
     payload = result.model_dump(mode="json")
     assert result.state == "ready" and result.server_verified is True
     assert "sessionid" not in str(payload).lower()
+
+
+@pytest.mark.asyncio
+async def test_video_auth_accepts_media_captured_by_browser(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return "https://cdn.douyinvod.com/media-video.mp4", None, "测试作品"
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+    result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
+    assert result.state == "ready"
+    assert result.server_verified is True
+    assert result.cookie_source == str(tmp_path / "browser")
+
+
+@pytest.mark.asyncio
+async def test_cdn_download_merges_audio_after_both_streams_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return (
+            "https://cdn.douyinvod.com/media-video.mp4",
+            "https://cdn.douyinvod.com/media-audio.mp4",
+            "测试作品",
+        )
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+    calls: list[str] = []
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffmpeg":
+            assert (tmp_path / "original.mp4").exists()
+            assert (tmp_path / "audio.mp4").exists()
+            Path(command[-1]).write_bytes(b"merged video and audio")
+            calls.append("merge")
+        elif "media-video.mp4" in command[-1]:
+            assert "--write-info-json" not in command
+            (tmp_path / "original.mp4").write_bytes(b"video")
+            calls.append("video")
+        elif "media-audio.mp4" in command[-1]:
+            (tmp_path / "audio.mp4").write_bytes(b"audio")
+            calls.append("audio")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    metadata = await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert calls == ["video", "audio", "merge"]
+    assert Path(metadata.media_path).read_bytes() == b"merged video and audio"
+    assert metadata.video_id == "123" and metadata.title == "测试作品"
+    assert not (tmp_path / "audio.mp4").exists()
+
+
+@pytest.mark.asyncio
+async def test_cdn_audio_failure_does_not_return_silent_video(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return (
+            "https://cdn.douyinvod.com/media-video.mp4",
+            "https://cdn.douyinvod.com/media-audio.mp4",
+            "测试作品",
+        )
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if "media-video.mp4" in command[-1]:
+            (tmp_path / "original.mp4").write_bytes(b"video")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 1, "", "audio download failed")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    with pytest.raises(ExternalToolError):
+        await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_fresh_cookies_error_with_local_login_is_not_reported_as_login_required(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = tmp_path / "Default"
+    database = profile / "Network" / "Cookies"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER)")
+        connection.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".douyin.com", "sessionid", 99_999_999_999_999_999),
+        )
+    downloader = YtDlpDownloader(
+        MediaSettings(browser="chrome", browser_profile=str(profile)), tmp_path / "browser"
+    )
+
+    async def no_cdn(_url: str):
+        return None
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", no_cdn)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.media._run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 1, "", "ERROR: Fresh cookies (not necessarily logged in) are needed"
+        ),
+    )
+
+    result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
+    assert result.state == "unverified" and result.ok is False
+    with pytest.raises(ExternalToolError, match="不能判定为需要重新登录") as exc_info:
+        await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert not isinstance(exc_info.value, CookieRequiredError)
