@@ -342,6 +342,63 @@ async def test_video_audio_tool_failure_is_not_mistaken_for_missing_audio(servic
 
 
 @pytest.mark.asyncio
+async def test_asr_prefers_retained_audio_over_video(service) -> None:
+    """CDN may keep audio.m4a / audio.mp4; ASR should prefer those over video."""
+    video_id = "7672717300746907078"
+    extracted: list[Path] = []
+
+    class RetainedAudioDownloader(FakeDownloader):
+        async def download(self, url: str, video_id: str, target_dir: Path):
+            metadata = await super().download(url, video_id, target_dir)
+            # Simulate CDN retaining audio.m4a (before rename) as ASR source.
+            (target_dir / "audio.m4a").write_bytes(b"retained-audio")
+            return metadata
+
+    class TrackingMedia(FakeMediaProcessor):
+        async def extract_audio(self, video_path: Path, audio_path: Path) -> Path:
+            extracted.append(video_path)
+            return await super().extract_audio(video_path, audio_path)
+
+    service.downloader = RetainedAudioDownloader()
+    service.media = TrackingMedia()
+    job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+
+    assert completed.id == job.id
+    assert completed.status == JobStatus.COMPLETED
+    assert extracted, "extract_audio should have been called"
+    assert extracted[0].name == "audio.m4a"
+    assert extracted[0].suffix.lower() == ".m4a"
+    # Video is only a fallback; must not be the first (or only) source used.
+    assert all(path.name != "original.mp4" for path in extracted) or extracted[0].name == "audio.m4a"
+
+
+@pytest.mark.asyncio
+async def test_asr_prefers_audio_mp4_over_other_audio_extensions(service) -> None:
+    extracted: list[Path] = []
+
+    class BothAudioDownloader(FakeDownloader):
+        async def download(self, url: str, video_id: str, target_dir: Path):
+            metadata = await super().download(url, video_id, target_dir)
+            (target_dir / "audio.m4a").write_bytes(b"m4a")
+            (target_dir / "audio.mp4").write_bytes(b"mp4")
+            return metadata
+
+    class TrackingMedia(FakeMediaProcessor):
+        async def extract_audio(self, video_path: Path, audio_path: Path) -> Path:
+            extracted.append(video_path)
+            return await super().extract_audio(video_path, audio_path)
+
+    service.downloader = BothAudioDownloader()
+    service.media = TrackingMedia()
+    service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    completed = await Worker(service).run_once()
+
+    assert completed.status == JobStatus.COMPLETED
+    assert extracted[0].name == "audio.mp4"
+
+
+@pytest.mark.asyncio
 async def test_duplicate_video_appends_inspiration_without_redownload(service) -> None:
     downloader = service.downloader
     service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/", [InspirationInput(text="灵感一")])
@@ -1243,6 +1300,14 @@ def test_analysis_response_schema_is_openai_strict_compatible() -> None:
         "minLength",
         "maxItems",
         "minItems",
+        "pattern",
+        "format",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "uniqueItems",
     }
     content_card = schema["properties"]["content_card"]
     assert "anyOf" in content_card
@@ -1331,5 +1396,53 @@ async def test_json_schema_400_falls_back_to_json_object(monkeypatch) -> None:
     assert len(requests) == 2
     assert requests[0]["response_format"]["type"] == "json_schema"
     assert requests[0]["response_format"]["json_schema"]["strict"] is True
+    assert requests[1]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_json_schema_400_falls_back_without_response_format_substring(
+    monkeypatch,
+) -> None:
+    """Backends may reject strict schema without mentioning response_format."""
+    requests: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                text='{"error":{"message":"strict mode does not support this keyword"}}',
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"segments":[],"review_issues":[]}'}}
+                ]
+            },
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "omlx-local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="Qwen3.6-35B-A3B-4bit",
+            response_format="json_schema",
+        )
+    )
+
+    result = await provider._json_call(
+        "analyze work", "input", response_schema=_analysis_response_schema()
+    )
+
+    assert result == {"segments": [], "review_issues": []}
+    assert len(requests) == 2
     assert requests[1]["response_format"] == {"type": "json_object"}
 

@@ -649,7 +649,9 @@ class YtDlpDownloader:
 
                         async def _store() -> None:
                             try:
-                                payloads.append(await response.json())
+                                payloads.append(
+                                    await asyncio.wait_for(response.json(), timeout=5.0)
+                                )
                             except Exception as exc:
                                 logger.debug(
                                     "忽略无法解析的作品接口响应：%s",
@@ -694,8 +696,26 @@ class YtDlpDownloader:
                                 )
                             await page.wait_for_timeout(250)
 
+                    # Short grace so late aweme JSON after CDN ready can still enqueue.
+                    if payload_tasks or video_url:
+                        try:
+                            await page.wait_for_timeout(400)
+                        except Exception:
+                            await asyncio.sleep(0.4)
+
                     if payload_tasks:
-                        await asyncio.gather(*payload_tasks, return_exceptions=True)
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*payload_tasks, return_exceptions=True),
+                                timeout=5.0,
+                            )
+                        except asyncio.TimeoutError:
+                            for task in payload_tasks:
+                                if not task.done():
+                                    task.cancel()
+                            logger.debug(
+                                "作品接口 JSON 解析超时，继续使用已捕获的元数据"
+                            )
 
                     page_title = (
                         (await page.title()).strip().removesuffix(" - 抖音").strip()

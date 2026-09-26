@@ -307,16 +307,20 @@ class OpenAICompatibleProvider(AnalysisProvider):
             try:
                 async with httpx.AsyncClient(timeout=self.settings.timeout_seconds) as client:
                     response = await client.post(url, headers=headers, json=body)
-                    if response.status_code == 400 and "response_format" in response.text:
+                    if response.status_code == 400:
                         current = body.get("response_format")
                         if (
                             isinstance(current, dict)
                             and current.get("type") == "json_schema"
                         ):
-                            # oMLX/OpenAI may reject an incompatible strict schema; relax.
+                            # Any 400 on strict json_schema: backends vary in wording
+                            # (schema / strict / unsupported). Degrade once to json_object.
                             body["response_format"] = {"type": "json_object"}
                             response = await client.post(url, headers=headers, json=body)
-                        elif self.settings.response_format == "json_object":
+                        elif (
+                            self.settings.response_format == "json_object"
+                            and "response_format" in response.text
+                        ):
                             body.pop("response_format", None)
                             response = await client.post(url, headers=headers, json=body)
                     response.raise_for_status()

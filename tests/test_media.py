@@ -557,3 +557,101 @@ async def test_capture_awaits_aweme_payload_tasks_before_merge(
     # json must complete before page title read (await gather precedes title()).
     assert order.index("json") < order.index("title")
 
+
+
+@pytest.mark.asyncio
+async def test_capture_does_not_stall_on_hung_aweme_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hung response.json() must not block CDN capture indefinitely."""
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+    work_id = "7672717300746907078"
+
+    class FakeResponse:
+        def __init__(self, url: str, payload: dict, *, content_type: str, status: int = 200):
+            self.url = url
+            self.status = status
+            self.headers = {"content-type": content_type}
+            self._payload = payload
+
+        async def json(self):
+            if "aweme" in self.url:
+                await asyncio.Event().wait()  # never completes
+            return self._payload
+
+    class FakePage:
+        def __init__(self):
+            self._handler = None
+
+        def on(self, event: str, handler):
+            self._handler = handler
+
+        async def goto(self, url: str, **kwargs):
+            assert self._handler is not None
+            self._handler(
+                FakeResponse(
+                    "https://v3.douyinvod.com/path/media-video/seg",
+                    {},
+                    content_type="video/mp4",
+                )
+            )
+            self._handler(
+                FakeResponse(
+                    "https://v3.douyinvod.com/path/media-audio/a",
+                    {},
+                    content_type="audio/mp4",
+                )
+            )
+            self._handler(
+                FakeResponse(
+                    f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={work_id}",
+                    {"aweme_detail": {"aweme_id": work_id, "desc": "迟到"}},
+                    content_type="application/json",
+                )
+            )
+
+        async def title(self):
+            return "页面标题 - 抖音"
+
+        async def evaluate(self, _script: str):
+            return {"description": "", "author": "", "authorHref": ""}
+
+        async def wait_for_event(self, _event: str, timeout: float = 0):
+            raise TimeoutError("timeout")
+
+        async def wait_for_timeout(self, _ms: int):
+            return None
+
+    class FakeContext:
+        pages: list = []
+
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **kwargs):
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(
+        "playwright.async_api.async_playwright", lambda: FakePlaywright()
+    )
+
+    captured = await asyncio.wait_for(
+        downloader._capture_cdn_url(f"https://www.douyin.com/video/{work_id}"),
+        timeout=8.0,
+    )
+    assert captured is not None
+    assert captured.video_url is not None
+    assert captured.audio_url is not None
