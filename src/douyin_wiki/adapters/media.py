@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
 import signal
 import sqlite3
 import subprocess
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,10 @@ from ..errors import (
     VideoUnavailableError,
 )
 from ..models import AuthCheckResult, OCRObservation, TranscriptSegment, VideoMetadata
+from .image_note import _acquire_file_lock, _release_file_lock
 from .share import extract_creator_sec_uid
+
+logger = logging.getLogger(__name__)
 
 DOUYIN_AUTH_COOKIE_NAMES = {"sessionid", "sessionid_ss", "sid_guard"}
 CHROMIUM_DATA_DIRS = {
@@ -62,6 +67,221 @@ AUTH_FAILURE_TERMS = (
     "sign in",
     "authentication required",
 )
+
+
+
+@dataclass
+class CapturedCdnMedia:
+    """CDN media URLs plus optional page metadata for VideoMetadata."""
+
+    video_url: str
+    audio_url: str | None = None
+    page_title: str | None = None
+    info: dict[str, Any] = field(default_factory=dict)
+
+
+def _cdn_url_identity(url: str) -> str:
+    parsed = urlsplit(url)
+    return f"{(parsed.hostname or '').lower()}{parsed.path}"
+
+
+def _dedupe_cdn_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in urls:
+        identity = _cdn_url_identity(url)
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        result.append(url)
+    return result
+
+
+def _unique_candidate_rows(
+    candidates: list[tuple[str, str, int]],
+) -> list[tuple[str, str, int]]:
+    """Dedupe CDN candidates by host+path, preferring higher status then richer MIME."""
+    best: dict[str, tuple[str, str, int]] = {}
+    for url, content_type, status in candidates:
+        identity = _cdn_url_identity(url)
+        if not identity:
+            continue
+        current = best.get(identity)
+        if current is None:
+            best[identity] = (url, content_type, status)
+            continue
+        _, cur_type, cur_status = current
+        prefer_complete = status == 200 and cur_status != 200
+        prefer_richer_type = status == cur_status and len(content_type) > len(cur_type)
+        if prefer_complete or prefer_richer_type:
+            best[identity] = (url, content_type, status)
+    return list(best.values())
+
+
+def _score_cdn_video_url(url: str, content_type: str = "", status: int = 200) -> tuple[int, int]:
+    lowered = url.lower()
+    mime = content_type.partition(";")[0].strip().lower()
+    score = 0
+    if mime.startswith("video/"):
+        score += 50
+    if "media-video" in lowered:
+        score += 40
+    elif "video" in lowered:
+        score += 10
+    if ".mp4" in lowered or "mime_type=video_mp4" in lowered:
+        score += 20
+    if "media-audio" in lowered or "audiomp4" in lowered:
+        score -= 100
+    if status == 200:
+        score += 5
+    elif status == 206:
+        score += 1
+    return score, len(url)
+
+
+def _score_cdn_audio_url(url: str, content_type: str = "", status: int = 200) -> tuple[int, int]:
+    lowered = url.lower()
+    mime = content_type.partition(";")[0].strip().lower()
+    score = 0
+    if mime.startswith("audio/"):
+        score += 50
+    if "media-audio" in lowered:
+        score += 40
+    elif "audiomp4" in lowered:
+        score += 30
+    elif "audio" in lowered:
+        score += 10
+    if ".mp4" in lowered or "mp4" in lowered:
+        score += 10
+    if "media-video" in lowered:
+        score -= 100
+    if status == 200:
+        score += 5
+    elif status == 206:
+        score += 1
+    return score, len(url)
+
+
+def _pick_best_cdn_url(
+    candidates: list[tuple[str, str, int]], *, audio: bool = False
+) -> str | None:
+    if not candidates:
+        return None
+    scorer = _score_cdn_audio_url if audio else _score_cdn_video_url
+    best = max(candidates, key=lambda item: scorer(item[0], item[1], item[2]))
+    if scorer(best[0], best[1], best[2])[0] < 0:
+        return None
+    return best[0]
+
+
+def _find_video_aweme_detail(
+    value: Any, *, expected_work_id: str | None = None
+) -> dict[str, Any] | None:
+    """Find a video aweme detail object in Douyin API envelopes."""
+
+    def matches(candidate: dict[str, Any]) -> bool:
+        candidate_id = str(candidate.get("aweme_id") or candidate.get("item_id") or "")
+        if not candidate_id:
+            return False
+        if expected_work_id is not None and candidate_id != expected_work_id:
+            return False
+        return bool(candidate.get("video") or candidate.get("author") or candidate.get("desc"))
+
+    if isinstance(value, dict):
+        for key in ("aweme_detail", "aweme", "item", "aweme_info"):
+            candidate = value.get(key)
+            if isinstance(candidate, dict) and matches(candidate):
+                return candidate
+        if matches(value):
+            return value
+        for child in value.values():
+            found = _find_video_aweme_detail(child, expected_work_id=expected_work_id)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_video_aweme_detail(child, expected_work_id=expected_work_id)
+            if found:
+                return found
+    return None
+
+
+def _cover_urls_from_aweme(detail: dict[str, Any]) -> list[str]:
+    video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
+    urls: list[str] = []
+    for key in ("origin_cover", "cover", "dynamic_cover"):
+        node = video.get(key) if video else None
+        if isinstance(node, dict):
+            for item in node.get("url_list") or []:
+                if isinstance(item, str) and item.startswith("http"):
+                    urls.append(item)
+    return _dedupe_cdn_urls(urls)
+
+
+def _info_from_aweme_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    author = detail.get("author") if isinstance(detail.get("author"), dict) else {}
+    video = detail.get("video") if isinstance(detail.get("video"), dict) else {}
+    sec_uid = str(author.get("sec_uid") or "") or None
+    description = str(detail.get("desc") or detail.get("description") or "").strip()
+    duration_ms = video.get("duration")
+    duration = None
+    if duration_ms is not None:
+        try:
+            raw = float(duration_ms)
+            duration = raw / 1000.0 if raw > 1000 else raw
+        except (TypeError, ValueError):
+            duration = None
+    cover_urls = _cover_urls_from_aweme(detail)
+    return {
+        "id": str(detail.get("aweme_id") or "") or None,
+        "title": (description.splitlines()[0][:120] if description else None),
+        "description": description or None,
+        "channel": author.get("nickname") or author.get("unique_id"),
+        "uploader": author.get("unique_id") or author.get("uid"),
+        "uploader_id": author.get("uid"),
+        "channel_url": f"https://www.douyin.com/user/{sec_uid}" if sec_uid else None,
+        "uploader_url": f"https://www.douyin.com/user/{sec_uid}" if sec_uid else None,
+        "timestamp": detail.get("create_time"),
+        "duration": duration,
+        "thumbnails": [{"id": "cover", "url": url} for url in cover_urls],
+        "creator_sec_uid": sec_uid,
+    }
+
+
+def _info_from_dom_meta(
+    *,
+    page_title: str | None,
+    description: str,
+    author: str | None,
+    author_href: str | None,
+) -> dict[str, Any]:
+    info: dict[str, Any] = {}
+    if page_title:
+        info["title"] = page_title
+    if description:
+        info["description"] = description
+        info.setdefault("title", description.splitlines()[0][:120])
+    if author:
+        info["channel"] = author
+    if author_href:
+        sec_uid = extract_creator_sec_uid(author_href)
+        if sec_uid:
+            info["channel_url"] = f"https://www.douyin.com/user/{sec_uid}"
+            info["uploader_url"] = info["channel_url"]
+            info["creator_sec_uid"] = sec_uid
+    return info
+
+
+def _merge_info(*parts: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for part in parts:
+        for key, value in part.items():
+            if value in (None, "", [], {}):
+                continue
+            if key == "thumbnails" and merged.get("thumbnails"):
+                continue
+            merged.setdefault(key, value)
+    return merged
 
 
 def _run(command: list[str], *, timeout: float = 3600) -> subprocess.CompletedProcess[str]:
@@ -220,6 +440,19 @@ class YtDlpDownloader:
     def __init__(self, settings: MediaSettings, profile_dir: Path) -> None:
         self.settings = settings
         self.profile_dir = profile_dir
+        # Chromium permits only one persistent context per profile directory.
+        self._profile_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _locked_profile(self):
+        """Serialize persistent Chromium access across threads and processes."""
+        async with self._profile_lock:
+            lock_path = self.profile_dir.parent / f"{self.profile_dir.name}.lock"
+            lock_file = await asyncio.to_thread(_acquire_file_lock, lock_path)
+            try:
+                yield
+            finally:
+                await asyncio.to_thread(_release_file_lock, lock_file)
 
     def _browser_spec(self) -> str:
         browser = self.settings.browser
@@ -349,61 +582,207 @@ class YtDlpDownloader:
             action="douyin-wiki auth status --video-url <抖音视频URL>",
         )
 
-    async def _capture_cdn_url(self, url: str) -> tuple[str, str | None, str | None] | None:
-        """Capture video and optional audio URLs while Playwright opens the work page."""
+    async def _capture_cdn_url(self, url: str) -> CapturedCdnMedia | None:
+        """Capture video/audio CDN URLs and page metadata from the work page."""
         try:
             from playwright.async_api import async_playwright
         except ImportError:
+            logger.warning("Playwright 未安装，跳过 CDN 拦截下载")
             return None
 
         profile_dir = self.profile_dir
         profile_dir.mkdir(parents=True, exist_ok=True)
+        expected_work_id = None
+        for part in urlsplit(url).path.strip("/").split("/"):
+            if part.isdigit() and len(part) >= 10:
+                expected_work_id = part
+                break
 
-        video_urls: list[str] = []
-        audio_urls: list[str] = []
+        video_candidates: list[tuple[str, str, int]] = []
+        audio_candidates: list[tuple[str, str, int]] = []
+        payloads: list[Any] = []
 
         try:
-            async with async_playwright() as p:
-                context = await p.chromium.launch_persistent_context(
+            async with self._locked_profile(), async_playwright() as playwright:
+                context = await playwright.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
                     headless=True,
                 )
                 try:
-                    page = context.pages[0] if context.pages else await context.new_page()
+                    page = (
+                        context.pages[0] if context.pages else await context.new_page()
+                    )
 
                     def on_response(response: Any) -> None:
                         resp_url = response.url
                         host = (urlsplit(resp_url).hostname or "").lower()
-                        if not (host == "douyinvod.com" or host.endswith(".douyinvod.com")):
+                        content_type = response.headers.get("content-type", "")
+                        status = int(response.status or 0)
+                        lowered_type = content_type.lower()
+                        if host == "douyinvod.com" or host.endswith(".douyinvod.com"):
+                            if status not in {200, 206}:
+                                return
+                            lowered = resp_url.lower()
+                            is_audio = lowered_type.startswith("audio/") or any(
+                                tag in lowered
+                                for tag in ("media-audio", "audiomp4", "/audio")
+                            )
+                            is_video = (
+                                lowered_type.startswith("video/")
+                                or "media-video" in lowered
+                                or ("video" in lowered and not is_audio)
+                            )
+                            if is_audio:
+                                audio_candidates.append((resp_url, content_type, status))
+                            elif is_video:
+                                video_candidates.append((resp_url, content_type, status))
                             return
-                        if response.status not in {200, 206}:
+                        if status != 200 or "json" not in lowered_type:
                             return
-                        # Audio segments contain "audio" or "audiomp4" or "media-audio" patterns.
-                        if any(tag in resp_url for tag in ("audio", "audiomp4", "media-audio")):
-                            audio_urls.append(resp_url)
-                        elif any(tag in resp_url for tag in ("media-video", "video")):
-                            video_urls.append(resp_url)
+                        if not any(
+                            token in resp_url.lower()
+                            for token in ("aweme", "detail", "video", "item")
+                        ):
+                            return
+
+                        async def _store() -> None:
+                            try:
+                                payloads.append(await response.json())
+                            except Exception as exc:
+                                logger.debug(
+                                    "忽略无法解析的作品接口响应：%s",
+                                    type(exc).__name__,
+                                )
+
+                        try:
+                            asyncio.get_running_loop().create_task(_store())
+                        except RuntimeError:
+                            return
 
                     page.on("response", on_response)
-                    await page.goto(url, wait_until="load", timeout=60_000)
-                    # Wait for video playback to start and both streams to be requested.
-                    await page.wait_for_timeout(10_000)
-                    page_title = (await page.title()).strip().removesuffix(" - 抖音").strip()
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-                    # Prefer highest-quality video URL (contains "media-video" and .mp4).
-                    for candidate in video_urls:
-                        if "media-video" in candidate and ".mp4" in candidate:
-                            return candidate, audio_urls[0] if audio_urls else None, page_title
-                    for candidate in video_urls:
-                        if "media-video" in candidate:
-                            return candidate, audio_urls[0] if audio_urls else None, page_title
-                    if video_urls:
-                        return video_urls[0], audio_urls[0] if audio_urls else None, page_title
-                    return None
+                    deadline = asyncio.get_running_loop().time() + 15.0
+                    video_url: str | None = None
+                    audio_url: str | None = None
+                    while asyncio.get_running_loop().time() < deadline:
+                        video_url = _pick_best_cdn_url(
+                            _unique_candidate_rows(video_candidates)
+                        )
+                        audio_url = _pick_best_cdn_url(
+                            _unique_candidate_rows(audio_candidates), audio=True
+                        )
+                        # Once video is present, wait a short extra window for audio.
+                        if video_url and (
+                            audio_url
+                            or asyncio.get_running_loop().time() + 3.0 >= deadline
+                        ):
+                            break
+                        try:
+                            await page.wait_for_event("response", timeout=500)
+                        except Exception as exc:
+                            # Timeouts are expected while waiting for CDN; other
+                            # wait errors should not abort capture.
+                            if type(exc).__name__ not in {"TimeoutError", "Error"}:
+                                logger.debug(
+                                    "等待 CDN 响应时出现异常：%s",
+                                    type(exc).__name__,
+                                )
+                            await page.wait_for_timeout(250)
+
+                    page_title = (
+                        (await page.title()).strip().removesuffix(" - 抖音").strip()
+                    )
+                    dom_meta = await page.evaluate(
+                        """
+                            () => {
+                              const description =
+                                document.querySelector('meta[name="description"]')
+                                  ?.content || '';
+                              const authorLink =
+                                document.querySelector('a[href*="/user/"]');
+                              return {
+                                description,
+                                author: authorLink?.innerText?.trim() || '',
+                                authorHref: authorLink?.href || ''
+                              };
+                            }
+                            """
+                    )
+
+                    info_parts: list[dict[str, Any]] = []
+                    for payload in payloads:
+                        detail = _find_video_aweme_detail(
+                            payload, expected_work_id=expected_work_id
+                        )
+                        if detail:
+                            info_parts.append(_info_from_aweme_detail(detail))
+                            break
+                    info_parts.append(
+                        _info_from_dom_meta(
+                            page_title=page_title or None,
+                            description=str((dom_meta or {}).get("description") or ""),
+                            author=str((dom_meta or {}).get("author") or "") or None,
+                            author_href=str((dom_meta or {}).get("authorHref") or "")
+                            or None,
+                        )
+                    )
+                    info = _merge_info(*info_parts)
+
+                    video_url = video_url or _pick_best_cdn_url(
+                        _unique_candidate_rows(video_candidates)
+                    )
+                    audio_url = audio_url or _pick_best_cdn_url(
+                        _unique_candidate_rows(audio_candidates), audio=True
+                    )
+                    if not video_url:
+                        return None
+                    return CapturedCdnMedia(
+                        video_url=video_url,
+                        audio_url=audio_url,
+                        page_title=page_title or info.get("title"),
+                        info=info,
+                    )
                 finally:
                     await context.close()
         except Exception:
+            logger.exception("Playwright CDN 拦截失败：%s", url)
             return None
+
+    async def _fetch_info_json(self, url: str, target_dir: Path) -> dict[str, Any]:
+        """Secondary metadata-only yt-dlp pass for CDN downloads that lack info.json."""
+        target_dir.mkdir(parents=True, exist_ok=True)
+        output_template = str(target_dir / "original.%(ext)s")
+        command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--skip-download",
+            "--write-info-json",
+            "--write-thumbnail",
+            "--convert-thumbnails",
+            "jpg",
+            "--cookies-from-browser",
+            self._browser_spec(),
+            "--no-warnings",
+            "--output",
+            output_template,
+            url,
+        ]
+        result = await asyncio.to_thread(_run, command, timeout=180)
+        if result.returncode != 0:
+            logger.warning(
+                "CDN 路径元数据补充失败：%s",
+                (result.stderr or result.stdout or "").strip()[:500],
+            )
+            return {}
+        info_files = list(target_dir.glob("original.info.json"))
+        if not info_files:
+            return {}
+        try:
+            return json.loads(info_files[0].read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("CDN 路径元数据 JSON 无法解析")
+            return {}
 
     async def download(self, url: str, video_id: str, target_dir: Path) -> VideoMetadata:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -414,11 +793,15 @@ class YtDlpDownloader:
         video_url: str
         audio_url: str | None
         page_title: str | None = None
+        page_info: dict[str, Any] = {}
         if cdn_result is None:
             video_url = url
             audio_url = None
         else:
-            video_url, audio_url, page_title = cdn_result
+            video_url = cdn_result.video_url
+            audio_url = cdn_result.audio_url
+            page_title = cdn_result.page_title
+            page_info = dict(cdn_result.info)
 
         # Download the video before merging a separately served audio stream.
         output_template = str(target_dir / "original.%(ext)s")
@@ -434,9 +817,14 @@ class YtDlpDownloader:
         else:
             # Fallback: use cookies from browser (may fail for some videos)
             command[2:2] = [
-                "--cookies-from-browser", self._browser_spec(),
-                "--write-info-json", "--write-thumbnail", "--convert-thumbnails", "jpg",
-                "--merge-output-format", "mp4",
+                "--cookies-from-browser",
+                self._browser_spec(),
+                "--write-info-json",
+                "--write-thumbnail",
+                "--convert-thumbnails",
+                "jpg",
+                "--merge-output-format",
+                "mp4",
             ]
             command.append(url)
         result = await asyncio.to_thread(_run, command, timeout=7200)
@@ -457,9 +845,11 @@ class YtDlpDownloader:
 
         def media_files(prefix: str) -> list[Path]:
             return [
-                path for path in target_dir.glob(f"{prefix}.*")
+                path
+                for path in target_dir.glob(f"{prefix}.*")
                 if path.is_file()
-                and path.suffix.lower() not in {".json", ".jpg", ".jpeg", ".png", ".webp", ".part"}
+                and path.suffix.lower()
+                not in {".json", ".jpg", ".jpeg", ".png", ".webp", ".part"}
             ]
 
         video_files = media_files("original")
@@ -467,8 +857,13 @@ class YtDlpDownloader:
             raise ExternalToolError("yt-dlp 未生成视频文件")
         if audio_url:
             audio_command = [
-                "yt-dlp", "--no-playlist", "--output", str(target_dir / "audio.%(ext)s"),
-                "--referer", "https://www.douyin.com/", audio_url,
+                "yt-dlp",
+                "--no-playlist",
+                "--output",
+                str(target_dir / "audio.%(ext)s"),
+                "--referer",
+                "https://www.douyin.com/",
+                audio_url,
             ]
             audio_result = await asyncio.to_thread(_run, audio_command, timeout=7200)
             _require_success(audio_result, "yt-dlp 音频下载")
@@ -479,8 +874,20 @@ class YtDlpDownloader:
             merge_result = await asyncio.to_thread(
                 _run,
                 [
-                    "ffmpeg", "-y", "-i", str(video_files[0]), "-i", str(audio_files[0]),
-                    "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", str(merged),
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(video_files[0]),
+                    "-i",
+                    str(audio_files[0]),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c",
+                    "copy",
+                    "-shortest",
+                    str(merged),
                 ],
                 timeout=600,
             )
@@ -491,13 +898,24 @@ class YtDlpDownloader:
             for path in video_files:
                 path.unlink()
             merged.replace(final_video)
-            for path in audio_files:
-                path.unlink()
+            # Keep independent audio.* for ASR; service prefers assets_dir/audio.mp4.
 
         info_files = list(target_dir.glob("original.info.json"))
         info: dict[str, Any] = {}
         if info_files:
             info = json.loads(info_files[0].read_text(encoding="utf-8"))
+        elif cdn_result is not None:
+            info = dict(page_info)
+            # Fill gaps so creator adoption and thumbnails still work.
+            has_creator = bool(
+                info.get("creator_sec_uid")
+                or extract_creator_sec_uid(
+                    str(info.get("channel_url") or info.get("uploader_url") or "")
+                )
+            )
+            if not has_creator or not info.get("thumbnails"):
+                secondary = await self._fetch_info_json(url, target_dir)
+                info = _merge_info(info, secondary)
         preferred_cover = download_preferred_cover(info, target_dir)
         candidates = media_files("original")
         if not candidates:
@@ -508,6 +926,12 @@ class YtDlpDownloader:
             for path in target_dir.glob("original.*")
             if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
         ]
+        # Also accept cover.* written by download_preferred_cover.
+        thumbnails.extend(
+            path
+            for path in target_dir.glob("cover.*")
+            if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        )
         fallback_thumbnail = max(thumbnails, key=lambda path: path.stat().st_size, default=None)
         thumbnail_path = preferred_cover or fallback_thumbnail
         timestamp = info.get("timestamp") or info.get("release_timestamp")
@@ -518,6 +942,8 @@ class YtDlpDownloader:
             thumbnail_kind = "douyin_cover"
         elif fallback_thumbnail:
             thumbnail_kind = "origin_cover"
+        channel_url = str(info.get("channel_url") or info.get("uploader_url") or "")
+        creator_sec_uid = info.get("creator_sec_uid") or extract_creator_sec_uid(channel_url)
         return VideoMetadata(
             video_id=video_id if cdn_result is not None else str(info.get("id") or video_id),
             original_url=url,
@@ -532,7 +958,7 @@ class YtDlpDownloader:
             media_path=str(media_path),
             thumbnail_path=str(thumbnail_path) if thumbnail_path else None,
             thumbnail_kind=thumbnail_kind,
-            creator_sec_uid=extract_creator_sec_uid(str(info.get("channel_url") or "")),
+            creator_sec_uid=str(creator_sec_uid) if creator_sec_uid else None,
             creator_uid=str(info.get("uploader_id") or "") or None,
             creator_unique_id=(
                 str(info.get("uploader") or "")
@@ -541,6 +967,7 @@ class YtDlpDownloader:
             ),
             creator_url=info.get("channel_url") or info.get("uploader_url"),
         )
+
 
 
 class FFmpegMediaProcessor:

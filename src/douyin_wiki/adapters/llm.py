@@ -102,7 +102,98 @@ def _analysis_response_schema() -> dict[str, Any]:
                 bound(value)
 
     bound(schema)
-    return schema
+    return _openai_strict_schema(schema)
+
+
+def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite a Pydantic JSON schema into an OpenAI ``strict``-compatible shape.
+
+    OpenAI/oMLX ``json_schema`` + ``strict: true`` rejects ``anyOf`` nullables,
+    missing ``required`` entries, free ``additionalProperties``, and remote
+    ``$ref`` nodes. Inline defs, require every property, and encode nullability
+    as ``type: [T, "null"]``.
+    """
+    import copy
+
+    root = copy.deepcopy(schema)
+    defs = root.pop("$defs", None) or root.pop("definitions", None) or {}
+
+    def resolve(ref: str) -> dict[str, Any]:
+        name = ref.rsplit("/", 1)[-1]
+        if name not in defs:
+            raise KeyError(f"unknown schema ref: {ref}")
+        return copy.deepcopy(defs[name])
+
+    def convert(node: Any) -> Any:
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            target = convert(resolve(node["$ref"]))
+            for key, value in node.items():
+                if key == "$ref":
+                    continue
+                target[key] = convert(value) if isinstance(value, dict) else value
+            return target
+
+        out: dict[str, Any] = {}
+        for key, value in node.items():
+            if key in {"anyOf", "oneOf"}:
+                variants = [convert(item) for item in value]
+                non_null = [
+                    item
+                    for item in variants
+                    if not (isinstance(item, dict) and item.get("type") == "null")
+                ]
+                has_null = len(non_null) != len(variants)
+                if key == "anyOf" and has_null and len(non_null) == 1:
+                    base = dict(non_null[0])
+                    type_value = base.get("type")
+                    if isinstance(type_value, str):
+                        base["type"] = [type_value, "null"]
+                    elif isinstance(type_value, list):
+                        if "null" not in type_value:
+                            base["type"] = [*type_value, "null"]
+                    elif "properties" in base:
+                        base["type"] = ["object", "null"]
+                    elif "items" in base:
+                        base["type"] = ["array", "null"]
+                    for extra_key, extra_value in node.items():
+                        if extra_key in {"anyOf", "oneOf"} or extra_key in base:
+                            continue
+                        base[extra_key] = extra_value
+                    out.update(base)
+                    continue
+                out["anyOf"] = variants
+                continue
+            if key == "properties" and isinstance(value, dict):
+                out["properties"] = {name: convert(child) for name, child in value.items()}
+                continue
+            if key == "items":
+                out["items"] = convert(value)
+                continue
+            if isinstance(value, dict):
+                out[key] = convert(value)
+            elif isinstance(value, list):
+                out[key] = [convert(item) if isinstance(item, dict) else item for item in value]
+            else:
+                out[key] = value
+
+        is_object = (
+            out.get("type") == "object"
+            or (isinstance(out.get("type"), list) and "object" in out["type"])
+            or "properties" in out
+        )
+        if is_object:
+            properties = out.setdefault("properties", {})
+            out["required"] = list(properties.keys())
+            out["additionalProperties"] = False
+            if "type" not in out:
+                out["type"] = "object"
+        return out
+
+    result = convert(root)
+    result.pop("title", None)
+    return result
 
 
 class AnalysisProvider(ABC):
@@ -184,13 +275,18 @@ class OpenAICompatibleProvider(AnalysisProvider):
             try:
                 async with httpx.AsyncClient(timeout=self.settings.timeout_seconds) as client:
                     response = await client.post(url, headers=headers, json=body)
-                    if (
-                        self.settings.response_format == "json_object"
-                        and response.status_code == 400
-                        and "response_format" in response.text
-                    ):
-                        body.pop("response_format", None)
-                        response = await client.post(url, headers=headers, json=body)
+                    if response.status_code == 400 and "response_format" in response.text:
+                        current = body.get("response_format")
+                        if (
+                            isinstance(current, dict)
+                            and current.get("type") == "json_schema"
+                        ):
+                            # oMLX/OpenAI may reject an incompatible strict schema; relax.
+                            body["response_format"] = {"type": "json_object"}
+                            response = await client.post(url, headers=headers, json=body)
+                        elif self.settings.response_format == "json_object":
+                            body.pop("response_format", None)
+                            response = await client.post(url, headers=headers, json=body)
                     response.raise_for_status()
                     payload = response.json()
                     usage = payload.get("usage") or {}

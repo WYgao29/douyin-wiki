@@ -8,12 +8,15 @@ import httpx
 import pytest
 
 from douyin_wiki.adapters.media import (
+    CapturedCdnMedia,
     VisionOCR,
     YtDlpDownloader,
     _chromium_cookie_databases,
     _inspect_chromium_auth_cookies,
+    _pick_best_cdn_url,
     _preferred_cover_urls,
     _require_success,
+    _unique_candidate_rows,
     download_preferred_cover,
 )
 from douyin_wiki.config import MediaSettings
@@ -192,7 +195,10 @@ async def test_video_auth_accepts_media_captured_by_browser(
     downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
 
     async def captured(_url: str):
-        return "https://cdn.douyinvod.com/media-video.mp4", None, "测试作品"
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            page_title="测试作品",
+        )
 
     monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
     result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
@@ -208,10 +214,18 @@ async def test_cdn_download_merges_audio_after_both_streams_exist(
     downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
 
     async def captured(_url: str):
-        return (
-            "https://cdn.douyinvod.com/media-video.mp4",
-            "https://cdn.douyinvod.com/media-audio.mp4",
-            "测试作品",
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            audio_url="https://cdn.douyinvod.com/media-audio.mp4",
+            page_title="测试作品",
+            info={
+                "channel": "测试作者",
+                "description": "作品简介",
+                "timestamp": 1_700_000_000,
+                "creator_sec_uid": "MS4wLjABAAAAtest",
+                "channel_url": "https://www.douyin.com/user/MS4wLjABAAAAtest",
+                "thumbnails": [{"id": "cover", "url": "https://example.invalid/cover.jpg"}],
+            },
         )
 
     monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
@@ -230,6 +244,8 @@ async def test_cdn_download_merges_audio_after_both_streams_exist(
         elif "media-audio.mp4" in command[-1]:
             (tmp_path / "audio.mp4").write_bytes(b"audio")
             calls.append("audio")
+        else:
+            raise AssertionError(f"unexpected command: {command}")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
@@ -237,7 +253,11 @@ async def test_cdn_download_merges_audio_after_both_streams_exist(
     assert calls == ["video", "audio", "merge"]
     assert Path(metadata.media_path).read_bytes() == b"merged video and audio"
     assert metadata.video_id == "123" and metadata.title == "测试作品"
-    assert not (tmp_path / "audio.mp4").exists()
+    assert metadata.author == "测试作者"
+    assert metadata.creator_sec_uid == "MS4wLjABAAAAtest"
+    assert metadata.description == "作品简介"
+    # Keep independent audio track for ASR after merge.
+    assert (tmp_path / "audio.mp4").exists()
 
 
 @pytest.mark.asyncio
@@ -247,10 +267,15 @@ async def test_cdn_audio_failure_does_not_return_silent_video(
     downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
 
     async def captured(_url: str):
-        return (
-            "https://cdn.douyinvod.com/media-video.mp4",
-            "https://cdn.douyinvod.com/media-audio.mp4",
-            "测试作品",
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            audio_url="https://cdn.douyinvod.com/media-audio.mp4",
+            page_title="测试作品",
+            info={
+                "creator_sec_uid": "MS4wLjABAAAAtest",
+                "channel_url": "https://www.douyin.com/user/MS4wLjABAAAAtest",
+                "thumbnails": [{"id": "cover", "url": "https://example.invalid/cover.jpg"}],
+            },
         )
 
     monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
@@ -299,3 +324,18 @@ async def test_fresh_cookies_error_with_local_login_is_not_reported_as_login_req
     with pytest.raises(ExternalToolError, match="不能判定为需要重新登录") as exc_info:
         await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
     assert not isinstance(exc_info.value, CookieRequiredError)
+
+
+def test_cdn_url_selection_prefers_full_media_mime() -> None:
+    rows = _unique_candidate_rows(
+        [
+            ("https://v3.douyinvod.com/path/media-video/seg", "", 206),
+            ("https://v3.douyinvod.com/path/media-video/seg", "video/mp4", 200),
+            ("https://v3.douyinvod.com/path/media-audio/a", "audio/mp4", 200),
+            ("https://v3.douyinvod.com/path/media-video/seg?x=1", "video/mp4", 206),
+        ]
+    )
+    video = _pick_best_cdn_url(rows)
+    audio = _pick_best_cdn_url(rows, audio=True)
+    assert video is not None and "media-video" in video and "audio" not in video
+    assert audio is not None and "media-audio" in audio

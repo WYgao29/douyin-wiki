@@ -46,6 +46,10 @@ class LLMSettings(BaseModel):
     api_key_env: str = "DOUYIN_WIKI_LLM_API_KEY"
     timeout_seconds: float = 120
     max_retries: int = 2
+    # Preserve whatever the user configured when rendering/saving config.toml.
+    # oMLX local servers typically want response_format="json_schema" plus the
+    # optional thinking controls below; cloud OpenAI-compatible endpoints can
+    # keep the default json_object.
     response_format: Literal["json_object", "json_schema"] = "json_object"
     enable_thinking: bool | None = None
     thinking_budget: int | None = Field(default=None, ge=0)

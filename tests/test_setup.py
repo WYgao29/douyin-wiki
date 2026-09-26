@@ -459,3 +459,14 @@ def test_doctor_reports_unregistered_obsidian_vault(
     checks = doctor(AppConfig(vault_path=vault))
     assert checks["obsidian_vault"]["ok"] is False
     assert str(vault) in checks["obsidian_vault"]["action"]
+
+def test_render_default_config_preserves_llm_response_format(tmp_path: Path) -> None:
+    rendered = render_default_config(
+        AppConfig(llm=LLMSettings(response_format="json_schema", model="local-model"))
+    )
+    assert 'response_format = "json_schema"' in rendered
+    path = tmp_path / "config.toml"
+    path.write_text(rendered, encoding="utf-8")
+    loaded = load_config(path)
+    assert loaded.llm.response_format == "json_schema"
+

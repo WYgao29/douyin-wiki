@@ -12,7 +12,11 @@ import httpx
 import pytest
 
 from douyin_wiki.adapters.embeddings import EmbeddingService
-from douyin_wiki.adapters.llm import OpenAICompatibleProvider, _parse_json_content
+from douyin_wiki.adapters.llm import (
+    OpenAICompatibleProvider,
+    _analysis_response_schema,
+    _parse_json_content,
+)
 from douyin_wiki.config import EmbeddingSettings, LLMSettings
 from douyin_wiki.errors import CookieRequiredError, ExternalToolError, JobStateError
 from douyin_wiki.models import (
@@ -1198,15 +1202,17 @@ async def test_provider_can_request_strict_json_schema_for_omlx(monkeypatch) -> 
         )
     )
 
+    schema = _analysis_response_schema()
     result = await provider._json_call(
-        "correct transcript", "input", response_schema={"type": "object"}
+        "analyze work", "input", response_schema=schema
     )
 
     assert result == {"segments": [], "review_issues": []}
     assert requests[0].headers["authorization"] == "Bearer omlx-local-key"
     body = json.loads(requests[0].content)
     assert body["response_format"]["type"] == "json_schema"
-    assert body["response_format"]["json_schema"]["schema"] == {"type": "object"}
+    assert body["response_format"]["json_schema"]["strict"] is True
+    assert body["response_format"]["json_schema"]["schema"] == schema
     assert body["enable_thinking"] is False
     assert body["thinking_budget"] == 0
     assert body["max_tokens"] == 4096
@@ -1215,3 +1221,37 @@ async def test_provider_can_request_strict_json_schema_for_omlx(monkeypatch) -> 
 def test_provider_rejects_json_array_when_object_is_required() -> None:
     with pytest.raises(ValueError, match="JSON 对象"):
         _parse_json_content("[]")
+
+def test_analysis_response_schema_is_openai_strict_compatible() -> None:
+    schema = _analysis_response_schema()
+    assert schema.get("type") == "object"
+    assert schema.get("additionalProperties") is False
+    assert set(schema.get("required") or []) == set(schema.get("properties") or {})
+    assert "content_card" in schema["properties"]
+    assert "takeaways" in schema["properties"]
+    assert "$defs" not in schema
+    assert "$ref" not in json.dumps(schema)
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            assert "$ref" not in node
+            if "properties" in node:
+                assert set(node.get("required") or []) == set(node["properties"])
+                assert node.get("additionalProperties") is False
+            if "anyOf" in node:
+                variants = node["anyOf"]
+                assert not (
+                    len(variants) == 2
+                    and any(
+                        isinstance(value, dict) and value.get("type") == "null"
+                        for value in variants
+                    )
+                )
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(schema)
+

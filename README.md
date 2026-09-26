@@ -122,6 +122,12 @@ enabled = true
 base_url = "https://api.openai.com/v1"
 model = "YOUR_MODEL"
 api_key_env = "DOUYIN_WIKI_LLM_API_KEY"
+# 可选：本地 oMLX 等支持 structured outputs 的接口可改为 json_schema；
+# 保存配置时会保留你设置的 response_format，不会强制写回 json_object。
+# response_format = "json_schema"
+# enable_thinking = false
+# thinking_budget = 0
+# max_output_tokens = 4096
 ```
 
 环境变量会优先于 Keychain，适合 CI 或临时会话：
