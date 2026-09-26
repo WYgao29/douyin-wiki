@@ -22,6 +22,8 @@
 
 ### 修复
 
+- Playwright CDN 候选与目标作品绑定：优先匹配 aweme `play_addr` / URI / 作品 ID 特征；在已知目标地址时拒绝无关广告/推荐 CDN，避免 video_id 正确但内容错位。
+
 - Web 写请求在带 Origin/Referer 时校验为本机 Host；二者皆无时仍允许本地 API 客户端。Vault 写入/扫描与删除一致拒绝内部符号链接。yt-dlp Cookie 仅在 Playwright Profile 有可用抖音会话时优先，否则回退系统浏览器；creator 与 media 共用同一选择逻辑。json_schema 400 回退不再把空响应体或过宽关键词当作 schema 拒绝。
 
 - 视频侧路径（auth 探测、`_fetch_info_json`、yt-dlp CDN 回退）优先使用专用 Playwright Profile Cookie，系统 Chrome 仅作最后手段；`check_auth` 文案标明双来源，README 改为 CDN 优先。

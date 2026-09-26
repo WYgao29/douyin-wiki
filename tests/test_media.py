@@ -13,6 +13,7 @@ from douyin_wiki.adapters.media import (
     VisionOCR,
     YtDlpDownloader,
     _chromium_cookie_databases,
+    _collect_aweme_media_anchors,
     _info_from_aweme_detail,
     _inspect_chromium_auth_cookies,
     _pick_best_cdn_url,
@@ -357,6 +358,211 @@ def test_cdn_url_selection_prefers_full_media_mime() -> None:
     audio = _pick_best_cdn_url(rows, audio=True)
     assert video is not None and "media-video" in video and "audio" not in video
     assert audio is not None and "media-audio" in audio
+
+
+def test_cdn_url_selection_prefers_work_bound_over_higher_mime_score() -> None:
+    """Ad/recommend CDN with richer MIME cues must lose to play_addr-bound URL."""
+    work_id = "7672717300746907078"
+    target = "https://v3.douyinvod.com/target/media-video/seg"
+    unrelated = "https://v9.douyinvod.com/ad/media-video/full.mp4"
+    rows = _unique_candidate_rows(
+        [
+            (target, "video/mp4", 200),
+            (unrelated, "video/mp4", 200),
+        ]
+    )
+    # Without binding, the ad URL wins on .mp4 path bonus.
+    assert _pick_best_cdn_url(rows) == unrelated
+
+    play_addr = f"{target}?video_id=v0200targeturi0001"
+    bound = _pick_best_cdn_url(
+        rows,
+        expected_work_id=work_id,
+        anchor_urls=[play_addr],
+        uri_markers={"v0200targeturi0001"},
+    )
+    assert bound == target
+
+
+def test_cdn_url_selection_rejects_unrelated_when_play_addr_known() -> None:
+    work_id = "7672717300746907078"
+    unrelated = "https://v9.douyinvod.com/ad/media-video/full.mp4"
+    rows = _unique_candidate_rows([(unrelated, "video/mp4", 200)])
+    assert (
+        _pick_best_cdn_url(
+            rows,
+            expected_work_id=work_id,
+            anchor_urls=[
+                "https://v3.douyinvod.com/target/media-video/seg?video_id=v0200targeturi0001"
+            ],
+            uri_markers={"v0200targeturi0001"},
+        )
+        is None
+    )
+
+
+def test_cdn_url_selection_boosts_work_id_marker_in_url() -> None:
+    work_id = "7672717300746907078"
+    bound = f"https://v3.douyinvod.com/path/{work_id}/media-video/seg"
+    unrelated = "https://v9.douyinvod.com/ad/media-video/full.mp4"
+    rows = _unique_candidate_rows(
+        [
+            (bound, "video/mp4", 200),
+            (unrelated, "video/mp4", 200),
+        ]
+    )
+    assert _pick_best_cdn_url(rows) == unrelated
+    assert _pick_best_cdn_url(rows, expected_work_id=work_id) == bound
+
+
+def test_collect_aweme_media_anchors_reads_play_addr_and_uri() -> None:
+    detail = {
+        "aweme_id": "7672717300746907078",
+        "video": {
+            "play_addr": {
+                "uri": "v0200targeturi0001",
+                "url_list": [
+                    "https://v3.douyinvod.com/target/media-video/seg?video_id=v0200targeturi0001",
+                ],
+            },
+            "bit_rate": [
+                {
+                    "play_addr": {
+                        "uri": "v0200targeturi0001",
+                        "url_list": [
+                            "https://v5.douyinvod.com/target/media-video/hi.mp4",
+                        ],
+                    }
+                }
+            ],
+        },
+        "music": {
+            "play_url": {
+                "uri": "audio-uri-1",
+                "url_list": ["https://v3.douyinvod.com/target/media-audio/a"],
+            }
+        },
+    }
+    video_urls, video_markers = _collect_aweme_media_anchors(detail, audio=False)
+    audio_urls, audio_markers = _collect_aweme_media_anchors(detail, audio=True)
+    assert any("target/media-video/seg" in url for url in video_urls)
+    assert "v0200targeturi0001" in video_markers
+    assert audio_urls and "media-audio" in audio_urls[0]
+    assert "audio-uri-1" in audio_markers
+
+
+@pytest.mark.asyncio
+async def test_capture_rebinds_cdn_to_aweme_play_addr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Higher-scoring ad CDN must lose once aweme play_addr anchors are known."""
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+    work_id = "7672717300746907078"
+    target = "https://v3.douyinvod.com/target/media-video/seg"
+    ad = "https://v9.douyinvod.com/ad/media-video/full.mp4"
+
+    class FakeResponse:
+        def __init__(self, url: str, payload: dict, *, content_type: str, status: int = 200):
+            self.url = url
+            self.status = status
+            self.headers = {"content-type": content_type}
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+    class FakePage:
+        def __init__(self):
+            self._handler = None
+
+        def on(self, event: str, handler):
+            assert event == "response"
+            self._handler = handler
+
+        async def goto(self, url: str, **kwargs):
+            assert self._handler is not None
+            # Target first (weaker MIME cues), then a richer ad CDN.
+            self._handler(FakeResponse(target, {}, content_type="video/mp4"))
+            self._handler(
+                FakeResponse(
+                    "https://v3.douyinvod.com/target/media-audio/a",
+                    {},
+                    content_type="audio/mp4",
+                )
+            )
+            self._handler(FakeResponse(ad, {}, content_type="video/mp4"))
+            self._handler(
+                FakeResponse(
+                    f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={work_id}",
+                    {
+                        "aweme_detail": {
+                            "aweme_id": work_id,
+                            "desc": "目标作品",
+                            "author": {
+                                "nickname": "作者",
+                                "sec_uid": "MS4wLjABAAAAbound",
+                                "uid": "1",
+                            },
+                            "video": {
+                                "duration": 5000,
+                                "play_addr": {
+                                    "uri": "v0200targeturi0001",
+                                    "url_list": [
+                                        f"{target}?video_id=v0200targeturi0001",
+                                    ],
+                                },
+                                "cover": {"url_list": ["https://example.invalid/c.jpg"]},
+                            },
+                        }
+                    },
+                    content_type="application/json",
+                )
+            )
+
+        async def title(self):
+            return "目标作品 - 抖音"
+
+        async def evaluate(self, _script: str):
+            return {"description": "", "author": "", "authorHref": ""}
+
+        async def wait_for_event(self, _event: str, timeout: float = 0):
+            raise TimeoutError("timeout")
+
+        async def wait_for_timeout(self, _ms: int):
+            return None
+
+    class FakeContext:
+        pages: list = []
+
+        async def new_page(self):
+            return FakePage()
+
+        async def close(self):
+            return None
+
+    class FakeChromium:
+        async def launch_persistent_context(self, **kwargs):
+            return FakeContext()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(
+        "playwright.async_api.async_playwright", lambda: FakePlaywright()
+    )
+    captured = await downloader._capture_cdn_url(
+        f"https://www.douyin.com/video/{work_id}"
+    )
+    assert captured is not None
+    assert captured.video_url == target
+    assert captured.info.get("id") == work_id
+
 
 @pytest.mark.asyncio
 async def test_cdn_download_renames_retained_audio_to_mp4(

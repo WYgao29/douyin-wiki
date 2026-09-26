@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
@@ -163,14 +163,152 @@ def _score_cdn_audio_url(url: str, content_type: str = "", status: int = 200) ->
     return score, len(url)
 
 
+def _significant_cdn_markers(url: str) -> set[str]:
+    """Extract stable path/query markers that can bind a CDN URL to an aweme."""
+    markers: set[str] = set()
+    identity = _cdn_url_identity(url)
+    if identity:
+        markers.add(identity)
+    parsed = urlsplit(url)
+    for segment in parsed.path.split("/"):
+        if len(segment) < 12:
+            continue
+        # Prefer opaque asset tokens (mixed alnum / tos paths), skip pure words.
+        if any(ch.isdigit() for ch in segment) and any(ch.isalpha() for ch in segment):
+            markers.add(segment)
+    query = parse_qs(parsed.query)
+    for key in ("video_id", "vid", "media_id", "item_id", "aweme_id"):
+        for value in query.get(key) or []:
+            value = str(value).strip()
+            if value:
+                markers.add(value)
+    return markers
+
+
+def _iter_media_addr_nodes(container: dict[str, Any]) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    for key, value in container.items():
+        lowered = str(key).lower()
+        if isinstance(value, dict) and (
+            "play_addr" in lowered
+            or lowered in {"download_addr", "play_url", "play_addr"}
+        ):
+            nodes.append(value)
+        if lowered == "bit_rate" and isinstance(value, list):
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                addr = item.get("play_addr")
+                if isinstance(addr, dict):
+                    nodes.append(addr)
+    return nodes
+
+
+def _collect_aweme_media_anchors(
+    detail: dict[str, Any], *, audio: bool = False
+) -> tuple[list[str], set[str]]:
+    """Collect play_addr CDN URLs and URI markers for the target aweme."""
+    container_key = "music" if audio else "video"
+    container = detail.get(container_key)
+    if not isinstance(container, dict):
+        container = {}
+    urls: list[str] = []
+    markers: set[str] = set()
+    for node in _iter_media_addr_nodes(container):
+        uri = str(node.get("uri") or "").strip()
+        if uri:
+            markers.add(uri)
+        for item in node.get("url_list") or []:
+            if isinstance(item, str) and item.startswith("http"):
+                urls.append(item)
+                markers.update(_significant_cdn_markers(item))
+    # Top-level download_addr occasionally appears beside video/music.
+    if not audio:
+        nested = detail.get("download_addr")
+        if isinstance(nested, dict):
+            for node in _iter_media_addr_nodes({"download_addr": nested}):
+                uri = str(node.get("uri") or "").strip()
+                if uri:
+                    markers.add(uri)
+                for item in node.get("url_list") or []:
+                    if isinstance(item, str) and item.startswith("http"):
+                        urls.append(item)
+                        markers.update(_significant_cdn_markers(item))
+    return _dedupe_cdn_urls(urls), markers
+
+
+def _cdn_binding_bonus(
+    url: str,
+    *,
+    expected_work_id: str | None = None,
+    markers: set[str] | None = None,
+    require_match: bool = False,
+) -> tuple[int, bool]:
+    """Return (score_delta, matched) for work-bound CDN selection."""
+    markers = markers or set()
+    lowered = url.lower()
+    identity = _cdn_url_identity(url).lower()
+    bonus = 0
+    matched = False
+    for marker in markers:
+        token = marker.strip()
+        if not token:
+            continue
+        token_l = token.lower()
+        if identity and identity == token_l:
+            bonus += 1000
+            matched = True
+            continue
+        if token_l in lowered or (identity and token_l in identity):
+            bonus += 200
+            matched = True
+    if expected_work_id and expected_work_id in lowered:
+        bonus += 100
+        matched = True
+    if require_match and markers and not matched:
+        bonus -= 1000
+    return bonus, matched
+
+
 def _pick_best_cdn_url(
-    candidates: list[tuple[str, str, int]], *, audio: bool = False
+    candidates: list[tuple[str, str, int]],
+    *,
+    audio: bool = False,
+    expected_work_id: str | None = None,
+    anchor_urls: list[str] | None = None,
+    uri_markers: set[str] | None = None,
 ) -> str | None:
     if not candidates:
         return None
+    markers: set[str] = set(uri_markers or set())
+    for url in anchor_urls or []:
+        markers.update(_significant_cdn_markers(url))
+    # Binding is required only when aweme play_addr (or equivalent) markers exist.
+    require_match = bool(markers)
     scorer = _score_cdn_audio_url if audio else _score_cdn_video_url
-    best = max(candidates, key=lambda item: scorer(item[0], item[1], item[2]))
-    if scorer(best[0], best[1], best[2])[0] < 0:
+
+    def key(item: tuple[str, str, int]) -> tuple[int, int]:
+        base, length = scorer(item[0], item[1], item[2])
+        bonus, _ = _cdn_binding_bonus(
+            item[0],
+            expected_work_id=expected_work_id,
+            markers=markers,
+            require_match=require_match,
+        )
+        return base + bonus, length
+
+    best = max(candidates, key=key)
+    base_score = scorer(best[0], best[1], best[2])[0]
+    bonus, matched = _cdn_binding_bonus(
+        best[0],
+        expected_work_id=expected_work_id,
+        markers=markers,
+        require_match=require_match,
+    )
+    if base_score + bonus < 0:
+        return None
+    # When the target work's play_addr is known, refuse an unbound CDN winner.
+    if require_match and not matched:
         return None
     return best[0]
 
@@ -847,11 +985,13 @@ class YtDlpDownloader:
                     )
 
                     info_parts: list[dict[str, Any]] = []
+                    aweme_detail: dict[str, Any] | None = None
                     for payload in payloads:
                         detail = _find_video_aweme_detail(
                             payload, expected_work_id=expected_work_id
                         )
                         if detail:
+                            aweme_detail = detail
                             info_parts.append(_info_from_aweme_detail(detail))
                             break
                     info_parts.append(
@@ -865,11 +1005,32 @@ class YtDlpDownloader:
                     )
                     info = _merge_info(*info_parts)
 
-                    video_url = video_url or _pick_best_cdn_url(
-                        _unique_candidate_rows(video_candidates)
+                    video_anchors: list[str] = []
+                    video_markers: set[str] = set()
+                    audio_anchors: list[str] = []
+                    audio_markers: set[str] = set()
+                    if aweme_detail is not None:
+                        video_anchors, video_markers = _collect_aweme_media_anchors(
+                            aweme_detail, audio=False
+                        )
+                        audio_anchors, audio_markers = _collect_aweme_media_anchors(
+                            aweme_detail, audio=True
+                        )
+
+                    # Always re-select after aweme binding is known so an early
+                    # MIME-only winner (ad/recommend CDN) cannot stick.
+                    video_url = _pick_best_cdn_url(
+                        _unique_candidate_rows(video_candidates),
+                        expected_work_id=expected_work_id,
+                        anchor_urls=video_anchors,
+                        uri_markers=video_markers,
                     )
-                    audio_url = audio_url or _pick_best_cdn_url(
-                        _unique_candidate_rows(audio_candidates), audio=True
+                    audio_url = _pick_best_cdn_url(
+                        _unique_candidate_rows(audio_candidates),
+                        audio=True,
+                        expected_work_id=expected_work_id,
+                        anchor_urls=audio_anchors,
+                        uri_markers=audio_markers,
                     )
                     if not video_url:
                         return None
