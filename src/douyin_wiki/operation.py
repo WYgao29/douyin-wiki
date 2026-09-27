@@ -309,6 +309,8 @@ def present_job(
         "error_code": job.error_code,
         "error_message": job.error_message,
         "result": job.result,
+        "analysis_progress": job.artifacts.get("analysis_progress"),
+        "llm_stats": job.artifacts.get("llm_stats"),
         "parent_job_id": parent_job_id(job),
         "child_job_ids": child_job_ids(job),
         "entry_id": _entry_id(job),

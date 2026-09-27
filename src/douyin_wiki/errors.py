@@ -43,6 +43,18 @@ class ExternalToolError(DouyinWikiError):
     code = "external_tool_error"
 
 
+class ModelServiceError(ExternalToolError):
+    code = "model_unavailable"
+
+
+class ModelConnectionError(ModelServiceError):
+    code = "model_connection_error"
+
+
+class ModelTimeoutError(ModelServiceError):
+    code = "model_timeout"
+
+
 class ModelConfigurationError(DouyinWikiError):
     code = "model_not_configured"
 

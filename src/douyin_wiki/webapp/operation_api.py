@@ -208,9 +208,7 @@ def register_operation_routes(
     @app.post("/api/auth/sessions", status_code=202)
     async def start_auth(body: AuthStartRequest):
         try:
-            session = await operations.auth.start(
-                body.channel, trigger_job_id=body.trigger_job_id
-            )
+            session = await operations.auth.start(body.channel, trigger_job_id=body.trigger_job_id)
         except (JobStateError, ValueError) as exc:
             raise _http_error(exc) from exc
         await notifier.publish("auth")
@@ -265,6 +263,10 @@ def register_operation_routes(
     @app.get("/api/system/analysis")
     async def analysis_status():
         return analysis_presentation(operations.analysis_mode)
+
+    @app.get("/api/system/model-health")
+    async def model_health():
+        return await operations.model_health()
 
     @app.post("/api/creators/inventory", status_code=202)
     async def creator_inventory(body: CreatorInventoryBody):

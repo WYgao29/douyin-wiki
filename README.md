@@ -128,7 +128,11 @@ api_key_env = "DOUYIN_WIKI_LLM_API_KEY"
 # enable_thinking = false
 # thinking_budget = 0
 # max_output_tokens = 4096
+# context_window_tokens = 65536  # 与模型服务实际配置的上下文窗口一致
 ```
+
+长视频的字幕和邻近 OCR 会按输入 token 预算分批；模型输出达到上限时会缩小批次，
+已完成批次在任务中断后可从检查点恢复。任务详情会显示分批进度和最近一次模型响应。
 
 环境变量会优先于 Keychain，适合 CI 或临时会话：
 

@@ -1,25 +1,81 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from ..config import LLMSettings, llm_is_configured
-from ..errors import ExternalToolError, ModelConfigurationError
+from ..errors import (
+    ExternalToolError,
+    ModelConfigurationError,
+    ModelConnectionError,
+    ModelServiceError,
+    ModelTimeoutError,
+)
 from ..models import (
     AnalysisResult,
     InspirationInput,
     OCRObservation,
     ReviewIssue,
+    TimelineChapter,
     TranscriptSegment,
 )
 from ..secrets import get_secret
 
 PROMPT_VERSION = "v2.2-timeline-chapters"
+
+
+class ModelLimitError(ExternalToolError):
+    """A request must be made smaller before it can be retried."""
+
+    code = "model_limit"
+
+
+class ModelContextError(ModelLimitError):
+    code = "model_context_limit"
+
+
+class ModelOutputError(ModelLimitError):
+    code = "model_output_limit"
+
+
+def _is_context_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        word in lowered
+        for word in (
+            "context length",
+            "context window",
+            "prompt too long",
+            "too many tokens",
+            "maximum context",
+            "上下文",
+            "输入过长",
+        )
+    )
+
+
+def _is_output_truncation_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "failed to extract valid json from output",
+            "json validation failed",
+            "output token limit",
+            "finish_reason=length",
+        )
+    )
+
+
 TRANSCRIPT_CORRECTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -73,6 +129,11 @@ def _looks_like_json_schema_rejection(body_text: str) -> bool:
     return "strict" in lowered and ("keyword" in lowered or "schema" in lowered)
 
 
+def _looks_like_json_object_rejection(body_text: str) -> bool:
+    lowered = (body_text or "").lower()
+    return "response_format" in lowered or "json_object" in lowered
+
+
 def _analysis_response_schema() -> dict[str, Any]:
     schema = AnalysisResult.model_json_schema()
     # Legacy fields remain readable in stored entries but need not be generated.
@@ -106,6 +167,7 @@ def _analysis_response_schema() -> dict[str, Any]:
         "entities",
         "contradictions",
     ]
+
     # Do not write minItems/maxItems/maxLength here: OpenAI-strict stripping
     # removes them, so pre-strict bounds would be dead writes. Keep only
     # additionalProperties=False which survives (and is required by strict).
@@ -279,6 +341,147 @@ class OpenAICompatibleProvider(AnalysisProvider):
         self.api_key = stored_key
         self.configured = llm_is_configured(settings, self.api_key)
         self.last_usage: dict[str, int] = {}
+        self._tokenizer: Any = None
+        for path in (Path.home() / ".omlx/models").glob(
+            f"*/{Path(self.model).name}/tokenizer.json"
+        ):
+            try:
+                from tokenizers import Tokenizer
+
+                self._tokenizer = Tokenizer.from_file(str(path))
+                break
+            except (ImportError, OSError, ValueError):
+                continue
+
+    def _token_count(self, value: str) -> int:
+        if self._tokenizer is not None:
+            return len(self._tokenizer.encode(value).ids)
+        # UTF-8 byte length is conservative for Chinese and mixed OCR text.
+        return len(value.encode("utf-8"))
+
+    def _fits(self, system: str, payload: dict[str, Any], schema: dict[str, Any]) -> bool:
+        request = json.dumps(payload, ensure_ascii=False)
+        schema_text = json.dumps(schema, ensure_ascii=False)
+        output = self.settings.max_output_tokens or 8192
+        context = self.settings.context_window_tokens
+        reserve = min(output, context // 2) + max(128, context // 50)
+        return self._token_count(system + request + schema_text) + reserve <= context
+
+    async def _checkpointed_call(
+        self,
+        system: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        *,
+        validator: Callable[[dict[str, Any]], Any] | None = None,
+        checkpoints: dict[str, Any] | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        user = json.dumps(payload, ensure_ascii=False)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                [PROMPT_VERSION, self.model, system, user, schema],
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        if checkpoints is not None and fingerprint in checkpoints:
+            result = checkpoints[fingerprint]
+            if validator is not None:
+                try:
+                    validator(result)
+                except ValueError:
+                    del checkpoints[fingerprint]
+                else:
+                    return result
+            else:
+                return result
+        result = await self._json_call(
+            system,
+            user,
+            response_schema=schema,
+            **({"response_validator": validator} if validator else {}),
+        )
+        if validator is not None:
+            validator(result)
+        if checkpoints is not None:
+            checkpoints[fingerprint] = result
+        if on_checkpoint is not None:
+            on_checkpoint(fingerprint, result)
+        return result
+
+    def _budgeted_chunks(
+        self,
+        segments: list[TranscriptSegment],
+        ocr: list[OCRObservation],
+        system: str,
+        schema: dict[str, Any],
+        payload_for: Callable[[list[TranscriptSegment], list[OCRObservation]], dict[str, Any]],
+        *,
+        max_items: int = 80,
+    ) -> list[list[TranscriptSegment]]:
+        if not segments:
+            return [[]]
+        chunks: list[list[TranscriptSegment]] = []
+        current: list[TranscriptSegment] = []
+        for segment in segments:
+            candidate = [*current, segment]
+            nearby = self._fit_ocr(candidate, ocr, system, schema, payload_for)
+            if current and (
+                len(candidate) > max_items
+                or not self._fits(
+                    system,
+                    payload_for(candidate, nearby),
+                    schema,
+                )
+            ):
+                chunks.append(current)
+                candidate = [segment]
+            nearby = self._fit_ocr(candidate, ocr, system, schema, payload_for)
+            if not self._fits(system, payload_for(candidate, nearby), schema):
+                raise ModelContextError(f"字幕段 {segment.id} 单独超过模型输入预算")
+            current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _fit_ocr(
+        self,
+        chunk: list[TranscriptSegment],
+        ocr: list[OCRObservation],
+        system: str,
+        schema: dict[str, Any],
+        payload_for: Callable[[list[TranscriptSegment], list[OCRObservation]], dict[str, Any]],
+    ) -> list[OCRObservation]:
+        nearby = _nearby_ocr(chunk, ocr)
+        while nearby and not self._fits(system, payload_for(chunk, nearby), schema):
+            nearby.pop()
+        return nearby
+
+    def _budgeted_ocr_chunks(
+        self,
+        ocr: list[OCRObservation],
+        system: str,
+        schema: dict[str, Any],
+        payload_for: Callable[[list[TranscriptSegment], list[OCRObservation]], dict[str, Any]],
+    ) -> list[list[OCRObservation]]:
+        chunks: list[list[OCRObservation]] = []
+        current: list[OCRObservation] = []
+        for item in ocr:
+            candidate = [*current, item]
+            if current and (
+                len(candidate) > 20
+                or sum(len(value.text) for value in candidate) > 6000
+                or not self._fits(system, payload_for([], candidate), schema)
+            ):
+                chunks.append(current)
+                candidate = [item]
+            if not self._fits(system, payload_for([], candidate), schema):
+                raise ModelContextError("单条 OCR 超过模型输入预算")
+            current = candidate
+        if current:
+            chunks.append(current)
+        return chunks or [[]]
 
     def _require_configured(self) -> None:
         if not self.configured:
@@ -287,7 +490,12 @@ class OpenAICompatibleProvider(AnalysisProvider):
             )
 
     async def _json_call(
-        self, system: str, user: str, *, response_schema: dict[str, Any]
+        self,
+        system: str,
+        user: str,
+        *,
+        response_schema: dict[str, Any],
+        response_validator: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
         self._require_configured()
         url = f"{self.settings.base_url.rstrip('/')}/chat/completions"
@@ -320,11 +528,21 @@ class OpenAICompatibleProvider(AnalysisProvider):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        def check_limits(response: httpx.Response) -> None:
+            if response.status_code == 400 and _is_context_error(response.text):
+                raise ModelContextError("模型输入超过上下文窗口")
+            if response.status_code >= 400 and _is_output_truncation_error(response.text):
+                raise ModelOutputError("模型输出截断，需缩小批次")
+
         last_error: Exception | None = None
+        request_count = 0
         for attempt in range(self.settings.max_retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=self.settings.timeout_seconds) as client:
+                    request_count += 1
                     response = await client.post(url, headers=headers, json=body)
+                    check_limits(response)
                     if response.status_code == 400:
                         current = body.get("response_format")
                         if (
@@ -334,24 +552,66 @@ class OpenAICompatibleProvider(AnalysisProvider):
                         ):
                             # Schema/strict rejection only — do not mask unrelated 400s.
                             body["response_format"] = {"type": "json_object"}
+                            request_count += 1
                             response = await client.post(url, headers=headers, json=body)
-                        elif (
-                            self.settings.response_format == "json_object"
-                            and "response_format" in response.text
+                            check_limits(response)
+                    if response.status_code == 400:
+                        current = body.get("response_format")
+                        if (
+                            isinstance(current, dict)
+                            and current.get("type") == "json_object"
+                            and _looks_like_json_object_rejection(response.text)
                         ):
                             body.pop("response_format", None)
+                            request_count += 1
                             response = await client.post(url, headers=headers, json=body)
+                            check_limits(response)
                     response.raise_for_status()
                     payload = response.json()
                     usage = payload.get("usage") or {}
                     self.last_usage = {
                         key: int(value) for key, value in usage.items() if isinstance(value, int)
                     }
+                    self.last_usage["request_count"] = request_count
+                    self.last_usage["retry_count"] = max(0, request_count - 1)
                     choice = payload["choices"][0]
                     if choice.get("finish_reason") == "length":
-                        raise ValueError("模型输出达到 token 上限")
+                        raise ModelOutputError("模型输出达到 token 上限")
                     content = choice["message"]["content"]
-                    return _parse_json_content(content)
+                    try:
+                        parsed = _parse_json_content(content)
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        emitted = usage.get("completion_tokens") or usage.get("output_tokens")
+                        if (
+                            isinstance(emitted, int)
+                            and self.settings.max_output_tokens is not None
+                            and emitted >= self.settings.max_output_tokens - 1
+                        ):
+                            raise ModelOutputError(
+                                "模型输出达到 token 上限，JSON 未完整返回"
+                            ) from exc
+                        raise
+                    if response_validator is not None:
+                        try:
+                            response_validator(parsed)
+                        except ValueError as exc:
+                            if attempt < self.settings.max_retries:
+                                body["messages"] = [
+                                    {"role": "system", "content": system},
+                                    {"role": "user", "content": user},
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "上一个 JSON 不符合结果模型，"
+                                            "请根据原始输入重新生成完整 JSON。"
+                                            f"校验错误：{str(exc)[:700]}"
+                                        ),
+                                    },
+                                ]
+                            raise
+                    return parsed
+            except ModelLimitError:
+                raise
             except (
                 httpx.HTTPError,
                 AttributeError,
@@ -362,38 +622,100 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 json.JSONDecodeError,
             ) as exc:
                 last_error = exc
-                if attempt < self.settings.max_retries:
+                retryable = not isinstance(exc, httpx.HTTPStatusError) or (
+                    exc.response.status_code >= 500 or exc.response.status_code == 429
+                )
+                if attempt < self.settings.max_retries and retryable:
                     await asyncio.sleep(2**attempt)
-        raise ExternalToolError("云端模型调用失败", details={"cause": str(last_error)})
+                elif not retryable:
+                    break
+        details = {"cause": str(last_error), "request_count": request_count}
+        if isinstance(last_error, httpx.HTTPStatusError):
+            details["status_code"] = last_error.response.status_code
+        if isinstance(last_error, httpx.TimeoutException):
+            raise ModelTimeoutError("模型请求超时，请检查模型接口状态", details=details)
+        if isinstance(last_error, httpx.ConnectError):
+            raise ModelConnectionError("无法连接模型服务，请检查接口地址和进程", details=details)
+        if isinstance(last_error, httpx.HTTPStatusError) and last_error.response.status_code >= 500:
+            raise ModelServiceError("模型服务暂不可用，请检查模型接口状态", details=details)
+        if isinstance(last_error, httpx.HTTPStatusError) and last_error.response.status_code == 400:
+            raise ExternalToolError(
+                "模型拒绝请求，请检查模型名称、输出上限和响应格式",
+                details=details,
+            )
+        raise ExternalToolError("模型调用失败", details=details)
 
     async def correct_transcript(
-        self, segments: list[TranscriptSegment], ocr: list[OCRObservation]
+        self,
+        segments: list[TranscriptSegment],
+        ocr: list[OCRObservation],
+        *,
+        checkpoints: dict[str, Any] | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
     ) -> tuple[list[TranscriptSegment], list[ReviewIssue]]:
         self._require_configured()
         corrected: list[TranscriptSegment] = []
         issues: list[ReviewIssue] = []
-        for chunk in _chunk_segments(segments, max_chars=12_000):
-            nearby_ocr = [
-                item.model_dump(mode="json")
-                for item in ocr
-                if not chunk
-                or item.timestamp_ms is None
-                or (chunk[0].start_ms - 5000 <= item.timestamp_ms <= chunk[-1].end_ms + 5000)
-            ]
-            result = await self._json_call(
-                """你是中文逐字稿校对器。只能修正明显的同音字、断句、数字、人名和专有名词错误；
+        system = """你是中文逐字稿校对器。只能修正明显的同音字、断句、数字、人名和专有名词错误；
 不得摘要、删句、补充视频没有说过的内容。OCR 只是辅助证据，冲突时保留不确定性。
 输出 JSON：{\"segments\":[{\"id\":整数,\"text\":字符串}],
-\"review_issues\":[{\"segment_id\":整数,\"reason\":字符串,\"suggestions\":[字符串]}]}。""",
-                json.dumps(
-                    {
-                        "segments": [item.model_dump(mode="json") for item in chunk],
-                        "ocr": nearby_ocr,
-                    },
-                    ensure_ascii=False,
-                ),
-                response_schema=TRANSCRIPT_CORRECTION_SCHEMA,
-            )
+\"review_issues\":[{\"segment_id\":整数,\"reason\":字符串,\"suggestions\":[字符串]}]}。"""
+
+        def payload_for(
+            chunk: list[TranscriptSegment], nearby: list[OCRObservation]
+        ) -> dict[str, Any]:
+            return {
+                "segments": [_transcript_prompt_item(item) for item in chunk],
+                "ocr": [_ocr_prompt_item(item) for item in nearby],
+            }
+
+        chunks = self._budgeted_chunks(
+            segments,
+            ocr,
+            system,
+            TRANSCRIPT_CORRECTION_SCHEMA,
+            payload_for,
+        )
+        if on_progress is not None:
+            on_progress("correction", 0, len(chunks))
+
+        async def run_chunk(chunk: list[TranscriptSegment]) -> dict[str, Any]:
+            try:
+                return await self._checkpointed_call(
+                    system,
+                    payload_for(
+                        chunk,
+                        self._fit_ocr(
+                            chunk,
+                            ocr,
+                            system,
+                            TRANSCRIPT_CORRECTION_SCHEMA,
+                            payload_for,
+                        ),
+                    ),
+                    TRANSCRIPT_CORRECTION_SCHEMA,
+                    checkpoints=checkpoints,
+                    on_checkpoint=on_checkpoint,
+                )
+            except ModelLimitError:
+                if len(chunk) < 2:
+                    raise
+                middle = len(chunk) // 2
+                left = await run_chunk(chunk[:middle])
+                right = await run_chunk(chunk[middle:])
+                return {
+                    "segments": [*left.get("segments", []), *right.get("segments", [])],
+                    "review_issues": [
+                        *left.get("review_issues", []),
+                        *right.get("review_issues", []),
+                    ],
+                }
+
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            result = await run_chunk(chunk)
+            if on_progress is not None:
+                on_progress("correction", chunk_index, len(chunks))
             by_id: dict[int, str] = {}
             for item in result.get("segments", []):
                 try:
@@ -413,14 +735,30 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     continue
                 source = next((segment for segment in chunk if segment.id == segment_id), None)
                 if source:
+                    suggestions = list(
+                        dict.fromkeys(
+                            str(value).strip()
+                            for value in item.get("suggestions", [])
+                            if str(value).strip()
+                        )
+                    )
+                    reason = str(item.get("reason", "模型认为该片段需要人工确认"))
+                    current_text = by_id.get(source.id, source.text)
+                    if _review_issue_skip_reason(
+                        source.text,
+                        current_text,
+                        reason,
+                        suggestions,
+                    ):
+                        continue
                     issues.append(
                         ReviewIssue(
                             id=f"llm-{segment_id}-{index}",
                             start_ms=source.start_ms,
                             end_ms=source.end_ms,
                             raw_text=source.text,
-                            reason=str(item.get("reason", "模型认为该片段需要人工确认")),
-                            suggestions=[str(value) for value in item.get("suggestions", [])],
+                            reason=reason,
+                            suggestions=suggestions,
                         )
                     )
         return corrected, issues
@@ -431,46 +769,193 @@ class OpenAICompatibleProvider(AnalysisProvider):
         ocr: list[OCRObservation],
         inspirations: list[InspirationInput],
         metadata: dict[str, Any],
+        *,
+        checkpoints: dict[str, Any] | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
+        on_progress: Callable[[str, int, int], None] | None = None,
     ) -> AnalysisResult:
         self._require_configured()
-        chunks = _chunk_segments(segments, max_chars=22_000)
-        if len(chunks) == 1:
-            payload = await self._analysis_call(chunks[0], ocr, inspirations, metadata)
-            return AnalysisResult.model_validate(payload)
+        schema = _analysis_response_schema()
+
+        def payload_for(
+            chunk: list[TranscriptSegment], nearby: list[OCRObservation]
+        ) -> dict[str, Any]:
+            return {
+                "metadata": metadata,
+                "user_inspirations_verbatim": [
+                    item.model_dump(mode="json") for item in inspirations
+                ],
+                "transcript": [_transcript_prompt_item(item) for item in chunk],
+                "ocr": [_ocr_prompt_item(item) for item in nearby],
+            }
+
+        chunks = (
+            [
+                (chunk, ocr)
+                for chunk in self._budgeted_chunks(
+                    segments,
+                    ocr,
+                    _analysis_system_prompt(),
+                    schema,
+                    payload_for,
+                    max_items=(
+                        min(80, max(20, self.settings.max_output_tokens // 200))
+                        if self.settings.max_output_tokens
+                        else 80
+                    ),
+                )
+            ]
+            if segments
+            else [
+                ([], group)
+                for group in self._budgeted_ocr_chunks(
+                    ocr,
+                    _analysis_system_prompt(),
+                    schema,
+                    payload_for,
+                )
+            ]
+        )
+        if on_progress is not None:
+            on_progress("analysis", 0, len(chunks))
+
+        async def analyze_chunk(
+            chunk: list[TranscriptSegment],
+            focus_ocr: list[OCRObservation],
+            index: int,
+        ) -> list[dict[str, Any]]:
+            try:
+                return [
+                    await self._analysis_call(
+                        chunk,
+                        self._fit_ocr(
+                            chunk,
+                            focus_ocr,
+                            _analysis_system_prompt(),
+                            schema,
+                            payload_for,
+                        ),
+                        inspirations,
+                        {**metadata, "part": index, "parts": len(chunks)}
+                        if len(chunks) > 1
+                        else metadata,
+                        checkpoints=checkpoints,
+                        on_checkpoint=on_checkpoint,
+                    )
+                ]
+            except ModelLimitError:
+                if len(chunk) >= 2:
+                    middle = len(chunk) // 2
+                    return [
+                        *await analyze_chunk(chunk[:middle], focus_ocr, index),
+                        *await analyze_chunk(chunk[middle:], focus_ocr, index),
+                    ]
+                if not chunk and len(focus_ocr) >= 2:
+                    middle = len(focus_ocr) // 2
+                    return [
+                        *await analyze_chunk([], focus_ocr[:middle], index),
+                        *await analyze_chunk([], focus_ocr[middle:], index),
+                    ]
+                raise
 
         partials: list[dict[str, Any]] = []
-        for index, chunk in enumerate(chunks):
-            partials.append(
-                await self._analysis_call(
-                    chunk,
+        for index, (chunk, focus_ocr) in enumerate(chunks, start=1):
+            partials.extend(await analyze_chunk(chunk, focus_ocr, index))
+            if on_progress is not None:
+                on_progress("analysis", index, len(chunks))
+        if len(partials) == 1:
+            return AnalysisResult.model_validate(partials[0])
+        if on_progress is not None:
+            on_progress("merge", 0, 0)
+        merge_count = 0
+
+        async def merge(group: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal merge_count
+            if len(group) == 1:
+                return group[0]
+            if len(group) > 3:
+                size = (len(group) + 2) // 3
+                return await merge(
                     [
-                        item
-                        for item in ocr
-                        if item.timestamp_ms is None
-                        or chunk[0].start_ms - 5000 <= item.timestamp_ms <= chunk[-1].end_ms + 5000
-                    ],
-                    inspirations,
-                    {**metadata, "part": index + 1, "parts": len(chunks)},
+                        await merge(group[index : index + size])
+                        for index in range(0, len(group), size)
+                    ]
                 )
+            inherited: set[tuple[int | None, str]] = set()
+            inherited_quotes: set[str] = set()
+            for partial in group:
+                for chapter in partial.get("chapters", []):
+                    for evidence in chapter.get("evidence", []):
+                        quote = _citation_key(evidence.get("quote", ""))
+                        inherited.add((evidence.get("timestamp_ms"), quote))
+                        inherited_quotes.add(quote)
+                for atom in partial.get("knowledge_atoms", []):
+                    quote = _citation_key(atom.get("quote", ""))
+                    inherited.add((atom.get("timestamp_ms"), quote))
+                    inherited_quotes.add(quote)
+                for reminder in partial.get("reminders", []):
+                    inherited_quotes.add(_citation_key(reminder.get("source_quote", "")))
+
+            def validate_merge(value: dict[str, Any]) -> AnalysisResult:
+                analysis = AnalysisResult.model_validate(value)
+                for chapter in analysis.chapters:
+                    for evidence in chapter.evidence:
+                        if (evidence.timestamp_ms, _citation_key(evidence.quote)) not in inherited:
+                            raise ValueError("汇总证据必须继承分段结果的原始引文与时间戳")
+                for atom in analysis.knowledge_atoms:
+                    if (
+                        atom.quote
+                        and atom.provenance != "ai_inference"
+                        and (atom.timestamp_ms, _citation_key(atom.quote)) not in inherited
+                    ):
+                        raise ValueError("汇总知识原子的引文与时间戳未见于分段结果")
+                for reminder in analysis.reminders:
+                    if (
+                        reminder.source_quote
+                        and _citation_key(reminder.source_quote) not in inherited_quotes
+                    ):
+                        raise ValueError("汇总提醒的依据未见于分段结果")
+                return analysis
+
+            payload = {
+                "task": "合并分段分析；保留原始引文、时间戳和来源，不创造新证据。",
+                "metadata": metadata,
+                "user_inspirations_verbatim": [
+                    item.model_dump(mode="json") for item in inspirations
+                ],
+                "partial_analyses": group,
+            }
+            fits_input = self._fits(_analysis_system_prompt(), payload, schema)
+            if len(group) <= 3 and fits_input:
+                try:
+                    result = await self._checkpointed_call(
+                        _analysis_system_prompt(),
+                        payload,
+                        schema,
+                        validator=validate_merge,
+                        checkpoints=checkpoints,
+                        on_checkpoint=on_checkpoint,
+                    )
+                    merge_count += 1
+                    if on_progress is not None:
+                        on_progress("merge", merge_count, 0)
+                    return result
+                except ModelLimitError:
+                    pass
+            if len(group) == 2:
+                if not fits_input:
+                    raise ModelContextError("两个分段结果仍超过模型输入预算，请增大上下文窗口")
+                raise ModelOutputError("两个分段结果仍超过模型汇总预算，请提高上下文或输出上限")
+            middle = len(group) // 2
+            return await merge(
+                [
+                    await merge(group[:middle]),
+                    await merge(group[middle:]),
+                ]
             )
-        result = await self._json_call(
-            _analysis_system_prompt(),
-            json.dumps(
-                {
-                    "task": (
-                        "把分段分析合并成一个完整分析；去重，但不要丢失时间敏感主张和提醒候选。"
-                    ),
-                    "metadata": metadata,
-                    "user_inspirations_verbatim": [
-                        item.model_dump(mode="json") for item in inspirations
-                    ],
-                    "partial_analyses": partials,
-                },
-                ensure_ascii=False,
-            ),
-            response_schema=_analysis_response_schema(),
-        )
-        return AnalysisResult.model_validate(result)
+
+        result = await merge(partials)
+        return _preserve_partial_coverage(AnalysisResult.model_validate(result), partials)
 
     async def _analysis_call(
         self,
@@ -478,21 +963,24 @@ class OpenAICompatibleProvider(AnalysisProvider):
         ocr: list[OCRObservation],
         inspirations: list[InspirationInput],
         metadata: dict[str, Any],
+        *,
+        checkpoints: dict[str, Any] | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        return await self._json_call(
+        return await self._checkpointed_call(
             _analysis_system_prompt(),
-            json.dumps(
-                {
-                    "metadata": metadata,
-                    "user_inspirations_verbatim": [
-                        item.model_dump(mode="json") for item in inspirations
-                    ],
-                    "transcript": [s.model_dump(mode="json") for s in segments],
-                    "ocr": [item.model_dump(mode="json") for item in ocr],
-                },
-                ensure_ascii=False,
-            ),
-            response_schema=_analysis_response_schema(),
+            {
+                "metadata": metadata,
+                "user_inspirations_verbatim": [
+                    item.model_dump(mode="json") for item in inspirations
+                ],
+                "transcript": [_transcript_prompt_item(s) for s in segments],
+                "ocr": [_ocr_prompt_item(item) for item in ocr],
+            },
+            _analysis_response_schema(),
+            validator=AnalysisResult.model_validate,
+            checkpoints=checkpoints,
+            on_checkpoint=on_checkpoint,
         )
 
 
@@ -537,8 +1025,155 @@ def provider_from_settings(settings: LLMSettings) -> AnalysisProvider:
     return provider if provider.configured else FallbackAnalysisProvider()
 
 
+def _transcript_prompt_item(segment: TranscriptSegment) -> dict[str, Any]:
+    return segment.model_dump(mode="json", include={"id", "start_ms", "end_ms", "text"})
+
+
+def _ocr_prompt_item(item: OCRObservation) -> dict[str, Any]:
+    return item.model_dump(mode="json", include={"timestamp_ms", "image_index", "text"})
+
+
+def _citation_key(value: str | None) -> str:
+    return re.sub(r"[\W_]+", "", value or "", flags=re.UNICODE).lower()
+
+
+def _preserve_partial_coverage(
+    merged: AnalysisResult, partials: list[dict[str, Any]]
+) -> AnalysisResult:
+    """Use the merge for its overview while retaining the source timeline and claims."""
+    if len(partials) <= 1:
+        return merged
+    sources = [AnalysisResult.model_validate(item) for item in partials]
+    group_size = max(1, math.ceil(len(sources) / 12))
+    chapters: list[TimelineChapter] = []
+    for offset in range(0, len(sources), group_size):
+        source_chapters = [
+            chapter
+            for source in sources[offset : offset + group_size]
+            for chapter in source.chapters
+        ]
+        if not source_chapters:
+            continue
+        first, last = source_chapters[0], source_chapters[-1]
+        evidence = [item for chapter in source_chapters for item in chapter.evidence]
+        key_points = list(
+            dict.fromkeys(point for chapter in source_chapters for point in chapter.key_points)
+        )
+        chapters.append(
+            TimelineChapter(
+                start_ms=min(chapter.start_ms for chapter in source_chapters),
+                end_ms=max(
+                    (chapter.end_ms or chapter.start_ms + 1) for chapter in source_chapters
+                ),
+                title=(
+                    first.title
+                    if first.title == last.title
+                    else f"{first.title}；{last.title}"
+                ),
+                summary=(
+                    first.summary
+                    if first.summary == last.summary
+                    else f"{first.summary} {last.summary}".strip()
+                ),
+                key_points=_sample_evenly(key_points, 5),
+                comparison_table=next(
+                    (
+                        chapter.comparison_table
+                        for chapter in source_chapters
+                        if chapter.comparison_table
+                    ),
+                    None,
+                ),
+                evidence=_sample_evenly(evidence, 6),
+            )
+        )
+    atoms = []
+    seen_statements: set[str] = set()
+    for source in sources:
+        for atom in source.knowledge_atoms:
+            key = _citation_key(atom.statement)
+            if not key or key in seen_statements:
+                continue
+            seen_statements.add(key)
+            atoms.append(atom.model_copy(update={"id": f"atom_{len(atoms) + 1:03d}"}))
+    return merged.model_copy(
+        update={
+            "chapters": chapters or merged.chapters,
+            "knowledge_atoms": atoms or merged.knowledge_atoms,
+        }
+    )
+
+
+def _sample_evenly(items: list[Any], limit: int) -> list[Any]:
+    if len(items) <= limit:
+        return items
+    return [items[round(index * (len(items) - 1) / (limit - 1))] for index in range(limit)]
+
+
+def _review_issue_skip_reason(
+    source_text: str,
+    corrected_text: str,
+    reason: str,
+    suggestions: list[str],
+) -> str | None:
+    if not suggestions:
+        return "没有可操作的建议"
+    if all(value == source_text for value in suggestions):
+        return "建议与原文相同"
+    if corrected_text != source_text and any(value in corrected_text for value in suggestions):
+        return "建议已应用于校正稿"
+    if len(suggestions) == 1 and not re.search(
+        r"不确定|无法|可能|歧义|语义不明|专有|人名|地名|数字|日期|型号|品牌|名称",
+        reason,
+    ):
+        return "单一建议且未说明关键歧义"
+    return None
+
+
+def _nearby_ocr(
+    chunk: list[TranscriptSegment],
+    ocr: list[OCRObservation],
+) -> list[OCRObservation]:
+    nearby: list[OCRObservation] = []
+    seen: dict[str, int] = {}
+    size = 0
+    for item in ocr:
+        timestamp = item.timestamp_ms
+        if (
+            chunk
+            and timestamp is not None
+            and not (chunk[0].start_ms - 5000 <= timestamp <= chunk[-1].end_ms + 5000)
+        ):
+            continue
+        lines: list[str] = []
+        keys: set[str] = set()
+        for line in item.text.splitlines():
+            key = re.sub(r"\s+", "", line).casefold()
+            if not key or key in keys:
+                continue
+            previous = seen.get(key)
+            if (
+                timestamp is not None
+                and previous is not None
+                and abs(timestamp - previous) <= 60_000
+            ):
+                continue
+            lines.append(line)
+            keys.add(key)
+        if not lines:
+            continue
+        filtered_text = "\n".join(lines)
+        if nearby and (size + len(filtered_text) > 6000 or len(nearby) >= 20):
+            break
+        nearby.append(item.model_copy(update={"text": filtered_text}))
+        if timestamp is not None:
+            seen.update({key: timestamp for key in keys})
+        size += len(filtered_text)
+    return nearby
+
+
 def _chunk_segments(
-    segments: list[TranscriptSegment], *, max_chars: int
+    segments: list[TranscriptSegment], *, max_chars: int, max_items: int | None = None
 ) -> list[list[TranscriptSegment]]:
     if not segments:
         return [[]]
@@ -546,7 +1181,10 @@ def _chunk_segments(
     current: list[TranscriptSegment] = []
     size = 0
     for segment in segments:
-        if current and size + len(segment.text) > max_chars:
+        if current and (
+            size + len(segment.text) > max_chars
+            or (max_items is not None and len(current) >= max_items)
+        ):
             chunks.append(current)
             current = []
             size = 0

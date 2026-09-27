@@ -13,21 +13,32 @@ import pytest
 
 from douyin_wiki.adapters.embeddings import EmbeddingService
 from douyin_wiki.adapters.llm import (
+    ModelLimitError,
     OpenAICompatibleProvider,
     _analysis_response_schema,
+    _nearby_ocr,
     _parse_json_content,
+    _preserve_partial_coverage,
 )
 from douyin_wiki.config import EmbeddingSettings, LLMSettings
-from douyin_wiki.errors import CookieRequiredError, ExternalToolError, JobStateError
+from douyin_wiki.errors import (
+    CookieRequiredError,
+    ExternalToolError,
+    JobStateError,
+    ModelServiceError,
+)
 from douyin_wiki.models import (
     AnalysisMode,
+    AnalysisResult,
     AuthCheckResult,
     CaptureOptions,
     GatewayContext,
     InspirationInput,
     JobStatus,
+    OCRObservation,
     RetentionPolicy,
     TranscriptCorrection,
+    TranscriptSegment,
 )
 from douyin_wiki.service import DouyinWikiService
 from douyin_wiki.vault import VaultWriter
@@ -313,8 +324,17 @@ async def test_video_without_audio_still_extracts_frames_without_transcribing(se
         async def transcribe(self, audio_path: Path, output_dir: Path):
             raise AssertionError("无音轨时不应调用转录")
 
+    class OcrOnlyAnalysis(FakeAnalysisProvider):
+        async def analyze(self, segments, ocr, inspirations, metadata):
+            return AnalysisResult(
+                title="财经媒体筛选",
+                one_liner="画面显示财经媒体筛选",
+                takeaways=["画面显示财经媒体筛选"],
+            )
+
     service.media = NoAudioProcessor()
     service.transcriber = UnexpectedTranscriber()
+    service.analysis = OcrOnlyAnalysis()
     job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
 
     completed = await Worker(service).run_once()
@@ -323,6 +343,8 @@ async def test_video_without_audio_still_extracts_frames_without_transcribing(se
     assert completed.artifacts["transcript_raw"] == []
     assert completed.artifacts["transcript_skipped"] == "no_audio_available"
     assert completed.artifacts["ocr"]
+    assert completed.status == JobStatus.COMPLETED_WITH_WARNINGS, completed.error_message
+    assert any("无音轨" in warning for warning in completed.result["warnings"])
 
 
 @pytest.mark.asyncio
@@ -344,7 +366,6 @@ async def test_video_audio_tool_failure_is_not_mistaken_for_missing_audio(servic
 @pytest.mark.asyncio
 async def test_asr_prefers_retained_audio_over_video(service) -> None:
     """CDN may keep audio.m4a / audio.mp4; ASR should prefer those over video."""
-    video_id = "7672717300746907078"
     extracted: list[Path] = []
 
     class RetainedAudioDownloader(FakeDownloader):
@@ -370,7 +391,7 @@ async def test_asr_prefers_retained_audio_over_video(service) -> None:
     assert extracted[0].name == "audio.m4a"
     assert extracted[0].suffix.lower() == ".m4a"
     # Video is only a fallback; must not be the first (or only) source used.
-    assert all(path.name != "original.mp4" for path in extracted) or extracted[0].name == "audio.m4a"
+    assert all(path.name != "original.mp4" for path in extracted)
 
 
 @pytest.mark.asyncio
@@ -1038,9 +1059,7 @@ async def test_two_character_chinese_search_uses_lexical_index(service) -> None:
     assert service.search_knowledge("拍照")[0].entry_id == entry.id
     assert service.search_knowledge("手机技巧")[0].entry_id == entry.id
 
-    substring_rows = service.database.fts_search(
-        '("不匹配")', raw_query="手机拍照"
-    )
+    substring_rows = service.database.fts_search('("不匹配")', raw_query="手机拍照")
     assert substring_rows[0]["match_kind"] == "exact_substring"
     assert substring_rows[0]["rank"] is None
     assert substring_rows[0]["match_quality"] < 1
@@ -1231,6 +1250,416 @@ def test_provider_mode_forwards_configured_loopback_api_key(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_long_transcript_uses_bounded_compact_model_requests(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="local-model")
+    )
+    requests: list[dict] = []
+
+    async def fake_json_call(system, user, *, response_schema):
+        requests.append(json.loads(user))
+        return {"segments": [], "review_issues": []}
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(
+            id=index,
+            start_ms=index * 1000,
+            end_ms=(index + 1) * 1000,
+            text="这是一段字幕",
+            confidence=0.9,
+        )
+        for index in range(161)
+    ]
+    ocr = [OCRObservation(timestamp_ms=500, text="画面文字", image_path="/private/frame.jpg")]
+    corrected, _ = await provider.correct_transcript(segments, ocr)
+
+    assert len(corrected) == 161
+    assert [len(request["segments"]) for request in requests] == [80, 80, 1]
+    assert set(requests[0]["segments"][0]) == {"id", "start_ms", "end_ms", "text"}
+    assert set(requests[0]["ocr"][0]) == {"timestamp_ms", "image_index", "text"}
+
+
+@pytest.mark.asyncio
+async def test_correction_splits_length_failures_and_reuses_completed_checkpoints(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model")
+    )
+    checkpoints: dict = {}
+    calls: list[tuple[int, ...]] = []
+
+    async def fake_json_call(system, user, *, response_schema):
+        ids = tuple(item["id"] for item in json.loads(user)["segments"])
+        calls.append(ids)
+        if len(ids) > 2:
+            raise ModelLimitError("模型输出达到 token 上限")
+        return {"segments": [], "review_issues": []}
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(id=i, start_ms=i * 1000, end_ms=(i + 1) * 1000, text="一段字幕")
+        for i in range(5)
+    ]
+    first, _ = await provider.correct_transcript(segments, [], checkpoints=checkpoints)
+    assert len(first) == 5
+    assert calls == [(0, 1, 2, 3, 4), (0, 1), (2, 3, 4), (2,), (3, 4)]
+    assert len(checkpoints) == 3
+    calls.clear()
+    second, _ = await provider.correct_transcript(segments, [], checkpoints=checkpoints)
+    assert [item.text for item in second] == [item.text for item in first]
+    assert calls == [(0, 1, 2, 3, 4), (2, 3, 4)]
+    calls.clear()
+    changed = [segments[0].model_copy(update={"text": "已更新的字幕"}), *segments[1:]]
+    await provider.correct_transcript(changed, [], checkpoints=checkpoints)
+    assert (0, 1) in calls
+    assert (3, 4) not in calls
+
+
+@pytest.mark.asyncio
+async def test_ocr_only_analysis_covers_all_images(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model")
+    )
+    seen_indices: list[int] = []
+
+    async def fake_json_call(system, user, *, response_schema, response_validator):
+        payload = json.loads(user)
+        seen_indices.extend(item["image_index"] for item in payload.get("ocr", []))
+        return AnalysisResult(title="图文", one_liner="图文摘要").model_dump(mode="json")
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    ocr = [OCRObservation(image_index=i, text=f"图片 {i} " + "内容" * 100) for i in range(1, 31)]
+    result = await provider.analyze([], ocr, [], {"source_kind": "image_note"})
+    assert result.title == "图文"
+    assert seen_indices == list(range(1, 31))
+
+
+def test_adjacent_ocr_lines_are_deduplicated_only_in_model_input() -> None:
+    source = [
+        OCRObservation(timestamp_ms=1000, text="固定标题\n第一段"),
+        OCRObservation(timestamp_ms=11000, text="固定标题\n第二段"),
+    ]
+    chunk = [TranscriptSegment(id=1, start_ms=0, end_ms=12000, text="旁白")]
+    prepared = _nearby_ocr(chunk, source)
+    assert [item.text for item in prepared] == ["固定标题\n第一段", "第二段"]
+    assert [item.timestamp_ms for item in prepared] == [1000, 11000]
+    assert source[1].text == "固定标题\n第二段"
+
+
+@pytest.mark.asyncio
+async def test_analysis_respects_reduced_context_budget(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="test-model",
+            context_window_tokens=16000,
+            max_output_tokens=512,
+        )
+    )
+    requests: list[tuple[str, dict, dict]] = []
+
+    async def fake_json_call(system, user, *, response_schema, response_validator):
+        payload = json.loads(user)
+        requests.append((system, payload, response_schema))
+        return AnalysisResult(title="预算测试", one_liner="摘要").model_dump(mode="json")
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(id=i, start_ms=i * 1000, end_ms=(i + 1) * 1000, text="字幕" * 100)
+        for i in range(60)
+    ]
+    await provider.analyze(segments, [], [], {})
+    parts = [payload for _, payload, _ in requests if "transcript" in payload]
+    assert len(parts) > 1
+    assert max(len(payload["transcript"]) for payload in parts) <= 20
+    assert sum(len(payload["transcript"]) for payload in parts) == 60
+    assert all(provider._fits(system, payload, schema) for system, payload, schema in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["context", "output", "server_json", "truncated_json"])
+async def test_model_limits_do_not_retry_identical_request(monkeypatch, failure) -> None:
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure == "context":
+            return httpx.Response(400, text='{"error":"prompt too long"}')
+        if failure == "server_json":
+            return httpx.Response(500, text="Failed to extract valid JSON from output")
+        if failure == "truncated_json":
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"finish_reason": "stop", "message": {"content": "{"}}],
+                    "usage": {"completion_tokens": 256},
+                },
+            )
+        return httpx.Response(
+            200, json={"choices": [{"finish_reason": "length", "message": {"content": "{}"}}]}
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="test-model",
+            max_retries=2,
+            max_output_tokens=256,
+        )
+    )
+    with pytest.raises(ModelLimitError) as exc:
+        await provider._json_call("system", "user", response_schema={"type": "object"})
+    assert exc.value.code == (
+        "model_context_limit" if failure == "context" else "model_output_limit"
+    )
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_model_502_has_specific_error_after_bounded_retries(monkeypatch) -> None:
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(502, text="Bad Gateway")
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="test-model",
+            max_retries=1,
+        )
+    )
+    with pytest.raises(ModelServiceError) as exc:
+        await provider._json_call("system", "user", response_schema={"type": "object"})
+    assert exc.value.code == "model_unavailable"
+    assert exc.value.details["status_code"] == 502
+    assert exc.value.details["request_count"] == 2
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [(httpx.ConnectError, "model_connection_error"), (httpx.ReadTimeout, "model_timeout")],
+)
+async def test_model_connection_and_timeout_have_distinct_codes(
+    monkeypatch,
+    failure,
+    expected_code,
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise failure("request failed")
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="test-model",
+            max_retries=0,
+        )
+    )
+    with pytest.raises(ModelServiceError) as exc:
+        await provider._json_call("system", "user", response_schema={"type": "object"})
+    assert exc.value.code == expected_code
+
+
+@pytest.mark.asyncio
+async def test_long_analysis_uses_small_model_requests(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="local-model")
+    )
+    requests: list[dict] = []
+
+    async def fake_json_call(system, user, *, response_schema, response_validator):
+        payload = json.loads(user)
+        requests.append(payload)
+        return AnalysisResult(title="测试", one_liner="测试摘要").model_dump(mode="json")
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(
+            id=index,
+            start_ms=index * 1000,
+            end_ms=(index + 1) * 1000,
+            text="一段字幕",
+        )
+        for index in range(161)
+    ]
+    result = await provider.analyze(segments, [], [], {})
+
+    assert result.title == "测试"
+    assert [len(request["transcript"]) for request in requests[:-1]] == [80, 80, 1]
+    assert len(requests[-1]["partial_analyses"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_many_analysis_parts_merge_hierarchically_and_checkpoint(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model")
+    )
+    calls: list[dict] = []
+    checkpoints: dict = {}
+
+    async def fake_json_call(system, user, *, response_schema, response_validator):
+        payload = json.loads(user)
+        calls.append(payload)
+        return AnalysisResult(
+            title="测试",
+            one_liner="摘要",
+            knowledge_atoms=[
+                {
+                    "id": "inference",
+                    "statement": "推断",
+                    "provenance": "ai_inference",
+                    "quote": None,
+                }
+            ],
+        ).model_dump(mode="json")
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(id=i, start_ms=i * 1000, end_ms=(i + 1) * 1000, text="字幕")
+        for i in range(321)
+    ]
+    first = await provider.analyze(segments, [], [], {}, checkpoints=checkpoints)
+    assert first.title == "测试"
+    assert len([x for x in calls if "transcript" in x]) == 5
+    assert all(len(x["partial_analyses"]) <= 3 for x in calls if "partial_analyses" in x)
+    assert len(checkpoints) == len(calls)
+    calls.clear()
+    second = await provider.analyze(segments, [], [], {}, checkpoints=checkpoints)
+    assert second.title == first.title
+    assert calls == []
+
+
+def test_merge_keeps_timeline_and_claims_from_all_partials() -> None:
+    partials = [
+        AnalysisResult(
+            title="测试",
+            chapters=[
+                {
+                    "start_ms": index * 1000,
+                    "end_ms": (index + 1) * 1000,
+                    "title": f"主题 {index}",
+                    "summary": f"内容 {index}",
+                    "key_points": [f"要点 {index}"],
+                    "evidence": [
+                        {"timestamp_ms": index * 1000, "quote": f"原话 {index}"}
+                    ],
+                }
+            ],
+            knowledge_atoms=[
+                {"id": "same-id", "statement": f"主张 {index}", "quote": f"原话 {index}"}
+            ],
+        ).model_dump(mode="json")
+        for index in range(22)
+    ]
+    merged = _preserve_partial_coverage(AnalysisResult(title="总览"), partials)
+    assert len(merged.chapters) == 11
+    assert merged.chapters[0].start_ms == 0
+    assert merged.chapters[-1].end_ms == 22000
+    assert all(len(chapter.evidence) == 2 for chapter in merged.chapters)
+    assert len(merged.knowledge_atoms) == 22
+    assert len({atom.id for atom in merged.knowledge_atoms}) == 22
+
+
+@pytest.mark.asyncio
+async def test_merge_rejects_citations_absent_from_partial_results(monkeypatch) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model")
+    )
+    checkpoints: dict = {}
+
+    async def fake_json_call(system, user, *, response_schema, response_validator):
+        payload = json.loads(user)
+        quote = "虚构引文" if "partial_analyses" in payload else "真实引文"
+        return AnalysisResult(
+            title="测试",
+            one_liner="摘要",
+            chapters=[
+                {
+                    "start_ms": 0,
+                    "title": "开始",
+                    "summary": "摘要",
+                    "evidence": [{"timestamp_ms": 0, "quote": quote, "evidence_type": "audio"}],
+                }
+            ],
+        ).model_dump(mode="json")
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(id=i, start_ms=i * 1000, end_ms=(i + 1) * 1000, text="真实引文")
+        for i in range(81)
+    ]
+    with pytest.raises(ValueError, match="汇总证据必须继承"):
+        await provider.analyze(segments, [], [], {}, checkpoints=checkpoints)
+    assert len(checkpoints) == 2
+
+
+@pytest.mark.asyncio
+async def test_transcript_correction_omits_already_resolved_and_noop_review_issues(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="local-model")
+    )
+
+    async def fake_json_call(system, user, *, response_schema):
+        return {
+            "segments": [{"id": 1, "text": "请做一个落地页设计"}],
+            "review_issues": [
+                {"segment_id": 1, "reason": "同音字错误", "suggestions": ["落地页"]},
+                {"segment_id": 2, "reason": "口语表达不清，保留原意", "suggestions": ["再看看"]},
+                {"segment_id": 3, "reason": "专有名词可能有误", "suggestions": ["Claude"]},
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_json_call", fake_json_call)
+    segments = [
+        TranscriptSegment(id=1, start_ms=0, end_ms=1000, text="请做一个落地液设计"),
+        TranscriptSegment(id=2, start_ms=1000, end_ms=2000, text="再看看"),
+        TranscriptSegment(id=3, start_ms=2000, end_ms=3000, text="Cloud"),
+    ]
+    corrected, issues = await provider.correct_transcript(segments, [])
+
+    assert corrected[0].text == "请做一个落地页设计"
+    assert [issue.id for issue in issues] == ["llm-3-2"]
+
+
+@pytest.mark.asyncio
 async def test_provider_can_request_strict_json_schema_for_omlx(monkeypatch) -> None:
     requests: list[httpx.Request] = []
 
@@ -1260,9 +1689,7 @@ async def test_provider_can_request_strict_json_schema_for_omlx(monkeypatch) -> 
     )
 
     schema = _analysis_response_schema()
-    result = await provider._json_call(
-        "analyze work", "input", response_schema=schema
-    )
+    result = await provider._json_call("analyze work", "input", response_schema=schema)
 
     assert result == {"segments": [], "review_issues": []}
     assert requests[0].headers["authorization"] == "Bearer omlx-local-key"
@@ -1278,6 +1705,7 @@ async def test_provider_can_request_strict_json_schema_for_omlx(monkeypatch) -> 
 def test_provider_rejects_json_array_when_object_is_required() -> None:
     with pytest.raises(ValueError, match="JSON 对象"):
         _parse_json_content("[]")
+
 
 def test_analysis_response_schema_is_openai_strict_compatible() -> None:
     schema = _analysis_response_schema()
@@ -1366,11 +1794,7 @@ async def test_json_schema_400_falls_back_to_json_object(monkeypatch) -> None:
             )
         return httpx.Response(
             200,
-            json={
-                "choices": [
-                    {"message": {"content": '{"segments":[],"review_issues":[]}'}}
-                ]
-            },
+            json={"choices": [{"message": {"content": '{"segments":[],"review_issues":[]}'}}]},
         )
 
     client_type = httpx.AsyncClient
@@ -1416,11 +1840,7 @@ async def test_json_schema_400_falls_back_without_response_format_substring(
             )
         return httpx.Response(
             200,
-            json={
-                "choices": [
-                    {"message": {"content": '{"segments":[],"review_issues":[]}'}}
-                ]
-            },
+            json={"choices": [{"message": {"content": '{"segments":[],"review_issues":[]}'}}]},
         )
 
     client_type = httpx.AsyncClient
@@ -1445,6 +1865,87 @@ async def test_json_schema_400_falls_back_without_response_format_substring(
     assert result == {"segments": [], "review_issues": []}
     assert len(requests) == 2
     assert requests[1]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_json_schema_fallback_can_remove_unsupported_response_format(monkeypatch) -> None:
+    requests: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) < 3:
+            return httpx.Response(400, text="unsupported response_format")
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": '{"ok":true}'}}]},
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            base_url="http://127.0.0.1:8000/v1",
+            model="test-model",
+            response_format="json_schema",
+            max_retries=0,
+        )
+    )
+    result = await provider._json_call(
+        "system", "user", response_schema=_analysis_response_schema()
+    )
+    assert result == {"ok": True}
+    assert [body.get("response_format", {}).get("type") for body in requests] == [
+        "json_schema",
+        "json_object",
+        None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_analysis_result_is_repaired_within_model_retry(monkeypatch) -> None:
+    requests: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        result = {
+            "analysis_version": 2,
+            "title": "测试作品",
+            "one_liner": "字" * (121 if len(requests) == 1 else 20),
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(result)}}]},
+        )
+
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(
+        "douyin_wiki.adapters.llm.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "local-key")
+    provider = OpenAICompatibleProvider(
+        LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model", max_retries=1)
+    )
+    result = await provider._json_call(
+        "system",
+        "user",
+        response_schema=_analysis_response_schema(),
+        response_validator=AnalysisResult.model_validate,
+    )
+    assert len(result["one_liner"]) == 20
+    assert len(requests) == 2
+    assert len(requests[1]["messages"]) == 3
+    assert requests[1]["messages"][-1]["role"] == "user"
+    assert "校验错误" in requests[1]["messages"][-1]["content"]
+
 
 @pytest.mark.asyncio
 async def test_json_schema_non_schema_400_does_not_fallback(monkeypatch) -> None:
@@ -1536,11 +2037,8 @@ def test_vault_rejects_internal_symlinks_on_write_and_scan(tmp_path: Path) -> No
         writer._atomic_write(link, "hijack\n")
 
     with pytest.raises(ValueError, match="符号链接"):
-        writer._safe_relative_path(
-            "wiki/.data/sources/222222222222.md", field="source_page"
-        )
+        writer._safe_relative_path("wiki/.data/sources/222222222222.md", field="source_page")
 
     loaded = writer.load_entries()
     assert loaded == []
     assert any("符号链接" in item["error"] for item in writer.last_entry_load_errors)
-

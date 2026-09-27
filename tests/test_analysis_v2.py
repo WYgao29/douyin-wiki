@@ -166,9 +166,7 @@ def test_timeline_chapter_evidence_rejects_blank_quote() -> None:
                         "start_ms": 0,
                         "title": "章节",
                         "summary": "摘要",
-                        "evidence": [
-                            {"timestamp_ms": 0, "quote": "   ", "evidence_type": "audio"}
-                        ],
+                        "evidence": [{"timestamp_ms": 0, "quote": "   ", "evidence_type": "audio"}],
                     }
                 ],
             }
@@ -233,6 +231,84 @@ async def test_analysis_rejects_ungrounded_timeline_chapter(service) -> None:
     payload["chapters"][0]["evidence"] = []
     with pytest.raises(JobStateError, match="时间轴章节 1 缺少可核验证据"):
         service.submit_analysis(completed.result["entry_id"], payload, producer="test-agent")
+
+
+def test_provider_analysis_prunes_untraceable_evidence(service) -> None:
+    payload = analysis_payload("tutorial", {"goal": "测试证据"})
+    payload["chapters"][0]["evidence"].append(
+        {"timestamp_ms": 55000, "quote": "虚构引文", "evidence_type": "audio"}
+    )
+    payload["knowledge_atoms"][0]["quote"] = "虚构引文"
+    analysis = AnalysisResult.model_validate(payload)
+    context = {
+        "metadata": {"duration_seconds": 20},
+        "transcript_corrected": [
+            {"start_ms": 5000, "end_ms": 6000, "text": "筛选信息源要看它能否提供一手证据"}
+        ],
+        "ocr": [{"timestamp_ms": 0, "text": "财经媒体筛选"}],
+    }
+
+    audit: list[dict] = []
+    cleaned, removed = service._prune_unverified_analysis_evidence(
+        analysis,
+        context,
+        audit=audit,
+    )
+
+    assert removed == 2
+    assert len(cleaned.chapters) == 2
+    assert len(cleaned.chapters[0].evidence) == 1
+    assert cleaned.knowledge_atoms == []
+    assert len(audit) == 2
+    assert all("引文" in item["reason"] for item in audit)
+    service._validate_analysis_evidence(cleaned, context)
+
+
+def test_provider_repairs_timestamp_from_exact_quote(service) -> None:
+    payload = analysis_payload("tutorial", {"goal": "测试证据"})
+    payload["knowledge_atoms"][0]["timestamp_ms"] = 55000
+    analysis = AnalysisResult.model_validate(payload)
+    context = {
+        "metadata": {"duration_seconds": 20},
+        "transcript_corrected": [
+            {"start_ms": 5000, "end_ms": 6000, "text": "筛选信息源要看它能否提供一手证据"}
+        ],
+        "ocr": [{"timestamp_ms": 0, "text": "财经媒体筛选"}],
+    }
+    audit: list[dict] = []
+    cleaned, removed = service._prune_unverified_analysis_evidence(
+        analysis,
+        context,
+        audit=audit,
+    )
+    assert removed == 0
+    assert audit == []
+    assert cleaned.knowledge_atoms[0].timestamp_ms == 5000
+
+
+def test_provider_repairs_video_locator_and_inference_type(service) -> None:
+    payload = analysis_payload("tutorial", {"goal": "测试证据"})
+    payload["knowledge_atoms"][0]["image_index"] = 1
+    payload["knowledge_atoms"].append(
+        {
+            "id": "inference-1",
+            "statement": "需要人工判断",
+            "atom_type": "fact",
+            "provenance": "ai_inference",
+        }
+    )
+    analysis = AnalysisResult.model_validate(payload)
+    context = {
+        "metadata": {"duration_seconds": 20},
+        "transcript_corrected": [
+            {"start_ms": 5000, "end_ms": 6000, "text": "筛选信息源要看它能否提供一手证据"}
+        ],
+        "ocr": [{"timestamp_ms": 0, "text": "财经媒体筛选"}],
+    }
+    cleaned, removed = service._prune_unverified_analysis_evidence(analysis, context)
+    assert removed == 0
+    assert cleaned.knowledge_atoms[0].image_index is None
+    assert cleaned.knowledge_atoms[1].atom_type == "inference"
 
 
 @pytest.mark.asyncio
@@ -328,13 +404,7 @@ async def test_reanalysis_does_not_recreate_deleted_entry(service, monkeypatch) 
     data["analysis"].pop("analysis_version", None)
     service.database.upsert_entry(entry, data)
     source_path = service.config.vault_path / entry.source_path
-    machine_path = (
-        service.config.vault_path
-        / "wiki"
-        / ".data"
-        / "sources"
-        / f"{entry.video_id}.md"
-    )
+    machine_path = service.config.vault_path / "wiki" / ".data" / "sources" / f"{entry.video_id}.md"
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -443,9 +513,9 @@ async def test_database_can_be_rebuilt_from_machine_markdown(service) -> None:
     completed = await Worker(service).run_once()
     entry_id = completed.result["entry_id"]
     original = service.database.get_entry(entry_id)
-    topic_id = service.create_topic(
-        "重建测试专题", [entry_id], goal="验证 Markdown 是长期事实源"
-    )["topic"]["id"]
+    topic_id = service.create_topic("重建测试专题", [entry_id], goal="验证 Markdown 是长期事实源")[
+        "topic"
+    ]["id"]
     service.save_topic_note(topic_id, "重建后仍应存在", confirmed=True)
 
     preview = service.rebuild_database_from_vault()

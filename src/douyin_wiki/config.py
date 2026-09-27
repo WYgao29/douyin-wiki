@@ -54,6 +54,7 @@ class LLMSettings(BaseModel):
     enable_thinking: bool | None = None
     thinking_budget: int | None = Field(default=None, ge=0)
     max_output_tokens: int | None = Field(default=None, ge=256, le=32768)
+    context_window_tokens: int = Field(default=65536, ge=1024)
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -204,6 +205,7 @@ def render_default_config(config: AppConfig | None = None) -> str:
             f"max_output_tokens = {cfg.llm.max_output_tokens}\n"
             if cfg.llm.max_output_tokens is not None
             else "",
+            f"context_window_tokens = {cfg.llm.context_window_tokens}\n",
         ]
     )
     profile = (

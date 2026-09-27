@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from .config import llm_is_configured
 from .errors import JobStateError
 from .models import CaptureOptions, InspirationInput, JobStatus, RetentionPolicy
 from .operation import (
@@ -18,6 +21,7 @@ from .operation import (
     sanitize_public_payload,
     worker_is_fresh,
 )
+from .secrets import get_secret
 from .setup import doctor
 from .time_utils import beijing_iso, format_beijing, parse_datetime
 from .web_auth import WebAuthManager
@@ -125,6 +129,7 @@ class WebOperationService:
         else:
             extra = {}
         extra["timeline"] = timeline
+        extra["analysis_evidence_audit"] = job.artifacts.get("analysis_evidence_audit", [])
         extra["children"] = children
         extra["child_stats"] = self._child_stats(children)
         if job.status == JobStatus.NEEDS_REVIEW:
@@ -362,6 +367,30 @@ class WebOperationService:
                 else "尚未执行",
             }
         )
+
+    async def model_health(self) -> dict[str, str]:
+        if self.analysis_mode != "provider":
+            return {"status": "inactive", "message": "当前分析方式不使用后台模型"}
+        settings = self.core.config.llm
+        api_key = get_secret(settings.api_key_env)
+        if not llm_is_configured(settings, api_key):
+            return {"status": "unconfigured", "message": "后台模型尚未配置"}
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.get(
+                    f"{settings.base_url.rstrip('/')}/models",
+                    headers=headers,
+                )
+            if response.status_code == 200:
+                return {"status": "ready", "message": "模型服务可连接"}
+            if response.status_code in {401, 403}:
+                return {"status": "auth", "message": "模型服务拒绝授权"}
+            if response.status_code in {404, 405}:
+                return {"status": "unknown", "message": "模型接口未提供状态检查"}
+            return {"status": "unavailable", "message": f"模型服务返回 HTTP {response.status_code}"}
+        except httpx.HTTPError:
+            return {"status": "unavailable", "message": "无法连接模型服务"}
 
     def run_doctor(self) -> dict[str, Any]:
         return sanitize_public_payload(doctor(self.core.config))

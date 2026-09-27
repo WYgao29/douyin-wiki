@@ -52,6 +52,27 @@ def test_gateway_waiting_is_not_described_as_automatic_analysis() -> None:
     assert "正在自动" not in message
 
 
+def test_job_presentation_exposes_model_progress_and_stats() -> None:
+    progress = {
+        "phase": "analysis",
+        "completed_chunks": 3,
+        "total_chunks": 11,
+        "last_response_at": "2026-09-27T00:00:00+00:00",
+    }
+    stats = {"successful_calls": 3, "retry_count": 1}
+    job = _job(
+        JobStatus.ANALYZING,
+        artifacts={
+            "analysis_progress": progress,
+            "llm_stats": stats,
+        },
+    )
+    presented = present_job(job, analysis_mode="provider")
+    assert presented["analysis_progress"] == progress
+    assert presented["llm_stats"] == stats
+    assert "analysis_evidence_audit" not in presented
+
+
 def test_sanitize_public_payload_drops_secret_fields_but_keeps_token_hint() -> None:
     payload = sanitize_public_payload(
         {

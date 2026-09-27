@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import httpx
 from fastapi.testclient import TestClient
 
+from douyin_wiki.config import LLMSettings
 from douyin_wiki.models import (
+    AnalysisMode,
     AuthCheckResult,
     CaptureRequest,
     InspirationInput,
@@ -11,6 +14,38 @@ from douyin_wiki.models import (
 )
 from douyin_wiki.webapp.app import create_app
 from tests.test_web import _web_fixture
+
+
+def test_model_health_reports_actual_provider_reachability(tmp_path, monkeypatch) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+    with TestClient(app) as client:
+        assert client.get("/api/system/model-health").json()["status"] == "inactive"
+
+    config.analysis_mode = AnalysisMode.PROVIDER
+    config.llm = LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model")
+    client_type = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"data": []}))
+    monkeypatch.setattr(
+        "douyin_wiki.web_operation.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    app = create_app(config, service=service, start_watcher=False)
+    with TestClient(app) as client:
+        assert client.get("/api/system/model-health").json()["status"] == "ready"
+
+
+def test_evidence_audit_is_available_in_job_detail_only(tmp_path) -> None:
+    config, service = _web_fixture(tmp_path)
+    job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    audit = [{"kind": "knowledge_atom", "id": "a1", "reason": "引文无法定位"}]
+    service.database.update_job(job.id, artifacts={"analysis_evidence_audit": audit})
+    app = create_app(config, service=service, start_watcher=False)
+    with TestClient(app) as client:
+        detail = client.get(f"/api/jobs/{job.id}").json()
+        listing = client.get("/api/jobs").json()
+    assert detail["analysis_evidence_audit"] == audit
+    assert all("analysis_evidence_audit" not in item for item in listing["items"])
 
 
 class FakeAuthDownloader:
@@ -197,7 +232,7 @@ def test_delete_import_history_keeps_entries(tmp_path) -> None:
     with service.database.connect() as conn:
         conn.execute(
             "INSERT INTO favorites_runs(parent_id, options_json, confirmed) VALUES (?,?,1)",
-            (parent.id, "{\"folder_ids\": null, \"include_images\": false}"),
+            (parent.id, '{"folder_ids": null, "include_images": false}'),
         )
     entry_id = service.database.list_entries()[0].id
     app = create_app(config, service=service, start_watcher=False)
@@ -238,13 +273,9 @@ def test_review_and_gateway_payloads(tmp_path) -> None:
     with TestClient(app) as client:
         review = client.get(f"/api/jobs/{job.id}/review").json()
         assert review["issues"][0]["id"] == "iss-1"
-        rejected = client.post(
-            f"/api/jobs/{job.id}/review", json={"resolutions": {"other": "x"}}
-        )
+        rejected = client.post(f"/api/jobs/{job.id}/review", json={"resolutions": {"other": "x"}})
         assert rejected.status_code == 409
-        accepted = client.post(
-            f"/api/jobs/{job.id}/review", json={"accept_uncertain": True}
-        )
+        accepted = client.post(f"/api/jobs/{job.id}/review", json={"accept_uncertain": True})
         assert accepted.status_code == 202
 
 

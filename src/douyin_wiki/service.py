@@ -2650,9 +2650,8 @@ class DouyinWikiService:
                         audio_path.unlink(missing_ok=True)
                         if source == video_path:
                             detail = str(exc.details.get("stderr", "")).lower()
-                            no_audio = (
-                                "does not contain any stream" in detail
-                                or "没有音轨" in str(exc)
+                            no_audio = "does not contain any stream" in detail or "没有音轨" in str(
+                                exc
                             )
                             if not no_audio:
                                 raise
@@ -2666,7 +2665,8 @@ class DouyinWikiService:
                 try:
                     transcript = (
                         await self.transcriber.transcribe(audio_path, work_dir / "whisper")
-                        if audio_ready else []
+                        if audio_ready
+                        else []
                     )
                     frames = await self.media.extract_frames(
                         video_path,
@@ -2709,6 +2709,77 @@ class DouyinWikiService:
         ]
         ocr_items = artifacts.get("ocr", [])
 
+        checkpoints = artifacts.setdefault("llm_checkpoints", {})
+        model_stats = artifacts.setdefault(
+            "llm_stats",
+            {
+                "successful_calls": 0,
+                "http_requests": 0,
+                "retry_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        )
+        last_model_response_at = (artifacts.get("analysis_progress") or {}).get("last_response_at")
+        last_model_usage = (artifacts.get("analysis_progress") or {}).get("usage", {})
+
+        def save_checkpoint(_fingerprint: str, _value: dict[str, Any]) -> None:
+            nonlocal last_model_response_at, last_model_usage
+            last_model_response_at = utc_now().isoformat()
+            last_model_usage = getattr(self.analysis, "last_usage", {}).copy()
+            increments = {
+                "successful_calls": 1,
+                "http_requests": last_model_usage.get("request_count", 1),
+                "retry_count": last_model_usage.get("retry_count", 0),
+                "input_tokens": last_model_usage.get(
+                    "input_tokens",
+                    last_model_usage.get("prompt_tokens", 0),
+                ),
+                "output_tokens": last_model_usage.get(
+                    "output_tokens",
+                    last_model_usage.get("completion_tokens", 0),
+                ),
+            }
+            for key, amount in increments.items():
+                model_stats[key] = int(model_stats.get(key, 0)) + amount
+            detail = {
+                **(artifacts.get("analysis_progress") or {}),
+                "last_response_at": last_model_response_at,
+                "usage": last_model_usage,
+            }
+            artifacts["analysis_progress"] = detail
+            self.database.update_job(
+                job.id,
+                artifacts={
+                    "llm_checkpoints": checkpoints,
+                    "analysis_progress": detail,
+                    "llm_stats": model_stats,
+                },
+            )
+
+        def model_progress(phase: str, completed: int, total: int) -> None:
+            current_progress = self.database.get_job(job.id).progress
+            target = (
+                0.62 + 0.04 * completed / max(total, 1)
+                if phase == "correction"
+                else 0.70 + 0.08 * completed / max(total, 1)
+                if phase == "analysis"
+                else 0.79
+            )
+            detail = {
+                "phase": phase,
+                "completed_chunks": completed,
+                "total_chunks": total,
+                "last_response_at": last_model_response_at,
+                "usage": last_model_usage,
+            }
+            artifacts["analysis_progress"] = detail
+            self.database.update_job(
+                job.id,
+                progress=max(current_progress, target),
+                artifacts={"analysis_progress": detail},
+            )
+
         if (
             self.config.analysis_mode == AnalysisMode.GATEWAY
             and "transcript_corrected" not in artifacts
@@ -2726,9 +2797,19 @@ class DouyinWikiService:
 
         if "transcript_corrected" not in artifacts:
             async with self.analysis_semaphore:
+                correction_kwargs = (
+                    {
+                        "checkpoints": checkpoints,
+                        "on_checkpoint": save_checkpoint,
+                        "on_progress": model_progress,
+                    }
+                    if isinstance(self.analysis, OpenAICompatibleProvider)
+                    else {}
+                )
                 corrected, llm_issues = await self.analysis.correct_transcript(
                     transcript_raw,
                     [self._ocr_model(item) for item in ocr_items],
+                    **correction_kwargs,
                 )
             issues = _deduplicate_issues([*detect_review_issues(transcript_raw), *llm_issues])
             artifacts["transcript_corrected"] = [item.model_dump(mode="json") for item in corrected]
@@ -2772,36 +2853,84 @@ class DouyinWikiService:
                 unlock=True,
             )
 
-        self.database.update_job(job.id, status=JobStatus.ANALYZING, progress=0.7)
+        self.database.update_job(
+            job.id,
+            status=JobStatus.ANALYZING,
+            progress=max(self.database.get_job(job.id).progress, 0.7),
+        )
         if "analysis" not in artifacts:
-            analysis_metadata = metadata.model_dump(mode="json")
-            if metadata.image_paths:
-                analysis_metadata["images"] = [
-                    {"image_index": index} for index in range(1, len(metadata.image_paths) + 1)
-                ]
-            for private_path_key in ("image_paths", "thumbnail_path", "media_path"):
-                analysis_metadata.pop(private_path_key, None)
-            context_text = "\n".join(
-                [
-                    *[inspiration.text for inspiration in effective_inspirations],
-                    *[segment.text for segment in corrected],
-                ]
-            )
-            analysis_metadata["existing_knowledge"] = self.indexer.find_related_claims(context_text)
-            async with self.analysis_semaphore:
-                analysis = await self.analysis.analyze(
-                    corrected,
-                    [self._ocr_model(item) for item in ocr_items],
-                    effective_inspirations,
-                    analysis_metadata,
+            if "analysis_candidate" in artifacts:
+                analysis = AnalysisResult.model_validate(artifacts["analysis_candidate"])
+            else:
+                analysis_metadata = metadata.model_dump(mode="json")
+                if metadata.image_paths:
+                    analysis_metadata["images"] = [
+                        {"image_index": index} for index in range(1, len(metadata.image_paths) + 1)
+                    ]
+                for private_path_key in ("image_paths", "thumbnail_path", "media_path"):
+                    analysis_metadata.pop(private_path_key, None)
+                context_text = "\n".join(
+                    [
+                        *[inspiration.text for inspiration in effective_inspirations],
+                        *[segment.text for segment in corrected],
+                    ]
                 )
-            self._validate_analysis_evidence(
-                analysis,
-                {**artifacts, "metadata": metadata.model_dump(mode="json")},
-            )
+                analysis_metadata["existing_knowledge"] = self.indexer.find_related_claims(
+                    context_text
+                )
+                async with self.analysis_semaphore:
+                    analysis_kwargs = (
+                        {
+                            "checkpoints": checkpoints,
+                            "on_checkpoint": save_checkpoint,
+                            "on_progress": model_progress,
+                        }
+                        if isinstance(self.analysis, OpenAICompatibleProvider)
+                        else {}
+                    )
+                    analysis = await self.analysis.analyze(
+                        corrected,
+                        [self._ocr_model(item) for item in ocr_items],
+                        effective_inspirations,
+                        analysis_metadata,
+                        **analysis_kwargs,
+                    )
+                artifacts["analysis_candidate"] = analysis.model_dump(mode="json")
+                self.database.update_job(
+                    job.id,
+                    artifacts={"analysis_candidate": artifacts["analysis_candidate"]},
+                    progress=0.8,
+                )
+            evidence_context = {**artifacts, "metadata": metadata.model_dump(mode="json")}
+            if self.config.analysis_mode == AnalysisMode.PROVIDER:
+                audit: list[dict[str, Any]] = []
+                analysis, removed = self._prune_unverified_analysis_evidence(
+                    analysis,
+                    evidence_context,
+                    audit=audit,
+                )
+                artifacts["analysis_evidence_audit"] = audit
+                if removed:
+                    artifacts["analysis_evidence_warning"] = (
+                        f"模型生成的 {removed} 条无法核实的证据或内容已移除"
+                    )
+                model_progress("evidence", 1, 1)
+            self._validate_analysis_evidence(analysis, evidence_context)
             artifacts["analysis"] = analysis.model_dump(mode="json")
+            artifacts["llm_checkpoints"] = {}
             self.database.update_job(
-                job.id, artifacts={"analysis": artifacts["analysis"]}, progress=0.83
+                job.id,
+                artifacts={
+                    "analysis": artifacts["analysis"],
+                    "llm_checkpoints": {},
+                    "analysis_evidence_audit": artifacts.get("analysis_evidence_audit", []),
+                    **(
+                        {"analysis_evidence_warning": artifacts["analysis_evidence_warning"]}
+                        if artifacts.get("analysis_evidence_warning")
+                        else {}
+                    ),
+                },
+                progress=0.83,
             )
 
         now = utc_now()
@@ -2924,8 +3053,12 @@ class DouyinWikiService:
         warnings = []
         if artifacts.get("ocr_warning"):
             warnings.append(f"OCR 未完成：{artifacts['ocr_warning']}")
+        if artifacts.get("transcript_skipped") == "no_audio_available":
+            warnings.append("视频无音轨，未生成逐字稿；分析仅依据画面文字和作品信息")
         if self.config.analysis_mode != AnalysisMode.GATEWAY and not self.analysis.configured:
             warnings.append("模型未配置，使用本地降级分析")
+        if artifacts.get("analysis_evidence_warning"):
+            warnings.append(artifacts["analysis_evidence_warning"])
         status = JobStatus.COMPLETED_WITH_WARNINGS if warnings else JobStatus.COMPLETED
         return self.database.update_job(
             job.id,
@@ -4029,6 +4162,158 @@ class DouyinWikiService:
             )
             for observation in observations
         ]
+
+    def _prune_unverified_analysis_evidence(
+        self,
+        analysis: AnalysisResult,
+        context: dict[str, Any],
+        *,
+        audit: list[dict[str, Any]] | None = None,
+    ) -> tuple[AnalysisResult, int]:
+        """Keep only model citations that pass the existing source evidence checks."""
+        try:
+            self._validate_analysis_evidence(analysis, context)
+            return analysis, 0
+        except JobStateError:
+            pass
+
+        base = analysis.model_copy(update={"chapters": [], "knowledge_atoms": [], "reminders": []})
+
+        def error(candidate: AnalysisResult) -> str | None:
+            try:
+                self._validate_analysis_evidence(candidate, context)
+                return None
+            except JobStateError as exc:
+                return str(exc)
+
+        def record(kind: str, item: Any, reason: str, *, chapter: Any = None) -> None:
+            if audit is not None:
+                audit.append(
+                    {
+                        "kind": kind,
+                        "id": getattr(item, "id", None),
+                        "chapter_title": getattr(chapter, "title", None),
+                        "chapter_start_ms": getattr(chapter, "start_ms", None),
+                        "timestamp_ms": getattr(item, "timestamp_ms", None),
+                        "quote": getattr(item, "quote", None),
+                        "reason": reason,
+                    }
+                )
+
+        def repair_timestamp(item: Any, provenance: str) -> Any:
+            quote = _normalize_evidence_text(getattr(item, "quote", "") or "")
+            if not quote or provenance not in {"audio", "ocr", "audio+ocr"}:
+                return item
+            candidates: list[tuple[int, str]] = []
+            if provenance in {"audio", "audio+ocr"}:
+                for source in context.get("transcript_corrected") or context.get(
+                    "transcript_raw", []
+                ):
+                    candidates.append(
+                        (
+                            int(
+                                source.get("start_ms", 0)
+                                if isinstance(source, dict)
+                                else source.start_ms
+                            ),
+                            str(
+                                source.get("text", "") if isinstance(source, dict) else source.text
+                            ),
+                        )
+                    )
+            if provenance in {"ocr", "audio+ocr"}:
+                for source in context.get("ocr", []):
+                    timestamp = (
+                        source.get("timestamp_ms")
+                        if isinstance(source, dict)
+                        else source.timestamp_ms
+                    )
+                    if timestamp is not None:
+                        candidates.append(
+                            (
+                                int(timestamp),
+                                str(
+                                    source.get("text", "")
+                                    if isinstance(source, dict)
+                                    else source.text
+                                ),
+                            )
+                        )
+            matching = [
+                timestamp
+                for timestamp, text in candidates
+                if quote in _normalize_evidence_text(text)
+            ]
+            if not matching:
+                return item
+            original = getattr(item, "timestamp_ms", None)
+            best = min(matching, key=lambda value: abs(value - (original or 0)))
+            return item.model_copy(update={"timestamp_ms": best})
+
+        removed = 0
+        chapters = []
+        for chapter in analysis.chapters:
+            evidence = []
+            for item in chapter.evidence:
+                candidate_chapter = chapter.model_copy(update={"evidence": [item]})
+                reason = error(base.model_copy(update={"chapters": [candidate_chapter]}))
+                if reason and "时间戳" in reason:
+                    repaired = repair_timestamp(item, item.evidence_type)
+                    repaired_chapter = chapter.model_copy(update={"evidence": [repaired]})
+                    if error(base.model_copy(update={"chapters": [repaired_chapter]})) is None:
+                        item = repaired
+                        reason = None
+                if reason is None:
+                    evidence.append(item)
+                else:
+                    removed += 1
+                    record("chapter_evidence", item, reason, chapter=chapter)
+            if evidence:
+                chapters.append(chapter.model_copy(update={"evidence": evidence}))
+            else:
+                removed += 1
+                record("chapter", chapter, "章节没有可核验证据", chapter=chapter)
+
+        atoms = []
+        seen_atom_ids: set[str] = set()
+        for atom in analysis.knowledge_atoms:
+            if atom.provenance in {"audio", "ocr", "audio+ocr"} and atom.image_index is not None:
+                atom = atom.model_copy(update={"image_index": None})
+            if atom.provenance == "ai_inference" and atom.atom_type != "inference":
+                atom = atom.model_copy(update={"atom_type": "inference"})
+            reason = error(base.model_copy(update={"knowledge_atoms": [atom]}))
+            if atom.id in seen_atom_ids:
+                reason = f"知识原子 id 重复：{atom.id}"
+            if reason and "时间戳" in reason:
+                repaired = repair_timestamp(atom, atom.provenance)
+                if error(base.model_copy(update={"knowledge_atoms": [repaired]})) is None:
+                    atom = repaired
+                    reason = None
+            if reason is None:
+                atoms.append(atom)
+                seen_atom_ids.add(atom.id)
+            else:
+                removed += 1
+                record("knowledge_atom", atom, reason)
+
+        reminders = []
+        for reminder in analysis.reminders:
+            reason = error(base.model_copy(update={"reminders": [reminder]}))
+            if reason is None:
+                reminders.append(reminder)
+            else:
+                removed += 1
+                record("reminder", reminder, reason)
+
+        cleaned = analysis.model_copy(
+            update={
+                "chapters": chapters,
+                "knowledge_atoms": atoms,
+                "reminders": reminders,
+            }
+        )
+        self._validate_analysis_evidence(cleaned, context)
+        return cleaned, removed
 
     def _validate_analysis_evidence(
         self, analysis: AnalysisResult, context: dict[str, Any]

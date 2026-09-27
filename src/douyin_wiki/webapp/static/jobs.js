@@ -105,6 +105,19 @@
     pill.dataset.state = job.status;
     header.append(titleBox, pill);
     const progress = D.node("p", `阶段 ${job.stage_label} · 进度 ${Math.round((job.progress || 0) * 100)}%`);
+    const modelProgress = D.node("p", "", "hint-copy");
+    if (job.analysis_progress) {
+      const state = job.analysis_progress;
+      const phases = {correction: "字幕校正", analysis: "分段分析", merge: "汇总", evidence: "证据校验"};
+      const count = state.phase === "merge" ? ` · 已完成 ${state.completed_chunks} 次合并`
+        : state.phase === "evidence" ? "" : ` · ${state.completed_chunks}/${state.total_chunks} 批`;
+      const responseAt = state.last_response_at ? new Date(state.last_response_at).toLocaleString("zh-CN") : "等待首个响应";
+      const usage = state.usage?.prompt_tokens != null ? ` · 最近输入 ${state.usage.prompt_tokens} tokens，输出 ${state.usage.completion_tokens || 0} tokens${state.usage.retry_count ? `，重试 ${state.usage.retry_count} 次` : ""}` : "";
+      const waitingMinutes = state.last_response_at ? Math.floor((Date.now() - Date.parse(state.last_response_at)) / 60000) : 0;
+      const waiting = job.status === "analyzing" && waitingMinutes >= 5 ? ` · 当前批次已等待 ${waitingMinutes} 分钟` : "";
+      const totalCalls = job.llm_stats?.successful_calls ? ` · 累计成功调用 ${job.llm_stats.successful_calls} 次` : "";
+      modelProgress.textContent = `${phases[state.phase] || state.phase}${count} · 最近模型响应 ${responseAt}${usage}${totalCalls}${waiting}`;
+    }
     const actions = D.node("div", null, "operation-actions");
     const action = actionButton(job.next_action, job.id);
     if (action) actions.append(action);
@@ -114,6 +127,7 @@
       actions.append(link);
     }
     const analysis = D.node("p", `${job.analysis_mode_label || ""}`, "hint-copy");
+    const modelHealth = D.node("p", "", "hint-copy");
     const timeline = D.node("ol", null, "job-timeline");
     for (const event of job.timeline || []) {
       const item = D.node("li", `${event.state_label} · ${event.created_display}`);
@@ -179,7 +193,22 @@
       form.append(save, accept);
       review.append(form);
     }
-    root.replaceChildren(header, progress, actions, analysis, timeline, children, review);
+    const evidenceAudit = D.node("section", null, "review-panel");
+    if (job.analysis_evidence_audit?.length) {
+      evidenceAudit.append(D.node("h2", `证据核验记录（${job.analysis_evidence_audit.length}）`));
+      for (const item of job.analysis_evidence_audit) {
+        evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${item.timestamp_ms == null ? "" : ` · ${item.timestamp_ms}ms`}：${item.reason}`));
+      }
+    }
+    root.replaceChildren(header, progress, modelProgress, modelHealth, actions, analysis, timeline, children, review, evidenceAudit);
+    if (job.analysis_mode === "provider") {
+      try {
+        const health = await D.api("/api/system/model-health");
+        modelHealth.textContent = `模型服务：${health.message}`;
+      } catch (error) {
+        modelHealth.textContent = `模型服务状态暂不可查：${error.message}`;
+      }
+    }
   }
 
   async function loadFromPath(path) {
