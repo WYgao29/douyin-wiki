@@ -117,7 +117,7 @@ class ImportMixin:
         )
         summary = self.database.creator_inventory_summary(job_id)
         self.database.update_job(job_id, result={**job.result, "selection": summary})
-        self._refresh_creator_documents(str(job.artifacts["creator_id"]), action="selection")
+        self.refresh_creator_documents(str(job.artifacts["creator_id"]), action="selection")
         return {"job_id": job_id, "changed": changed, "selection": summary}
 
     def confirm_creator_import(self, job_id: str, *, accept_partial: bool = False) -> JobRecord:
@@ -186,7 +186,7 @@ class ImportMixin:
             result=result,
             unlock=True,
         )
-        self._refresh_creator_documents(creator_id, action="confirm-import")
+        self.refresh_creator_documents(creator_id, action="confirm-import")
         return updated
 
     def import_creator_works(
@@ -246,7 +246,7 @@ class ImportMixin:
             item.model_dump(mode="json") for item in self.database.list_creator_works(creator_id)
         ]
 
-    async def _process_creator_import(self, job: JobRecord) -> JobRecord:
+    async def process_creator_import(self, job: JobRecord) -> JobRecord:
         artifacts = dict(job.artifacts)
         action = str(artifacts.get("creator_action") or "initial")
         self.database.update_job(job.id, status=JobStatus.RESOLVING, progress=0.05)
@@ -302,7 +302,7 @@ class ImportMixin:
             "next_tool": "get_creator_inventory" if summary["total"] else None,
         }
         self.database.update_job(job.id, artifacts=artifacts_update)
-        self._refresh_creator_documents(creator.id, action=f"inventory-{action}")
+        self.refresh_creator_documents(creator.id, action=f"inventory-{action}")
         if not summary["total"] and inventory.complete:
             return self.database.update_job(
                 job.id,
@@ -371,7 +371,7 @@ class ImportMixin:
         return persisted
 
     @staticmethod
-    def _creator_context(creator_id: str, folder_path: str, work_id: str) -> dict[str, Any]:
+    def creator_context(creator_id: str, folder_path: str, work_id: str) -> dict[str, Any]:
         return {
             "id": creator_id,
             "folder_path": folder_path,
@@ -380,7 +380,7 @@ class ImportMixin:
             "batch_silent": False,
         }
 
-    def _adopt_creator_capture(
+    def adopt_creator_capture(
         self,
         metadata: VideoMetadata,
         *,
@@ -410,7 +410,7 @@ class ImportMixin:
                 thumbnail_path=metadata.thumbnail_path,
             ),
         )
-        return self._creator_context(creator.id, creator.folder_path, work_id), metadata, target_dir
+        return self.creator_context(creator.id, creator.folder_path, work_id), metadata, target_dir
 
     @staticmethod
     def _relocate_capture_metadata(
@@ -450,7 +450,7 @@ class ImportMixin:
             }
         )
 
-    def _refresh_creator_documents(self, creator_id: str, *, action: str) -> None:
+    def refresh_creator_documents(self, creator_id: str, *, action: str) -> None:
         if not creator_id:
             return
         creator = self.database.get_creator(creator_id)
@@ -461,9 +461,9 @@ class ImportMixin:
             root_index = self.vault.rebuild_index(entries)
             changed.append(root_index)
             if (self.config.vault_path / ".git").exists():
-                self._commit_vault(changed, f"creator: {creator.nickname} {action}")
+                self.commit_vault(changed, f"creator: {creator.nickname} {action}")
 
-    def _refresh_creator_parent(self, parent_job_id: str) -> None:
+    def refresh_creator_parent(self, parent_job_id: str) -> None:
         if not parent_job_id:
             return
         with suppress(JobStateError):

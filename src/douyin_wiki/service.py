@@ -130,7 +130,7 @@ class DouyinWikiService(
             statuses = self.vault.migrate_visible_status_labels()
             times = self.vault.migrate_visible_times_to_beijing()
             self.database.initialize()
-            self._recover_entry_trash_operations_locked()
+            self.recover_entry_trash_operations_locked()
             creator_views = self._migrate_creator_views()
             if initialize_git:
                 self.vault.commit(
@@ -147,7 +147,7 @@ class DouyinWikiService(
                 statuses = self.vault.migrate_visible_status_labels()
                 times = self.vault.migrate_visible_times_to_beijing()
             self.database.initialize()
-            self._recover_entry_trash_operations_locked()
+            self.recover_entry_trash_operations_locked()
             with self.vault.locked():
                 creator_views = self._migrate_creator_views()
                 self.vault.commit(
@@ -368,13 +368,13 @@ class DouyinWikiService(
             if job.kind == "favorites_import":
                 outcome = await self.favorites.process(job)
             elif job.kind == "creator_import":
-                outcome = await self._process_creator_import(job)
+                outcome = await self.process_creator_import(job)
             elif job.kind == "reanalyze":
-                outcome = await self._process_reanalysis(job)
+                outcome = await self.process_reanalysis(job)
             elif job.kind == "media_restore":
-                outcome = await self._process_media_restore(job)
+                outcome = await self.process_media_restore(job)
             else:
-                outcome = await self._process_capture(job)
+                outcome = await self.process_capture(job)
         except JobLeaseLostError:
             raise
         except (BrowserAuthRequiredError, CookieRequiredError) as exc:
@@ -431,10 +431,10 @@ class DouyinWikiService(
                         str(creator_context.get("work_id")),
                         entry_id,
                     )
-                    self._refresh_creator_documents(
+                    self.refresh_creator_documents(
                         str(creator_context.get("id")), action="work-imported"
                     )
-            self._refresh_creator_parent(str(creator_context.get("parent_job_id") or ""))
+            self.refresh_creator_parent(str(creator_context.get("parent_job_id") or ""))
         return outcome
 
 
@@ -446,7 +446,7 @@ class DouyinWikiService(
 
 
 
-    def _prepare_entry_bundle(
+    def prepare_entry_bundle(
         self,
         entry: EntryRecord,
         data: dict[str, Any],
@@ -463,7 +463,7 @@ class DouyinWikiService(
         ]
         return chunks, relations, reminder_values
 
-    def _write_entry_documents(
+    def write_entry_documents(
         self,
         entry: EntryRecord,
         data: dict[str, Any],
@@ -486,9 +486,9 @@ class DouyinWikiService(
                     [*written.changed_paths, index],
                 )
                 changed.append(log)
-            self._commit_vault(changed, commit_message)
+            self.commit_vault(changed, commit_message)
 
-    def _persist_entry_documents_and_bundle(
+    def persist_entry_documents_and_bundle(
         self,
         entry: EntryRecord,
         data: dict[str, Any],
@@ -503,7 +503,7 @@ class DouyinWikiService(
     ) -> EntryRecord:
         """Commit one entry mutation under the cross-process operation lock."""
         with self.vault.entry_operations_locked():
-            return self._persist_entry_documents_and_bundle_locked(
+            return self.persist_entry_documents_and_bundle_locked(
                 entry,
                 data,
                 chunks,
@@ -515,7 +515,7 @@ class DouyinWikiService(
                 require_existing=require_existing,
             )
 
-    def _persist_entry_documents_and_bundle_locked(
+    def persist_entry_documents_and_bundle_locked(
         self,
         entry: EntryRecord,
         data: dict[str, Any],
@@ -531,7 +531,7 @@ class DouyinWikiService(
         """Persist an entry while the caller already owns the operation lock."""
         if require_existing:
             self.database.get_entry(entry.id)
-        self._write_entry_documents(
+        self.write_entry_documents(
             entry,
             data,
             action=action,
@@ -546,7 +546,7 @@ class DouyinWikiService(
 
 
 
-    def _commit_vault(self, changed: list[Path], message: str) -> bool:
+    def commit_vault(self, changed: list[Path], message: str) -> bool:
         if not (self.config.vault_path / ".git").exists():
             return True
         committed = self.vault.commit(changed, message)
@@ -567,11 +567,11 @@ class DouyinWikiService(
 
 
 
-    def _vault_path(self, value: str | Path) -> Path:
+    def vault_path(self, value: str | Path) -> Path:
         path = Path(value)
         return path if path.is_absolute() else self.config.vault_path / path
 
-    def _vault_relative(self, path: Path) -> str:
+    def vault_relative(self, path: Path) -> str:
         return str(path.resolve().relative_to(self.config.vault_path.resolve()))
 
 
@@ -583,12 +583,12 @@ class DouyinWikiService(
 
 
     @staticmethod
-    def _ocr_model(value: dict[str, Any]):
+    def ocr_model(value: dict[str, Any]):
         from .models import OCRObservation
 
         return OCRObservation.model_validate(value)
 
-    def _normalize_contradictions(
+    def normalize_contradictions(
         self, values: list[dict[str, Any]], current_entry_id: str
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []

@@ -1733,7 +1733,7 @@ async def test_analysis_presplits_one_long_segment_and_preserves_coarse_citation
     assert {atom.statement for atom in result.knowledge_atoms} == {
         item["text"] for item in sent
     }
-    service._validate_analysis_evidence(
+    service.validate_analysis_evidence(
         result,
         {
             "metadata": {"source_kind": "video", "duration_seconds": 10},

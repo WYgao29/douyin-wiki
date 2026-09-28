@@ -30,9 +30,9 @@ from .time_utils import utc_now
 class EntriesMixin:
     def add_inspiration(self, entry_id: str, inspiration: InspirationInput) -> EntryRecord:
         with self.vault.entry_operations_locked():
-            return self._add_inspiration_locked(entry_id, inspiration)
+            return self.add_inspiration_locked(entry_id, inspiration)
 
-    def _add_inspiration_locked(self, entry_id: str, inspiration: InspirationInput) -> EntryRecord:
+    def add_inspiration_locked(self, entry_id: str, inspiration: InspirationInput) -> EntryRecord:
         entry = self.database.get_entry(entry_id)
         if inspiration in entry.inspirations:
             return entry
@@ -45,8 +45,8 @@ class EntriesMixin:
         data = self.database.get_entry_data(entry_id)
         data.pop("purposes", None)
         data["inspirations"] = [item.model_dump(mode="json") for item in entry.inspirations]
-        chunks, relations, reminders = self._prepare_entry_bundle(entry, data)
-        self._write_entry_documents(
+        chunks, relations, reminders = self.prepare_entry_bundle(entry, data)
+        self.write_entry_documents(
             entry,
             data,
             action="inspiration",
@@ -80,7 +80,7 @@ class EntriesMixin:
                     "updated_at": now,
                 }
             )
-            self._write_entry_documents(
+            self.write_entry_documents(
                 updated,
                 data,
                 action="favorite",
@@ -126,7 +126,7 @@ class EntriesMixin:
         )
 
     @staticmethod
-    def _topic_revision(
+    def topic_revision(
         entries: list[tuple[EntryRecord, bool]],
     ) -> tuple[str, list[SourceRevision]]:
         revisions = [
@@ -143,22 +143,22 @@ class EntriesMixin:
         ).hexdigest()
         return digest, revisions
 
-    def _refresh_topic(self, topic_id: str) -> ResearchTopic:
+    def refresh_topic(self, topic_id: str) -> ResearchTopic:
         topic = self.database.get_topic(topic_id)
         entries = [
             (self.database.get_entry(source.entry_id), source.enabled) for source in topic.sources
         ]
-        revision, _ = self._topic_revision(entries)
+        revision, _ = self.topic_revision(entries)
         if revision != topic.source_revision:
             topic = self.database.update_topic_revision(
                 topic_id,
                 source_revision=revision,
                 source_versions={entry.id: entry.updated_at.isoformat() for entry, _ in entries},
             )
-            self._persist_topic(topic)
+            self.persist_topic(topic)
         return topic
 
-    def _persist_topic(self, topic: ResearchTopic) -> list[Path]:
+    def persist_topic(self, topic: ResearchTopic) -> list[Path]:
         artifacts = self.database.list_topic_artifacts(topic.id)
         entries = {
             source.entry_id: self.database.get_entry(source.entry_id) for source in topic.sources
@@ -167,7 +167,7 @@ class EntriesMixin:
             changed = self.vault.write_topic(topic, artifacts, entries)
             topics_index = self.vault.write_topics_index(self.database.list_topics())
             changed.append(topics_index)
-            self._commit_vault(changed, f"docs: update topic {topic.id}")
+            self.commit_vault(changed, f"docs: update topic {topic.id}")
         return changed
 
     def create_topic(
@@ -196,7 +196,7 @@ class EntriesMixin:
         if not unique_ids:
             raise ValueError("请至少选择一篇文章作为专题来源")
         entries = [self.database.get_entry(entry_id) for entry_id in unique_ids]
-        revision, _ = self._topic_revision([(entry, True) for entry in entries])
+        revision, _ = self.topic_revision([(entry, True) for entry in entries])
         topic = self.database.create_topic(
             topic_id=f"topic-{uuid.uuid4().hex[:12]}",
             title=normalized_title[:200],
@@ -209,11 +209,11 @@ class EntriesMixin:
             [(entry.id, True, entry.updated_at.isoformat()) for entry in entries],
             source_revision=revision,
         )
-        self._persist_topic(topic)
+        self.persist_topic(topic)
         return self.get_topic(topic.id)
 
     def get_topic(self, topic_id: str) -> dict[str, Any]:
-        topic = self._refresh_topic(topic_id)
+        topic = self.refresh_topic(topic_id)
         artifacts = self.database.list_topic_artifacts(topic_id)
         return {
             "topic": topic.model_dump(mode="json"),
@@ -248,13 +248,13 @@ class EntriesMixin:
             ordered.append((self.database.get_entry(entry_id), bool(source.get("enabled", True))))
         if not ordered:
             raise ValueError("专题必须保留至少一篇来源")
-        revision, _ = self._topic_revision(ordered)
+        revision, _ = self.topic_revision(ordered)
         topic = self.database.set_topic_sources(
             topic_id,
             [(entry.id, enabled, entry.updated_at.isoformat()) for entry, enabled in ordered],
             source_revision=revision,
         )
-        self._persist_topic(topic)
+        self.persist_topic(topic)
         return self.get_topic(topic_id)
 
     def search_topic(
@@ -265,7 +265,7 @@ class EntriesMixin:
         include_stale: bool = False,
         limit: int = 10,
     ):
-        self._refresh_topic(topic_id)
+        self.refresh_topic(topic_id)
         entry_ids = self.database.enabled_topic_entry_ids(topic_id)
         return self.search_knowledge(
             query,
@@ -281,7 +281,7 @@ class EntriesMixin:
         if not enabled_sources:
             raise ValueError("当前专题没有启用的来源")
         enabled_entries = [self.database.get_entry(source.entry_id) for source in enabled_sources]
-        _, revisions = self._topic_revision([(entry, True) for entry in enabled_entries])
+        _, revisions = self.topic_revision([(entry, True) for entry in enabled_entries])
         per_source_budget = max(1200, min(14_000, 52_000 // len(enabled_sources)))
         contexts: list[dict[str, Any]] = []
         for source, entry in zip(enabled_sources, enabled_entries, strict=True):
@@ -332,7 +332,7 @@ class EntriesMixin:
         }
         if kind == "note":
             raise ValueError("用户笔记请使用 save_topic_note 保存")
-        topic = self._refresh_topic(topic_id)
+        topic = self.refresh_topic(topic_id)
         contexts, revisions = self._topic_context(topic)
         if provider is None:
             from .webapp.chat import OpenAICompatibleChatProvider
@@ -377,7 +377,7 @@ class EntriesMixin:
         if not any(entry_id in answer for entry_id in enabled_ids):
             raise ExternalToolError("专题成果缺少来源标注，未保存；请重试")
         with self.vault.entry_operations_locked():
-            latest_topic = self._refresh_topic(topic_id)
+            latest_topic = self.refresh_topic(topic_id)
             now = utc_now()
             artifact = TopicArtifact(
                 id=f"{kind}-{uuid.uuid4().hex[:12]}",
@@ -400,7 +400,7 @@ class EntriesMixin:
                 updated_at=now,
             )
             artifact = self.database.save_topic_artifact(artifact)
-            self._persist_topic(latest_topic)
+            self.persist_topic(latest_topic)
         return artifact.model_dump(mode="json")
 
     def save_topic_note(
@@ -416,7 +416,7 @@ class EntriesMixin:
         literal = content.strip()
         if not literal:
             raise ValueError("专题笔记不能为空")
-        topic = self._refresh_topic(topic_id)
+        topic = self.refresh_topic(topic_id)
         _, revisions = self._topic_context(topic)
         now = utc_now()
         artifact = TopicArtifact(
@@ -433,7 +433,7 @@ class EntriesMixin:
             updated_at=now,
         )
         artifact = self.database.save_topic_artifact(artifact)
-        self._persist_topic(topic)
+        self.persist_topic(topic)
         return artifact.model_dump(mode="json")
 
     def get_entry(self, entry_id: str, *, include_documents: bool = False) -> dict[str, Any]:

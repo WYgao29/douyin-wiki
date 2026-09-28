@@ -874,7 +874,7 @@ def test_secondary_delete_and_restore_failures_return_success_with_warning(
     monkeypatch.undo()
     monkeypatch.setattr(
         service,
-        "_persist_topic",
+        "persist_topic",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("专题故障")),
     )
     restored = service.restore_trashed_entry(deleted["trash_id"], confirmed=True)

@@ -249,7 +249,7 @@ def test_provider_analysis_prunes_untraceable_evidence(service) -> None:
     }
 
     audit: list[dict] = []
-    cleaned, removed = service._prune_unverified_analysis_evidence(
+    cleaned, removed = service.prune_unverified_analysis_evidence(
         analysis,
         context,
         audit=audit,
@@ -261,7 +261,7 @@ def test_provider_analysis_prunes_untraceable_evidence(service) -> None:
     assert cleaned.knowledge_atoms == []
     assert len(audit) == 2
     assert all("引文" in item["reason"] for item in audit)
-    service._validate_analysis_evidence(cleaned, context)
+    service.validate_analysis_evidence(cleaned, context)
 
 
 def test_provider_repairs_timestamp_from_exact_quote(service) -> None:
@@ -276,7 +276,7 @@ def test_provider_repairs_timestamp_from_exact_quote(service) -> None:
         "ocr": [{"timestamp_ms": 0, "text": "财经媒体筛选"}],
     }
     audit: list[dict] = []
-    cleaned, removed = service._prune_unverified_analysis_evidence(
+    cleaned, removed = service.prune_unverified_analysis_evidence(
         analysis,
         context,
         audit=audit,
@@ -305,7 +305,7 @@ def test_provider_repairs_video_locator_and_inference_type(service) -> None:
         ],
         "ocr": [{"timestamp_ms": 0, "text": "财经媒体筛选"}],
     }
-    cleaned, removed = service._prune_unverified_analysis_evidence(analysis, context)
+    cleaned, removed = service.prune_unverified_analysis_evidence(analysis, context)
     assert removed == 0
     assert cleaned.knowledge_atoms[0].image_index is None
     assert cleaned.knowledge_atoms[1].atom_type == "inference"
@@ -418,7 +418,7 @@ async def test_reanalysis_does_not_recreate_deleted_entry(service, monkeypatch) 
 
     monkeypatch.setattr(service.analysis, "analyze", blocking_analyze)
     job = service.reanalyze_entry(entry.id)
-    processing = asyncio.create_task(service._process_reanalysis(job))
+    processing = asyncio.create_task(service.process_reanalysis(job))
     await asyncio.wait_for(started.wait(), timeout=3)
     service.trash_entry(entry.id, confirmed=True)
     release.set()

@@ -173,12 +173,12 @@ class AnalysisMixin:
         if self.database.get_review_issues(job_id, open_only=True):
             raise JobStateError("逐字稿仍有未解决疑点")
         validated = AnalysisResult.model_validate(analysis)
-        self._validate_analysis_evidence(validated, job.artifacts)
+        self.validate_analysis_evidence(validated, job.artifacts)
         reanalyze_entry_id = job.artifacts.get("reanalyze_entry_id")
         video_id = job.artifacts.get("resolved", {}).get("video_id", "")
         source_entry_id = reanalyze_entry_id or f"dy-{video_id}"
         normalized = validated.model_dump(mode="json")
-        normalized["contradictions"] = self._normalize_contradictions(
+        normalized["contradictions"] = self.normalize_contradictions(
             normalized.get("contradictions", []), source_entry_id
         )
         return self.database.requeue_job(
@@ -252,11 +252,11 @@ class AnalysisMixin:
         ):
             incoming["one_liner"] = incoming["summary"]
         validated = AnalysisResult.model_validate(incoming)
-        self._validate_analysis_evidence(validated, data)
+        self.validate_analysis_evidence(validated, data)
         validated = AnalysisResult.model_validate(
             {
                 **validated.model_dump(mode="json"),
-                "contradictions": self._normalize_contradictions(
+                "contradictions": self.normalize_contradictions(
                     validated.model_dump(mode="json").get("contradictions", []), entry.id
                 ),
             }
@@ -274,8 +274,8 @@ class AnalysisMixin:
                 "updated_at": utc_now(),
             }
         )
-        chunks, relations, reminders = self._prepare_entry_bundle(entry, data)
-        self._write_entry_documents(
+        chunks, relations, reminders = self.prepare_entry_bundle(entry, data)
+        self.write_entry_documents(
             entry,
             data,
             action="analysis",
@@ -323,7 +323,7 @@ class AnalysisMixin:
             queued.append(job.id)
         return {"queued_job_ids": queued, "skipped_entry_ids": skipped, "force": force}
 
-    async def _process_reanalysis(self, job: JobRecord) -> JobRecord:
+    async def process_reanalysis(self, job: JobRecord) -> JobRecord:
         entry_id = str(job.artifacts.get("reanalyze_entry_id", ""))
         entry = self.database.get_entry(entry_id)
         current_data = self.database.get_entry_data(entry_id)
@@ -343,7 +343,7 @@ class AnalysisMixin:
             TranscriptSegment.model_validate(item)
             for item in artifacts.get("transcript_corrected", [])
         ]
-        ocr_items = [self._ocr_model(item) for item in artifacts.get("ocr", [])]
+        ocr_items = [self.ocr_model(item) for item in artifacts.get("ocr", [])]
         if self.config.analysis_mode == AnalysisMode.GATEWAY and "analysis" not in artifacts:
             return self.database.update_job(
                 job.id,
@@ -369,7 +369,7 @@ class AnalysisMixin:
                 result = await self.analysis.analyze(
                     segments, ocr_items, entry.inspirations, metadata
                 )
-            self._validate_analysis_evidence(
+            self.validate_analysis_evidence(
                 result,
                 {**current_data, **artifacts, "metadata": metadata},
             )
@@ -379,9 +379,9 @@ class AnalysisMixin:
             )
 
         validated = AnalysisResult.model_validate(artifacts["analysis"])
-        self._validate_analysis_evidence(validated, {**current_data, **artifacts})
+        self.validate_analysis_evidence(validated, {**current_data, **artifacts})
         normalized = validated.model_dump(mode="json")
-        normalized["contradictions"] = self._normalize_contradictions(
+        normalized["contradictions"] = self.normalize_contradictions(
             normalized.get("contradictions", []), entry.id
         )
         validated = AnalysisResult.model_validate(normalized)
@@ -416,8 +416,8 @@ class AnalysisMixin:
                     "updated_at": utc_now(),
                 }
             )
-            chunks, relations, reminders = self._prepare_entry_bundle(updated, latest_data)
-            self._persist_entry_documents_and_bundle_locked(
+            chunks, relations, reminders = self.prepare_entry_bundle(updated, latest_data)
+            self.persist_entry_documents_and_bundle_locked(
                 updated,
                 latest_data,
                 chunks,
@@ -449,7 +449,7 @@ class AnalysisMixin:
         )
 
     @staticmethod
-    def _detect_image_review_issues(
+    def detect_image_review_issues(
         observations: list[OCRObservation], post_text: str
     ) -> list[ReviewIssue]:
         normalized_post = re.sub(r"\s+", "", post_text).lower()
@@ -479,7 +479,7 @@ class AnalysisMixin:
         return issues
 
     @staticmethod
-    def _apply_image_review_resolutions(
+    def apply_image_review_resolutions(
         observations: list[OCRObservation], issues: list[ReviewIssue]
     ) -> list[OCRObservation]:
         resolved = {
@@ -498,7 +498,7 @@ class AnalysisMixin:
             for observation in observations
         ]
 
-    def _prune_unverified_analysis_evidence(
+    def prune_unverified_analysis_evidence(
         self,
         analysis: AnalysisResult,
         context: dict[str, Any],
@@ -507,7 +507,7 @@ class AnalysisMixin:
     ) -> tuple[AnalysisResult, int]:
         """Keep only model citations that pass the existing source evidence checks."""
         try:
-            self._validate_analysis_evidence(analysis, context)
+            self.validate_analysis_evidence(analysis, context)
             return analysis, 0
         except JobStateError:
             pass
@@ -516,7 +516,7 @@ class AnalysisMixin:
 
         def error(candidate: AnalysisResult) -> str | None:
             try:
-                self._validate_analysis_evidence(candidate, context)
+                self.validate_analysis_evidence(candidate, context)
                 return None
             except JobStateError as exc:
                 return str(exc)
@@ -647,10 +647,10 @@ class AnalysisMixin:
                 "reminders": reminders,
             }
         )
-        self._validate_analysis_evidence(cleaned, context)
+        self.validate_analysis_evidence(cleaned, context)
         return cleaned, removed
 
-    def _validate_analysis_evidence(
+    def validate_analysis_evidence(
         self, analysis: AnalysisResult, context: dict[str, Any]
     ) -> None:
         """Reject source claims whose locator or quote cannot be traced to captured evidence."""

@@ -39,7 +39,7 @@ from .vault import safe_filename
 
 
 class CaptureMixin:
-    async def _process_media_restore(self, job: JobRecord) -> JobRecord:
+    async def process_media_restore(self, job: JobRecord) -> JobRecord:
         entry_id = str(job.artifacts.get("entry_id") or "")
         entry = self.database.get_entry(entry_id)
         if not entry.favorite:
@@ -76,7 +76,7 @@ class CaptureMixin:
                     "updated_at": now,
                 }
             )
-            self._write_entry_documents(
+            self.write_entry_documents(
                 updated,
                 data,
                 action="media_restore",
@@ -92,7 +92,7 @@ class CaptureMixin:
             unlock=True,
         )
 
-    async def _process_capture(self, job: JobRecord) -> JobRecord:
+    async def process_capture(self, job: JobRecord) -> JobRecord:
         request = job.request
         artifacts = dict(job.artifacts)
 
@@ -160,7 +160,7 @@ class CaptureMixin:
         if not artifacts.get("creator_context"):
             known_creator = self.database.find_creator_for_work(video_id)
             if known_creator:
-                artifacts["creator_context"] = self._creator_context(
+                artifacts["creator_context"] = self.creator_context(
                     known_creator.id, known_creator.folder_path, video_id
                 )
                 self.database.update_job(
@@ -176,13 +176,13 @@ class CaptureMixin:
             existing = self.database.find_entry_by_video_id(video_id)
             if existing:
                 for inspiration in request.inspirations:
-                    existing = self._add_inspiration_locked(existing.id, inspiration)
+                    existing = self.add_inspiration_locked(existing.id, inspiration)
                 should_reacquire = (
                     existing.media_status == "removed"
                     and request.options.retention != RetentionPolicy.DISCARD
                 )
                 if not should_reacquire:
-                    existing = self._repair_entry_if_needed_locked(existing)
+                    existing = self.repair_entry_if_needed_locked(existing)
                     return self.database.update_job(
                         job.id,
                         status=JobStatus.COMPLETED,
@@ -228,7 +228,7 @@ class CaptureMixin:
             )
         metadata = VideoMetadata.model_validate(artifacts["metadata"])
         if not creator_folder:
-            creator_context, metadata, assets_dir = self._adopt_creator_capture(
+            creator_context, metadata, assets_dir = self.adopt_creator_capture(
                 metadata,
                 work_id=video_id,
                 original_url=str(resolved_data["original_url"]),
@@ -525,7 +525,7 @@ class CaptureMixin:
                 )
                 corrected, llm_issues = await self.analysis.correct_transcript(
                     transcript_raw,
-                    [self._ocr_model(item) for item in ocr_items],
+                    [self.ocr_model(item) for item in ocr_items],
                     **correction_kwargs,
                 )
             issues = deduplicate_review_issues([*detect_review_issues(transcript_raw), *llm_issues])
@@ -616,7 +616,7 @@ class CaptureMixin:
                     )
                     analysis = await self.analysis.analyze(
                         corrected,
-                        [self._ocr_model(item) for item in ocr_items],
+                        [self.ocr_model(item) for item in ocr_items],
                         effective_inspirations,
                         analysis_metadata,
                         **analysis_kwargs,
@@ -630,7 +630,7 @@ class CaptureMixin:
             evidence_context = {**artifacts, "metadata": metadata.model_dump(mode="json")}
             if self.config.analysis_mode == AnalysisMode.PROVIDER:
                 audit: list[dict[str, Any]] = []
-                analysis, removed = self._prune_unverified_analysis_evidence(
+                analysis, removed = self.prune_unverified_analysis_evidence(
                     analysis,
                     evidence_context,
                     audit=audit,
@@ -641,7 +641,7 @@ class CaptureMixin:
                         f"模型生成的 {removed} 条无法核实的证据或内容已移除"
                     )
                 model_progress("evidence", 1, 1)
-            self._validate_analysis_evidence(analysis, evidence_context)
+            self.validate_analysis_evidence(analysis, evidence_context)
             artifacts["analysis"] = analysis.model_dump(mode="json")
             artifacts["llm_checkpoints"] = {}
             self.database.update_job(
@@ -661,12 +661,12 @@ class CaptureMixin:
 
         now = utc_now()
         validated_analysis = AnalysisResult.model_validate(artifacts["analysis"])
-        self._validate_analysis_evidence(
+        self.validate_analysis_evidence(
             validated_analysis,
             {**artifacts, "metadata": metadata.model_dump(mode="json")},
         )
         analysis_data = validated_analysis.model_dump(mode="json")
-        analysis_data["contradictions"] = self._normalize_contradictions(
+        analysis_data["contradictions"] = self.normalize_contradictions(
             analysis_data.get("contradictions", []), f"dy-{video_id}"
         )
         title = safe_filename(analysis_data.get("title") or metadata.title)
@@ -691,7 +691,7 @@ class CaptureMixin:
                 else Path("wiki") / "sources" / filename
             )
         )
-        cover_path = self._persist_video_cover(
+        cover_path = self.persist_video_cover(
             video_id,
             assets_dir,
             thumbnail_path=metadata.thumbnail_path,
@@ -762,10 +762,10 @@ class CaptureMixin:
             ReminderCandidate.model_validate(item) for item in analysis_data.get("reminders", [])
         ]
         if request.options.retention == RetentionPolicy.DISCARD:
-            self._trash_assets(entry, mark_database=False)
+            self.trash_assets(entry, mark_database=False)
             entry = entry.model_copy(update={"media_status": "removed"})
-        chunks, relations, reminders = self._prepare_entry_bundle(entry, data, reminders=reminders)
-        self._persist_entry_documents_and_bundle(
+        chunks, relations, reminders = self.prepare_entry_bundle(entry, data, reminders=reminders)
+        self.persist_entry_documents_and_bundle(
             entry,
             data,
             chunks,
@@ -818,10 +818,10 @@ class CaptureMixin:
             existing = self.database.find_entry_by_video_id(work_id)
             if existing:
                 for inspiration in request.inspirations:
-                    existing = self._add_inspiration_locked(existing.id, inspiration)
+                    existing = self.add_inspiration_locked(existing.id, inspiration)
                 existing_data = self.database.get_entry_data(existing.id)
-                if self._image_note_files_intact(existing_data):
-                    existing = self._repair_entry_if_needed_locked(existing)
+                if self.image_note_files_intact(existing_data):
+                    existing = self.repair_entry_if_needed_locked(existing)
                     return self.database.update_job(
                         job.id,
                         status=JobStatus.COMPLETED,
@@ -846,7 +846,7 @@ class CaptureMixin:
         metadata: VideoMetadata | None = None
         if "metadata" in artifacts:
             candidate = VideoMetadata.model_validate(artifacts["metadata"])
-            if self._metadata_image_paths_exist(candidate):
+            if self.metadata_image_paths_exist(candidate):
                 metadata = candidate
         if metadata is None:
             self.database.update_job(job.id, status=JobStatus.DOWNLOADING, progress=0.15)
@@ -863,7 +863,7 @@ class CaptureMixin:
             )
 
         if not creator_folder:
-            creator_context, metadata, images_dir = self._adopt_creator_capture(
+            creator_context, metadata, images_dir = self.adopt_creator_capture(
                 metadata,
                 work_id=work_id,
                 original_url=str(resolved_data["original_url"]),
@@ -883,7 +883,7 @@ class CaptureMixin:
                     },
                 )
 
-        absolute_images = [self._vault_path(value) for value in metadata.image_paths]
+        absolute_images = [self.vault_path(value) for value in metadata.image_paths]
         images_complete = absolute_images and all(
             path.is_file() and path.stat().st_size for path in absolute_images
         )
@@ -921,7 +921,7 @@ class CaptureMixin:
                         update={
                             "timestamp_ms": None,
                             "image_index": image_index,
-                            "image_path": self._vault_relative(
+                            "image_path": self.vault_relative(
                                 absolute_images[(image_index or 1) - 1]
                             ),
                         }
@@ -942,9 +942,9 @@ class CaptureMixin:
                 },
                 progress=0.58,
             )
-        ocr_models = [self._ocr_model(item) for item in artifacts.get("ocr", [])]
+        ocr_models = [self.ocr_model(item) for item in artifacts.get("ocr", [])]
 
-        issues = self._detect_image_review_issues(ocr_models, metadata.post_text or "")
+        issues = self.detect_image_review_issues(ocr_models, metadata.post_text or "")
         if issues and not artifacts.get("review_resolved"):
             artifacts["review_issues"] = [item.model_dump(mode="json") for item in issues]
             self.database.replace_review_issues(job.id, issues)
@@ -961,7 +961,7 @@ class CaptureMixin:
             )
         if artifacts.get("review_resolved"):
             resolved_issues = self.database.get_review_issues(job.id)
-            ocr_models = self._apply_image_review_resolutions(ocr_models, resolved_issues)
+            ocr_models = self.apply_image_review_resolutions(ocr_models, resolved_issues)
             artifacts["ocr"] = [item.model_dump(mode="json") for item in ocr_models]
             self.database.update_job(job.id, artifacts={"ocr": artifacts["ocr"]})
 
@@ -994,7 +994,7 @@ class CaptureMixin:
                 analysis = await self.analysis.analyze(
                     [], ocr_models, effective_inspirations, analysis_metadata
                 )
-            self._validate_analysis_evidence(
+            self.validate_analysis_evidence(
                 analysis,
                 {**artifacts, "metadata": metadata.model_dump(mode="json")},
             )
@@ -1005,13 +1005,13 @@ class CaptureMixin:
 
         now = utc_now()
         validated_analysis = AnalysisResult.model_validate(artifacts["analysis"])
-        self._validate_analysis_evidence(
+        self.validate_analysis_evidence(
             validated_analysis,
             {**artifacts, "metadata": metadata.model_dump(mode="json")},
         )
         analysis_data = validated_analysis.model_dump(mode="json")
         entry_id = f"dy-{work_id}"
-        analysis_data["contradictions"] = self._normalize_contradictions(
+        analysis_data["contradictions"] = self.normalize_contradictions(
             analysis_data.get("contradictions", []), entry_id
         )
         title = safe_filename(analysis_data.get("title") or metadata.title)
@@ -1036,7 +1036,7 @@ class CaptureMixin:
             )
         )
 
-        relative_images = [self._vault_relative(path) for path in absolute_images]
+        relative_images = [self.vault_relative(path) for path in absolute_images]
         stored_metadata = metadata.model_copy(
             update={
                 "image_paths": relative_images,
@@ -1103,8 +1103,8 @@ class CaptureMixin:
         reminders = [
             ReminderCandidate.model_validate(item) for item in analysis_data.get("reminders", [])
         ]
-        chunks, relations, reminders = self._prepare_entry_bundle(entry, data, reminders=reminders)
-        self._persist_entry_documents_and_bundle(
+        chunks, relations, reminders = self.prepare_entry_bundle(entry, data, reminders=reminders)
+        self.persist_entry_documents_and_bundle(
             entry,
             data,
             chunks,
@@ -1139,7 +1139,7 @@ class CaptureMixin:
             unlock=True,
         )
 
-    def _persist_video_cover(
+    def persist_video_cover(
         self,
         video_id: str,
         assets_dir: Path,

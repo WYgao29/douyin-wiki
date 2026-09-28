@@ -166,7 +166,7 @@ class TrashMixin:
         dependencies: dict[str, Any],
     ) -> tuple[dict[str, list[str]], list[str]]:
         self.database.upsert_entry(entry, data)
-        chunks, relations, reminders = self._prepare_entry_bundle(entry, data)
+        chunks, relations, reminders = self.prepare_entry_bundle(entry, data)
         self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
         dependency_result = self.database.restore_entry_dependencies(entry.id, dependencies)
         restored_topic_ids = self._restore_trashed_topic_sources(entry, dependencies, persist=False)
@@ -215,7 +215,7 @@ class TrashMixin:
             warnings.append(f"资料已删除，但知识库导航更新失败：{exc}")
         for topic_id in dependencies.get("topics", {}):
             try:
-                self._refresh_topic(topic_id)
+                self.refresh_topic(topic_id)
             except (KeyError, Exception) as exc:
                 warnings.append(f"资料已删除，但专题 {topic_id} 更新失败：{exc}")
         creator_ids = {
@@ -225,7 +225,7 @@ class TrashMixin:
         }
         for creator_id in creator_ids:
             try:
-                self._refresh_creator_documents(creator_id, action="删除入库资料")
+                self.refresh_creator_documents(creator_id, action="删除入库资料")
             except (KeyError, Exception) as exc:
                 warnings.append(f"资料已删除，但博主 {creator_id} 更新失败：{exc}")
         return warnings
@@ -255,12 +255,12 @@ class TrashMixin:
             warnings.append(f"资料已恢复，但知识库导航更新失败：{exc}")
         for topic_id in restored_topic_ids:
             try:
-                self._persist_topic(self.database.get_topic(topic_id))
+                self.persist_topic(self.database.get_topic(topic_id))
             except (KeyError, Exception) as exc:
                 warnings.append(f"资料已恢复，但专题 {topic_id} 更新失败：{exc}")
         for creator_id in creator_ids:
             try:
-                self._refresh_creator_documents(creator_id, action="恢复入库资料")
+                self.refresh_creator_documents(creator_id, action="恢复入库资料")
             except (KeyError, Exception) as exc:
                 warnings.append(f"资料已恢复，但博主 {creator_id} 更新失败：{exc}")
         return warnings
@@ -312,14 +312,14 @@ class TrashMixin:
             ]
             position = max(0, min(int(original.get("position") or 1) - 1, len(ordered)))
             ordered.insert(position, (entry, bool(original.get("enabled", 1))))
-            revision, _ = self._topic_revision(ordered)
+            revision, _ = self.topic_revision(ordered)
             restored_topic = self.database.set_topic_sources(
                 topic_id,
                 [(value.id, enabled, value.updated_at.isoformat()) for value, enabled in ordered],
                 source_revision=revision,
             )
             if persist:
-                self._persist_topic(restored_topic)
+                self.persist_topic(restored_topic)
             restored_ids.append(topic_id)
         return restored_ids
 
@@ -619,9 +619,9 @@ class TrashMixin:
     def recover_entry_trash_operations(self) -> dict[str, Any]:
         """Recover interrupted delete/restore operations after an unclean exit."""
         with self.vault.entry_operations_locked():
-            return self._recover_entry_trash_operations_locked()
+            return self.recover_entry_trash_operations_locked()
 
-    def _recover_entry_trash_operations_locked(self) -> dict[str, Any]:
+    def recover_entry_trash_operations_locked(self) -> dict[str, Any]:
         root = self._entry_trash_root
         report: dict[str, Any] = {"recovered": [], "completed": [], "warnings": []}
         if not root.is_dir():

@@ -52,7 +52,7 @@ class MaintenanceMixin:
                     if preferred_cover:
                         metadata["thumbnail_path"] = str(preferred_cover)
                         metadata["thumbnail_kind"] = "douyin_cover"
-                cover_path = self._persist_video_cover(
+                cover_path = self.persist_video_cover(
                     entry.video_id,
                     assets_dir,
                     thumbnail_path=str(preferred_cover)
@@ -116,17 +116,17 @@ class MaintenanceMixin:
 
     def _repair_entry_if_needed(self, entry: EntryRecord) -> EntryRecord:
         with self.vault.entry_operations_locked():
-            return self._repair_entry_if_needed_locked(entry)
+            return self.repair_entry_if_needed_locked(entry)
 
-    def _repair_entry_if_needed_locked(self, entry: EntryRecord) -> EntryRecord:
+    def repair_entry_if_needed_locked(self, entry: EntryRecord) -> EntryRecord:
         # Re-read under the operation lock so a concurrent delete cannot be
         # undone by a stale worker repair.
         entry = self.database.get_entry(entry.id)
         if self._entry_documents_intact(entry) and self.database.entry_chunk_count(entry.id) > 0:
             return entry
         data = self.database.get_entry_data(entry.id)
-        chunks, relations, reminders = self._prepare_entry_bundle(entry, data)
-        self._write_entry_documents(
+        chunks, relations, reminders = self.prepare_entry_bundle(entry, data)
+        self.write_entry_documents(
             entry,
             data,
             action="repair",
@@ -384,7 +384,7 @@ class MaintenanceMixin:
                     previous_relations = json.dumps(
                         data.get("relations", []), ensure_ascii=False, sort_keys=True
                     )
-                    chunks, relations, reminders = self._prepare_entry_bundle(entry, data)
+                    chunks, relations, reminders = self.prepare_entry_bundle(entry, data)
                     current_relations = json.dumps(relations, ensure_ascii=False, sort_keys=True)
                     if current_relations == previous_relations:
                         continue
@@ -393,7 +393,7 @@ class MaintenanceMixin:
                     self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
                     report["relation_updates"].append(entry.id)
                 for entry in expired:
-                    self._trash_assets(entry)
+                    self.trash_assets(entry)
                     report["media_removed"].append(entry.id)
                     refreshed = self.database.get_entry(entry.id)
                     data = self.database.get_entry_data(entry.id)
@@ -412,7 +412,7 @@ class MaintenanceMixin:
             self.database.record_maintenance("weekly", report)
         return report
 
-    def _trash_assets(self, entry: EntryRecord, *, mark_database: bool = True) -> None:
+    def trash_assets(self, entry: EntryRecord, *, mark_database: bool = True) -> None:
         raw_parent = Path(entry.raw_path).parent
         raw_root = raw_parent.parent if raw_parent.name == "records" else raw_parent
         assets = self.config.vault_path / raw_root / "assets" / entry.video_id
@@ -421,18 +421,18 @@ class MaintenanceMixin:
         if mark_database:
             self.database.mark_media_removed(entry.id)
 
-    def _metadata_image_paths_exist(self, metadata: VideoMetadata) -> bool:
+    def metadata_image_paths_exist(self, metadata: VideoMetadata) -> bool:
         return bool(metadata.image_paths) and all(
-            (path := self._vault_path(value)).is_file() and path.stat().st_size > 0
+            (path := self.vault_path(value)).is_file() and path.stat().st_size > 0
             for value in metadata.image_paths
         )
 
-    def _image_note_files_intact(self, data: dict[str, Any]) -> bool:
+    def image_note_files_intact(self, data: dict[str, Any]) -> bool:
         metadata_data = data.get("metadata", {})
         if metadata_data.get("source_kind") != SourceKind.IMAGE_NOTE.value:
             return False
         try:
-            return self._metadata_image_paths_exist(VideoMetadata.model_validate(metadata_data))
+            return self.metadata_image_paths_exist(VideoMetadata.model_validate(metadata_data))
         except (TypeError, ValueError):
             return False
 
