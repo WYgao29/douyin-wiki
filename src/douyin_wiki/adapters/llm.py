@@ -47,6 +47,101 @@ class ModelOutputError(ModelLimitError):
     code = "model_output_limit"
 
 
+
+def _soft_merge_analysis_partials(
+    group: list[dict[str, Any]], *, reason: str
+) -> dict[str, Any]:
+    """Concatenate partial analyses without another model call."""
+    open_questions: list[str] = []
+    knowledge_atoms: list[dict[str, Any]] = []
+    chapters: list[dict[str, Any]] = []
+    actions: list[str] = []
+    tags: list[str] = []
+    concepts: list[str] = []
+    entities: list[dict[str, Any]] = []
+    reminders: list[dict[str, Any]] = []
+    takeaways: list[str] = []
+    titles: list[str] = []
+    notes: list[str] = []
+    for partial in group:
+        titles.append(str(partial.get("title") or "").strip())
+        open_questions.extend(
+            str(item).strip()
+            for item in (partial.get("open_questions") or [])
+            if str(item).strip()
+        )
+        knowledge_atoms.extend(
+            item for item in (partial.get("knowledge_atoms") or []) if isinstance(item, dict)
+        )
+        chapters.extend(
+            item for item in (partial.get("chapters") or []) if isinstance(item, dict)
+        )
+        actions.extend(str(item).strip() for item in (partial.get("actions") or []) if str(item).strip())
+        tags.extend(str(item).strip() for item in (partial.get("tags") or []) if str(item).strip())
+        concepts.extend(
+            str(item).strip() for item in (partial.get("concepts") or []) if str(item).strip()
+        )
+        entities.extend(
+            item for item in (partial.get("entities") or []) if isinstance(item, dict)
+        )
+        reminders.extend(
+            item for item in (partial.get("reminders") or []) if isinstance(item, dict)
+        )
+        takeaways.extend(
+            str(item).strip() for item in (partial.get("takeaways") or []) if str(item).strip()
+        )
+        card = partial.get("content_card") or {}
+        if isinstance(card, dict):
+            notes.extend(
+                str(item).strip() for item in (card.get("notes") or []) if str(item).strip()
+            )
+    open_questions.append(reason)
+    notes.append(reason)
+    title = next((item for item in titles if item and not item.startswith("跳过")), None)
+    if title is None:
+        title = titles[0] if titles and titles[0] else "分段汇总（降级）"
+    return AnalysisResult(
+        title=title[:200],
+        one_liner=reason[:120],
+        takeaways=list(dict.fromkeys(takeaways))[:5],
+        open_questions=list(dict.fromkeys(open_questions)),
+        knowledge_atoms=knowledge_atoms,
+        chapters=chapters[:12],
+        actions=list(dict.fromkeys(actions)),
+        tags=list(dict.fromkeys(tags)),
+        concepts=list(dict.fromkeys(concepts)),
+        entities=entities,
+        reminders=reminders,
+        content_card={"kind": "other", "notes": list(dict.fromkeys(notes))},
+    ).model_dump(mode="json")
+
+
+def _split_transcript_text(value: str, *, min_chars: int = 12) -> tuple[str, str] | None:
+    """Shrink a transcript piece for context/output limits.
+
+    Prefer punctuation boundaries when both halves meet ``min_chars``.
+    Otherwise hard-split on characters. Returns ``None`` only when the
+    text is irreducible (fewer than 2 characters).
+    """
+    if len(value) < 2:
+        return None
+    middle = max(1, len(value) // 2)
+    boundaries = [
+        match.end()
+        for match in re.finditer(r"[。！？!?；;，,、：:\n]", value)
+        if min_chars <= match.end() <= len(value) - min_chars
+    ]
+    boundary = (
+        min(boundaries, key=lambda point: abs(point - middle))
+        if boundaries
+        else middle
+    )
+    left, right = value[:boundary], value[boundary:]
+    if not left or not right:
+        return None
+    return left, right
+
+
 def _is_context_error(message: str) -> bool:
     lowered = message.lower()
     return any(
@@ -376,11 +471,22 @@ class OpenAICompatibleProvider(AnalysisProvider):
         validator: Callable[[dict[str, Any]], Any] | None = None,
         checkpoints: dict[str, Any] | None = None,
         on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
+        checkpoint_scope: Any = None,
     ) -> dict[str, Any]:
         user = json.dumps(payload, ensure_ascii=False)
         fingerprint = hashlib.sha256(
             json.dumps(
-                [PROMPT_VERSION, self.model, system, user, schema],
+                [
+                    PROMPT_VERSION,
+                    self.model,
+                    self.settings.max_output_tokens,
+                    self.settings.enable_thinking,
+                    self.settings.thinking_budget,
+                    checkpoint_scope,
+                    system,
+                    user,
+                    schema,
+                ],
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode()
@@ -419,6 +525,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
         payload_for: Callable[[list[TranscriptSegment], list[OCRObservation]], dict[str, Any]],
         *,
         max_items: int = 80,
+        max_text_chars: int | None = None,
     ) -> list[list[TranscriptSegment]]:
         if not segments:
             return [[]]
@@ -429,6 +536,10 @@ class OpenAICompatibleProvider(AnalysisProvider):
             nearby = self._fit_ocr(candidate, ocr, system, schema, payload_for)
             if current and (
                 len(candidate) > max_items
+                or (
+                    max_text_chars is not None
+                    and sum(len(item.text) for item in candidate) > max_text_chars
+                )
                 or not self._fits(
                     system,
                     payload_for(candidate, nearby),
@@ -576,7 +687,20 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     self.last_usage["retry_count"] = max(0, request_count - 1)
                     choice = payload["choices"][0]
                     if choice.get("finish_reason") == "length":
-                        raise ModelOutputError("模型输出达到 token 上限")
+                        message = choice.get("message") or {}
+                        content = message.get("content") or ""
+                        reasoning = (
+                            message.get("reasoning_content") or message.get("reasoning") or ""
+                        )
+                        raise ModelOutputError(
+                            "模型输出达到 token 上限",
+                            details={
+                                "finish_reason": "length",
+                                "usage": self.last_usage.copy(),
+                                "content_chars": len(content),
+                                "reasoning_chars": len(reasoning),
+                            },
+                        )
                     content = choice["message"]["content"]
                     try:
                         parsed = _parse_json_content(content)
@@ -643,6 +767,8 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 "模型拒绝请求，请检查模型名称、输出上限和响应格式",
                 details=details,
             )
+        if isinstance(last_error, (ValueError, json.JSONDecodeError)):
+            raise ExternalToolError(f"模型结果校验失败：{last_error}", details=details)
         raise ExternalToolError("模型调用失败", details=details)
 
     async def correct_transcript(
@@ -666,23 +792,120 @@ class OpenAICompatibleProvider(AnalysisProvider):
             chunk: list[TranscriptSegment], nearby: list[OCRObservation]
         ) -> dict[str, Any]:
             return {
-                "segments": [_transcript_prompt_item(item) for item in chunk],
+                # Model-facing IDs are small and local to this request. Internal
+                # path IDs only identify pieces/checkpoints and never reach the model.
+                "segments": [
+                    _transcript_prompt_item(item.model_copy(update={"id": index}))
+                    for index, item in enumerate(chunk)
+                ],
                 "ocr": [_ocr_prompt_item(item) for item in nearby],
             }
 
+        if len({segment.id for segment in segments}) != len(segments):
+            raise ExternalToolError("原始逐字稿片段 ID 重复，无法安全校正")
+        if not segments:
+            if on_progress is not None:
+                on_progress("correction", 0, 0)
+            return [], []
+
+        # Internal IDs identify text pieces, while the returned segments retain
+        # their original IDs and time ranges. Source index and binary split path
+        # keep IDs stable even when another branch succeeds on a later retry.
+        id_floor = min(segment.id for segment in segments)
+        source_by_id = {segment.id: segment for segment in segments}
+        piece_by_id: dict[int, TranscriptSegment] = {}
+        path_by_id: dict[int, int] = {}
+        source_index = {segment.id: index for index, segment in enumerate(segments)}
+        pieces_by_source: dict[int, list[int]] = {segment.id: [] for segment in segments}
+        pieces: list[TranscriptSegment] = []
+        min_chars = 12
+        max_chars = max(48, min(1600, (self.settings.max_output_tokens or 8192) // 4))
+
+        def split_text(value: str) -> tuple[str, str] | None:
+            return _split_transcript_text(value, min_chars=min_chars)
+
+        def add_piece(source: TranscriptSegment, value: str, path: int) -> TranscriptSegment:
+            identifier = id_floor - ((source_index[source.id] + 1) * (1 << 32) + path)
+            piece = source.model_copy(update={"id": identifier, "text": value})
+            source_by_id[identifier] = source
+            piece_by_id[identifier] = piece
+            path_by_id[identifier] = path
+            return piece
+
+        for source in segments:
+            pending = [(source.text, 1)]
+            while pending:
+                value, path = pending.pop()
+                candidate = add_piece(source, value, path)
+                nearby = self._fit_ocr(
+                    [candidate], ocr, system, TRANSCRIPT_CORRECTION_SCHEMA, payload_for
+                )
+                if len(value) <= max_chars and self._fits(
+                    system, payload_for([candidate], nearby), TRANSCRIPT_CORRECTION_SCHEMA
+                ):
+                    pieces.append(candidate)
+                    pieces_by_source[source.id].append(candidate.id)
+                    continue
+                halves = split_text(value)
+                if halves is None:
+                    raise ModelContextError(f"字幕段 {source.id} 单独超过模型输入预算")
+                pending.extend(((halves[1], path * 2 + 1), (halves[0], path * 2)))
+
         chunks = self._budgeted_chunks(
-            segments,
+            pieces,
             ocr,
             system,
             TRANSCRIPT_CORRECTION_SCHEMA,
             payload_for,
+            max_text_chars=max_chars,
         )
+        completed = 0
+        total = len(pieces) if pieces else 1
         if on_progress is not None:
-            on_progress("correction", 0, len(chunks))
+            on_progress("correction", completed, total)
 
-        async def run_chunk(chunk: list[TranscriptSegment]) -> dict[str, Any]:
+        def validate_result(chunk: list[TranscriptSegment], result: dict[str, Any]) -> None:
+            returned = result.get("segments")
+            if not isinstance(returned, list):
+                raise ValueError("模型校正结果缺少 segments 数组")
+            expected = set(range(len(chunk)))
+            found: set[int] = set()
+            for item in returned:
+                if not isinstance(item, dict) or type(item.get("id")) is not int:
+                    raise ValueError("模型校正结果包含无效片段 ID")
+                identifier = item["id"]
+                if identifier not in expected or identifier in found:
+                    raise ValueError(f"模型校正结果包含未知或重复片段 ID：{identifier}")
+                if not isinstance(item.get("text"), str) or not item["text"].strip():
+                    raise ValueError(f"模型校正结果的片段 {identifier} 文本为空")
+                found.add(identifier)
+            if found != expected:
+                raise ValueError(f"模型校正结果缺少片段 ID：{sorted(expected - found)}")
+            if not isinstance(result.get("review_issues"), list):
+                raise ValueError("模型校正结果缺少 review_issues 数组")
+            for item in result["review_issues"]:
+                if not isinstance(item, dict) or type(item.get("segment_id")) is not int:
+                    raise ValueError("模型校正疑点包含无效片段 ID")
+                if item["segment_id"] not in expected:
+                    raise ValueError(f"模型校正疑点引用未知片段 ID：{item['segment_id']}")
+
+        results: dict[int, str] = {}
+        reviews: list[tuple[int, dict[str, Any]]] = []
+        limit_skips: dict[int, list[str]] = {}
+        limit_splits = 0
+        # Character-level hard-splits need headroom proportional to total chars.
+        max_limit_splits = max(
+            32,
+            len(pieces) * 8,
+            sum(len(piece.text) for piece in pieces) * 2,
+        )
+
+        async def run_chunk(chunk: list[TranscriptSegment]) -> None:
+            nonlocal limit_splits, completed, total
+            if limit_splits > max_limit_splits:
+                raise ModelOutputError("字幕校正连续超限，已达到有界重试上限")
             try:
-                return await self._checkpointed_call(
+                result = await self._checkpointed_call(
                     system,
                     payload_for(
                         chunk,
@@ -695,72 +918,127 @@ class OpenAICompatibleProvider(AnalysisProvider):
                         ),
                     ),
                     TRANSCRIPT_CORRECTION_SCHEMA,
+                    validator=lambda result: validate_result(chunk, result),
                     checkpoints=checkpoints,
                     on_checkpoint=on_checkpoint,
+                    checkpoint_scope=[piece.id for piece in chunk],
                 )
-            except ModelLimitError:
-                if len(chunk) < 2:
-                    raise
-                middle = len(chunk) // 2
-                left = await run_chunk(chunk[:middle])
-                right = await run_chunk(chunk[middle:])
-                return {
-                    "segments": [*left.get("segments", []), *right.get("segments", [])],
-                    "review_issues": [
-                        *left.get("review_issues", []),
-                        *right.get("review_issues", []),
-                    ],
-                }
-
-        for chunk_index, chunk in enumerate(chunks, start=1):
-            result = await run_chunk(chunk)
+            except ModelLimitError as exc:
+                limit_splits += 1
+                if limit_splits > max_limit_splits:
+                    raise ModelOutputError(
+                        "字幕校正连续超限，已达到有界重试上限",
+                        details={"last_response": exc.details},
+                    ) from exc
+                if len(chunk) > 1:
+                    middle = len(chunk) // 2
+                    await run_chunk(chunk[:middle])
+                    await run_chunk(chunk[middle:])
+                    return
+                piece = chunk[0]
+                halves = split_text(piece.text)
+                if halves is None:
+                    # Irreducible min chunk: keep original text and continue.
+                    source = source_by_id[piece.id]
+                    results[piece.id] = piece.text
+                    skip_reason = (
+                        f"模型输出超限且最小文本块不可再切（{len(piece.text)} 字），"
+                        "已跳过该块校正并保留原文"
+                    )
+                    limit_skips.setdefault(source.id, []).append(skip_reason)
+                    completed += len(chunk)
+                    if on_progress is not None:
+                        on_progress("correction", completed, total)
+                    return
+                source = source_by_id[piece.id]
+                path = path_by_id[piece.id]
+                children = [
+                    add_piece(source, halves[0], path * 2),
+                    add_piece(source, halves[1], path * 2 + 1),
+                ]
+                position = pieces_by_source[source.id].index(piece.id)
+                pieces_by_source[source.id][position : position + 1] = [
+                    child.id for child in children
+                ]
+                total += 1
+                await run_chunk([children[0]])
+                await run_chunk([children[1]])
+                return
+            for item in result["segments"]:
+                results[chunk[item["id"]].id] = item["text"]
+            reviews.extend(
+                (
+                    index,
+                    {**item, "segment_id": chunk[item["segment_id"]].id},
+                )
+                for index, item in enumerate(result["review_issues"])
+            )
+            completed += len(chunk)
             if on_progress is not None:
-                on_progress("correction", chunk_index, len(chunks))
-            by_id: dict[int, str] = {}
-            for item in result.get("segments", []):
-                try:
-                    identifier = int(item["id"])
-                    text = str(item["text"]).strip()
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if text:
-                    by_id[identifier] = text
-            for segment in chunk:
-                updated = segment.model_copy(update={"text": by_id.get(segment.id, segment.text)})
-                corrected.append(updated)
-            for index, item in enumerate(result.get("review_issues", [])):
-                try:
-                    segment_id = int(item.get("segment_id", -1))
-                except (TypeError, ValueError):
-                    continue
-                source = next((segment for segment in chunk if segment.id == segment_id), None)
-                if source:
-                    suggestions = list(
-                        dict.fromkeys(
-                            str(value).strip()
-                            for value in item.get("suggestions", [])
-                            if str(value).strip()
-                        )
+                on_progress("correction", completed, total)
+
+        for chunk in chunks:
+            await run_chunk(chunk)
+
+        for segment in segments:
+            piece_ids = pieces_by_source[segment.id]
+            if any(identifier not in results for identifier in piece_ids):
+                raise ExternalToolError(f"字幕段 {segment.id} 的子块未全部完成，无法合并")
+            text = "".join(results[identifier] for identifier in piece_ids)
+            corrected.append(segment.model_copy(update={"text": text}))
+        reasons_by_source: dict[int, list[str]] = {}
+        for _index, item in reviews:
+            piece_id = item["segment_id"]
+            source = source_by_id[piece_id]
+            suggestions = list(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in item.get("suggestions", [])
+                    if str(value).strip()
+                )
+            )
+            reason = str(item.get("reason", "模型认为该片段需要人工确认"))
+            if _review_issue_skip_reason(
+                piece_by_id[piece_id].text, results[piece_id], reason, suggestions
+            ):
+                continue
+            detail = f"{reason}（局部建议：{' / '.join(suggestions)}）" if suggestions else reason
+            reasons_by_source.setdefault(source.id, []).append(detail)
+        for source in segments:
+            reasons = reasons_by_source.get(source.id)
+            if reasons:
+                full_text = next(item.text for item in corrected if item.id == source.id)
+                issues.append(
+                    ReviewIssue(
+                        id=f"llm-{source.id}",
+                        start_ms=source.start_ms,
+                        end_ms=source.end_ms,
+                        raw_text=source.text,
+                        reason="；".join(dict.fromkeys(reasons)),
+                        suggestions=[full_text],
                     )
-                    reason = str(item.get("reason", "模型认为该片段需要人工确认"))
-                    current_text = by_id.get(source.id, source.text)
-                    if _review_issue_skip_reason(
-                        source.text,
-                        current_text,
-                        reason,
-                        suggestions,
-                    ):
-                        continue
-                    issues.append(
-                        ReviewIssue(
-                            id=f"llm-{segment_id}-{index}",
-                            start_ms=source.start_ms,
-                            end_ms=source.end_ms,
-                            raw_text=source.text,
-                            reason=reason,
-                            suggestions=suggestions,
-                        )
-                    )
+                )
+        for source in segments:
+            skip_reasons = limit_skips.get(source.id)
+            if not skip_reasons:
+                continue
+            detail = "；".join(dict.fromkeys(skip_reasons))
+            existing = next((item for item in issues if item.id == f"llm-{source.id}"), None)
+            if existing is not None:
+                if detail not in existing.reason:
+                    existing.reason = f"{existing.reason}；{detail}"
+                continue
+            full_text = next(item.text for item in corrected if item.id == source.id)
+            issues.append(
+                ReviewIssue(
+                    id=f"llm-{source.id}",
+                    start_ms=source.start_ms,
+                    end_ms=source.end_ms,
+                    raw_text=source.text,
+                    reason=detail,
+                    suggestions=[full_text],
+                )
+            )
         return corrected, issues
 
     async def analyze(
@@ -776,26 +1054,81 @@ class OpenAICompatibleProvider(AnalysisProvider):
     ) -> AnalysisResult:
         self._require_configured()
         schema = _analysis_response_schema()
+        system = _analysis_system_prompt()
+        # A split piece still has only its source segment's time range. The
+        # model may cite its text, but must not infer a finer timestamp.
+        split_system = (
+            system
+            + "\n同一字幕段的内部文本块可能共用原始起止时间；音频引文只用所给字幕段的"
+            "start_ms 作粗粒度定位，不按文字位置推算更精确的时间。"
+        )
+        max_text_chars = max(48, min(1600, (self.settings.max_output_tokens or 8192) // 4))
+        min_chars = 12
+        source_index = {segment.id: index for index, segment in enumerate(segments)}
+        if len(source_index) != len(segments):
+            raise ExternalToolError("原始逐字稿片段 ID 重复，无法安全分析")
+        id_floor = min(source_index, default=0)
+        path_by_id = {segment.id: 1 for segment in segments}
+        source_by_id = {segment.id: segment for segment in segments}
+        # Reserve space for part/parts before chunking. The actual values are
+        # smaller, so an accepted chunk also fits the later request payload.
+        budget_metadata = {**metadata, "part": 999999999, "parts": 999999999}
+
+        def split_text(value: str) -> tuple[str, str] | None:
+            return _split_transcript_text(value, min_chars=min_chars)
+
+        def add_piece(source: TranscriptSegment, value: str, path: int) -> TranscriptSegment:
+            identifier = id_floor - ((source_index[source.id] + 1) * (1 << 32) + path)
+            piece = source.model_copy(update={"id": identifier, "text": value})
+            source_by_id[identifier] = source
+            path_by_id[identifier] = path
+            return piece
 
         def payload_for(
             chunk: list[TranscriptSegment], nearby: list[OCRObservation]
         ) -> dict[str, Any]:
             return {
-                "metadata": metadata,
+                "metadata": budget_metadata,
                 "user_inspirations_verbatim": [
                     item.model_dump(mode="json") for item in inspirations
                 ],
-                "transcript": [_transcript_prompt_item(item) for item in chunk],
+                "transcript": [
+                    {
+                        **_transcript_prompt_item(item),
+                        "id": index,
+                        "source_segment_id": source_by_id[item.id].id,
+                    }
+                    for index, item in enumerate(chunk)
+                ],
                 "ocr": [_ocr_prompt_item(item) for item in nearby],
             }
+
+        pieces: list[TranscriptSegment] = []
+        for source in segments:
+            pending = [(source.text, 1)]
+            while pending:
+                value, path = pending.pop()
+                candidate = add_piece(source, value, path)
+                nearby = self._fit_ocr([candidate], ocr, split_system, schema, payload_for)
+                if len(value) <= max_text_chars and self._fits(
+                    split_system, payload_for([candidate], nearby), schema
+                ):
+                    pieces.append(source if path == 1 else candidate)
+                    continue
+                halves = split_text(value)
+                if halves is None:
+                    raise ModelContextError(f"字幕段 {source.id} 的最小文本块仍超过模型输入预算")
+                pending.extend(((halves[1], path * 2 + 1), (halves[0], path * 2)))
+
+        request_system = split_system
 
         chunks = (
             [
                 (chunk, ocr)
                 for chunk in self._budgeted_chunks(
-                    segments,
+                    pieces,
                     ocr,
-                    _analysis_system_prompt(),
+                    request_system,
                     schema,
                     payload_for,
                     max_items=(
@@ -803,6 +1136,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
                         if self.settings.max_output_tokens
                         else 80
                     ),
+                    max_text_chars=max_text_chars,
                 )
             ]
             if segments
@@ -810,48 +1144,105 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 ([], group)
                 for group in self._budgeted_ocr_chunks(
                     ocr,
-                    _analysis_system_prompt(),
+                    request_system,
                     schema,
                     payload_for,
                 )
             ]
         )
-        if on_progress is not None:
-            on_progress("analysis", 0, len(chunks))
+        completed_chunks = 0
+        total_chunks = len(chunks)
+
+        def report_progress() -> None:
+            if on_progress is not None:
+                on_progress("analysis", completed_chunks, total_chunks)
+
+        report_progress()
+        limit_splits = 0
+        max_limit_splits = max(
+            256,
+            sum(len(piece.text) for piece in pieces) * 2 + max(1, len(ocr)) * 2,
+        )
 
         async def analyze_chunk(
             chunk: list[TranscriptSegment],
             focus_ocr: list[OCRObservation],
             index: int,
         ) -> list[dict[str, Any]]:
+            nonlocal completed_chunks, total_chunks, limit_splits
             try:
-                return [
-                    await self._analysis_call(
+                result = await self._analysis_call(
+                    chunk,
+                    self._fit_ocr(
                         chunk,
-                        self._fit_ocr(
-                            chunk,
-                            focus_ocr,
-                            _analysis_system_prompt(),
-                            schema,
-                            payload_for,
-                        ),
-                        inspirations,
-                        {**metadata, "part": index, "parts": len(chunks)}
-                        if len(chunks) > 1
-                        else metadata,
-                        checkpoints=checkpoints,
-                        on_checkpoint=on_checkpoint,
-                    )
-                ]
-            except ModelLimitError:
+                        focus_ocr,
+                        request_system,
+                        schema,
+                        payload_for,
+                    ),
+                    inspirations,
+                    {**metadata, "part": index, "parts": len(chunks)}
+                    if len(chunks) > 1
+                    else metadata,
+                    system=request_system,
+                    source_ids={item.id: source_by_id[item.id].id for item in chunk},
+                    checkpoints=checkpoints,
+                    on_checkpoint=on_checkpoint,
+                )
+                completed_chunks += 1
+                report_progress()
+                return [result]
+            except ModelLimitError as exc:
+                limit_splits += 1
+                if limit_splits > max_limit_splits:
+                    raise ModelOutputError(
+                        "内容分析连续超限，已达到有界缩小上限",
+                        details={"last_response": exc.details},
+                    ) from exc
                 if len(chunk) >= 2:
                     middle = len(chunk) // 2
+                    total_chunks += 1
+                    report_progress()
                     return [
                         *await analyze_chunk(chunk[:middle], focus_ocr, index),
                         *await analyze_chunk(chunk[middle:], focus_ocr, index),
                     ]
+                if len(chunk) == 1:
+                    piece = chunk[0]
+                    halves = split_text(piece.text)
+                    if halves is None:
+                        # Irreducible min chunk: degrade instead of failing the job.
+                        source = source_by_id[piece.id]
+                        completed_chunks += 1
+                        report_progress()
+                        warning = (
+                            f"字幕段 {source.id}（{len(piece.text)} 字）模型输出超限且"
+                            "最小文本块不可再切，已跳过该块分析"
+                        )
+                        return [
+                            AnalysisResult(
+                                title=f"跳过字幕段 {source.id}",
+                                one_liner=warning[:120],
+                                open_questions=[warning],
+                                content_card={"kind": "other", "notes": [warning]},
+                            ).model_dump(mode="json")
+                        ]
+                    source = source_by_id[piece.id]
+                    path = path_by_id[piece.id]
+                    children = [
+                        add_piece(source, halves[0], path * 2),
+                        add_piece(source, halves[1], path * 2 + 1),
+                    ]
+                    total_chunks += 1
+                    report_progress()
+                    return [
+                        *await analyze_chunk([children[0]], focus_ocr, index),
+                        *await analyze_chunk([children[1]], focus_ocr, index),
+                    ]
                 if not chunk and len(focus_ocr) >= 2:
                     middle = len(focus_ocr) // 2
+                    total_chunks += 1
+                    report_progress()
                     return [
                         *await analyze_chunk([], focus_ocr[:middle], index),
                         *await analyze_chunk([], focus_ocr[middle:], index),
@@ -861,8 +1252,6 @@ class OpenAICompatibleProvider(AnalysisProvider):
         partials: list[dict[str, Any]] = []
         for index, (chunk, focus_ocr) in enumerate(chunks, start=1):
             partials.extend(await analyze_chunk(chunk, focus_ocr, index))
-            if on_progress is not None:
-                on_progress("analysis", index, len(chunks))
         if len(partials) == 1:
             return AnalysisResult.model_validate(partials[0])
         if on_progress is not None:
@@ -943,9 +1332,13 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 except ModelLimitError:
                     pass
             if len(group) == 2:
-                if not fits_input:
-                    raise ModelContextError("两个分段结果仍超过模型输入预算，请增大上下文窗口")
-                raise ModelOutputError("两个分段结果仍超过模型汇总预算，请提高上下文或输出上限")
+                # Final fallback: never fail the whole job on an irreducible merge.
+                warning = (
+                    "两个分段结果仍超过模型输入预算，已降级拼接分段结果"
+                    if not fits_input
+                    else "两个分段结果仍超过模型汇总预算，已降级拼接分段结果"
+                )
+                return _soft_merge_analysis_partials(group, reason=warning)
             middle = len(group) // 2
             return await merge(
                 [
@@ -964,17 +1357,28 @@ class OpenAICompatibleProvider(AnalysisProvider):
         inspirations: list[InspirationInput],
         metadata: dict[str, Any],
         *,
+        system: str | None = None,
+        source_ids: dict[int, int] | None = None,
         checkpoints: dict[str, Any] | None = None,
         on_checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         return await self._checkpointed_call(
-            _analysis_system_prompt(),
+            system or _analysis_system_prompt(),
             {
                 "metadata": metadata,
                 "user_inspirations_verbatim": [
                     item.model_dump(mode="json") for item in inspirations
                 ],
-                "transcript": [_transcript_prompt_item(s) for s in segments],
+                "transcript": [
+                    {
+                        **_transcript_prompt_item(segment),
+                        "id": index,
+                        "source_segment_id": (
+                            source_ids[segment.id] if source_ids is not None else segment.id
+                        ),
+                    }
+                    for index, segment in enumerate(segments)
+                ],
                 "ocr": [_ocr_prompt_item(item) for item in ocr],
             },
             _analysis_response_schema(),
