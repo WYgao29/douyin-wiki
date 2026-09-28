@@ -123,3 +123,15 @@ async def test_auto_ocr_fallback_and_explicit_failure(monkeypatch: pytest.Monkey
 def test_unknown_sensevoice_confidence_is_not_a_review_reason(text) -> None:
     segments = [TranscriptSegment(id=2, start_ms=0, end_ms=1000, text=text)]
     assert detect_review_issues(segments) == []
+
+def test_selectors_construct_backends_lazily() -> None:
+    asr = SelectedTranscriber(MediaSettings(asr_provider="whisper"))
+    assert asr._whisper is None and asr._sensevoice is None
+    _ = asr.whisper
+    assert asr._whisper is not None and asr._sensevoice is None
+
+    ocr = SelectedOCR(MediaSettings(ocr_provider="vision"), Path("vision.swift"))
+    assert ocr._rapidocr is None and ocr._vision is None
+    _ = ocr.vision
+    assert ocr._vision is not None and ocr._rapidocr is None
+

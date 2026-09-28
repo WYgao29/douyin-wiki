@@ -1719,6 +1719,7 @@ class VisionOCR:
         self.script_path = script_path
 
     async def recognize(self, frames: list[tuple[int, Path]]) -> list[OCRObservation]:
+        """frames[*][0] is timestamp_ms for video frames (same contract as RapidOCR)."""
         if not frames:
             return []
         if not shutil.which("swift"):

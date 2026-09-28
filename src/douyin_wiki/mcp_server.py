@@ -26,8 +26,7 @@ from .models import (
 from .service import DouyinWikiService
 
 INSTRUCTIONS = """这是抖库，本地抖音知识库默认由当前 Gateway Agent 完成 AI 校正与分析。
-工具会保留英文内部状态码供程序判断，并同时返回对应的中文 label 字段；面向用户回复时只能
-使用中文 label，不得展示英文状态码。
+工具会保留英文内部状态码供程序判断，并同时返回对应的中文 label 字段。轮询与分支必须读英文 `status`（或事件中的机读状态），禁止用 `status_label` / `state_label` / `stage_label` 做相等判断；面向用户回复时只能使用中文 label，不得展示英文状态码。
 采集时调用 capture_douyin，并传入 gateway_context 以便异步结果回到原会话。任务显示为
 “待 AI 处理”后：调用 get_analysis_context；先调用 submit_transcript_correction，
 如 source_kind=image_note 且 phase=analysis，则直接根据 analysis_schema 调用

@@ -7,15 +7,21 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from ..config import MediaSettings
 from ..errors import ExternalToolError
 from ..models import OCRObservation, TranscriptSegment
-from .media import VisionOCR, WhisperTranscriber
+
+if TYPE_CHECKING:
+    from .media import VisionOCR, WhisperTranscriber
 
 logger = logging.getLogger(__name__)
 _SENSEVOICE_TAG = re.compile(r"<\|[^|>]+\|>")
+
+# First element of OCR frame tuples: video extract_frames uses milliseconds;
+# image-note callers may pass an ordinal later remapped onto image_index.
+FrameStampMs = int
 
 
 class Transcriber(Protocol):
@@ -23,7 +29,7 @@ class Transcriber(Protocol):
 
 
 class OCREngine(Protocol):
-    async def recognize(self, frames: list[tuple[int, Path]]) -> list[OCRObservation]: ...
+    async def recognize(self, frames: list[tuple[FrameStampMs, Path]]) -> list[OCRObservation]: ...
 
 
 class BackendUnavailableError(ExternalToolError):
@@ -166,17 +172,17 @@ class RapidOCREngine:
     async def ensure_ready(self) -> None:
         await asyncio.to_thread(self._ensure_ready)
 
-    async def recognize(self, frames: list[tuple[int, Path]]) -> list[OCRObservation]:
+    async def recognize(self, frames: list[tuple[FrameStampMs, Path]]) -> list[OCRObservation]:
         if not frames:
             return []
         await self.ensure_ready()
         return await asyncio.to_thread(self._recognize_sync, frames)
 
-    def _recognize_sync(self, frames: list[tuple[int, Path]]) -> list[OCRObservation]:
+    def _recognize_sync(self, frames: list[tuple[FrameStampMs, Path]]) -> list[OCRObservation]:
         observations: list[OCRObservation] = []
         with self._lock:
             try:
-                for source_index, path in frames:
+                for timestamp_ms, path in frames:
                     result = self._engine(str(path))
                     texts = getattr(result, "txts", None)
                     scores = getattr(result, "scores", None)
@@ -196,8 +202,8 @@ class RapidOCREngine:
                             confidence = sum(values) / len(values)
                     observations.append(
                         OCRObservation(
-                            timestamp_ms=source_index,
-                            source_index=source_index,
+                            timestamp_ms=timestamp_ms,
+                            source_index=timestamp_ms,
                             text="\n".join(lines),
                             confidence=confidence,
                             image_path=str(path),
@@ -209,15 +215,32 @@ class RapidOCREngine:
 
 
 class SelectedTranscriber:
+    """Pick SenseVoice or Whisper; backends are constructed only when selected."""
+
     def __init__(self, settings: MediaSettings) -> None:
         self.settings = settings
-        self.whisper = WhisperTranscriber(settings)
-        self.sensevoice = SenseVoiceTranscriber(settings)
+        self._whisper: WhisperTranscriber | None = None
+        self._sensevoice: SenseVoiceTranscriber | None = None
         self.provenance: dict[str, str] = {}
+
+    @property
+    def whisper(self) -> WhisperTranscriber:
+        if self._whisper is None:
+            from .media import WhisperTranscriber
+
+            self._whisper = WhisperTranscriber(self.settings)
+        return self._whisper
+
+    @property
+    def sensevoice(self) -> SenseVoiceTranscriber:
+        if self._sensevoice is None:
+            self._sensevoice = SenseVoiceTranscriber(self.settings)
+        return self._sensevoice
 
     async def transcribe(self, audio_path: Path, output_dir: Path) -> list[TranscriptSegment]:
         self.provenance = {}
         provider = self.settings.asr_provider
+        fallback_reason: str | None = None
         if provider != "whisper":
             try:
                 await self.sensevoice.ensure_ready()
@@ -233,19 +256,36 @@ class SelectedTranscriber:
         self.provenance = dict(self.whisper.provenance) or {
             "provider": "whisper", "model": self.settings.whisper_model
         }
-        if provider == "auto" and "fallback_reason" not in self.provenance:
+        if provider == "auto" and fallback_reason and "fallback_reason" not in self.provenance:
             self.provenance["fallback_reason"] = fallback_reason
         return result
 
 
 class SelectedOCR:
+    """Pick RapidOCR or Vision; backends are constructed only when selected."""
+
     def __init__(self, settings: MediaSettings, vision_script: Path) -> None:
         self.settings = settings
-        self.rapidocr = RapidOCREngine()
-        self.vision = VisionOCR(vision_script)
+        self._vision_script = vision_script
+        self._rapidocr: RapidOCREngine | None = None
+        self._vision: VisionOCR | None = None
         self.provenance: dict[str, str] = {}
 
-    async def recognize(self, frames: list[tuple[int, Path]]) -> list[OCRObservation]:
+    @property
+    def rapidocr(self) -> RapidOCREngine:
+        if self._rapidocr is None:
+            self._rapidocr = RapidOCREngine()
+        return self._rapidocr
+
+    @property
+    def vision(self) -> VisionOCR:
+        if self._vision is None:
+            from .media import VisionOCR
+
+            self._vision = VisionOCR(self._vision_script)
+        return self._vision
+
+    async def recognize(self, frames: list[tuple[FrameStampMs, Path]]) -> list[OCRObservation]:
         self.provenance = {}
         if not frames:
             return []

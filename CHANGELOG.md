@@ -24,6 +24,8 @@
 
 ### 修复
 
+- R4 收口：公开 `deduplicate_review_issues`；Selector 按需构造后端并懒加载 `media`；FSMN-VAD revision 钉为提交哈希；Gateway/MCP 明确机读 `status` 与中文 label 分工；清理已 ignore 的本地 `.test-*` / 证据目录（不改 `.gitignore`）。
+
 - Playwright CDN 候选与目标作品绑定：优先匹配 aweme `play_addr` / URI / 作品 ID 特征；在已知目标地址时拒绝无关广告/推荐 CDN，避免 video_id 正确但内容错位。`require_match` 下作品 ID 子串只加分、不视为 matched；等待环在锚点就绪前不因 MIME 音视频对提前结束，以便迟到的目标 douyinvod 仍能进入候选。
 
 - Web 写请求必须带匹配本机 Host 的 Origin 或 Referer；并拒绝 `Sec-Fetch-Site: cross-site` / `same-site`。同源浏览器 UI 不受影响；无头本地客户端需显式加头。Vault 写入/扫描与删除一致拒绝内部符号链接。yt-dlp Cookie 仅在 Playwright Profile 有可用抖音会话时优先，否则回退系统浏览器；creator 与 media 共用同一选择逻辑。json_schema 400 回退不再把空响应体或过宽关键词当作 schema 拒绝。

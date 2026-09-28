@@ -81,9 +81,9 @@ class MediaSettings(BaseModel):
     ocr_provider: Literal["auto", "rapidocr", "vision"] = "auto"
     asr_model: str = "iic/SenseVoiceSmall"
     vad_model: str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-    # Pin hub revisions so weight pulls stay reproducible (SenseVoice model.pt commit; VAD tag).
+    # Pin hub revisions so weight pulls stay reproducible (SenseVoice model.pt commit; FSMN-VAD tip of tag v2.0.4).
     asr_model_revision: str = "70514a3da51f1160f51d18449dab6128bbd4928b"
-    vad_model_revision: str = "v2.0.4"
+    vad_model_revision: str = "662fc7a38813d81305085696d59eb5b1141a204a"
     asr_device: Literal["auto", "cpu", "mps"] = "auto"
     whisper_provider: str = "auto"
     whisper_model: str = "mlx-community/whisper-large-v3-turbo"
@@ -192,7 +192,8 @@ def load_config(path: Path | None = None) -> AppConfig:
         data = tomllib.load(handle)
     media = data.setdefault("media", {})
     if isinstance(media, dict):
-        # A pre-upgrade config must keep using the engines it was created with.
+        # Upgrade path: configs written before asr/ocr_provider existed keep Whisper/Vision.
+        # Fresh AppConfig / render_default_config still default to "auto" (SenseVoice/RapidOCR).
         media.setdefault("asr_provider", "whisper")
         media.setdefault("ocr_provider", "vision")
     return AppConfig.model_validate(data)

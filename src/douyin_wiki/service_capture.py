@@ -29,7 +29,7 @@ from .models import (
     VideoMetadata,
 )
 from .review import (
-    _deduplicate_issues,
+    deduplicate_review_issues,
     apply_review_resolutions,
     detect_review_issues,
     transcript_confidence_info,
@@ -528,7 +528,7 @@ class CaptureMixin:
                     [self._ocr_model(item) for item in ocr_items],
                     **correction_kwargs,
                 )
-            issues = _deduplicate_issues([*detect_review_issues(transcript_raw), *llm_issues])
+            issues = deduplicate_review_issues([*detect_review_issues(transcript_raw), *llm_issues])
             artifacts["transcript_corrected"] = [item.model_dump(mode="json") for item in corrected]
             artifacts["review_issues"] = [item.model_dump(mode="json") for item in issues]
             self.database.update_job(

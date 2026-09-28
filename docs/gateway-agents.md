@@ -166,7 +166,9 @@ OCR 未出现对应内容不等于冲突，两个来源相同也不保证正确�
 “需要登录授权”表示视频浏览器 Cookie 失效，或图文专用浏览器需要登录/验证码。本机 Worker 通常已经
 显示 macOS 授权引导；用户完成登录后，抖库会验证授权并自动重试相同授权通道中仍然暂停的任务。
 Gateway 应先调用 `get_auth_status` 和 `get_job` 复核最新状态，不要反复打开浏览器或重复调用
-`retry_job`。若用户选择稍后处理、引导超时或本机弹框不可用，再按任务中的 `auth_scope` 提供手工兜底：
+`retry_job`。
+
+**状态字段约定（程序判断用机读码）**：MCP/`get_job` 同时返回英文机读码 （`status` / 事件里的状态）和中文展示字段（`status_label`、`state_label`、`stage_label` 等）。Agent 轮询与分支判断必须用英文机读码（如 `awaiting_agent_analysis`、`needs_review`）；面向用户回复时只用中文 label，不要用中文 label 做相等判断。若用户选择稍后处理、引导超时或本机弹框不可用，再按任务中的 `auth_scope` 提供手工兜底：
 `video` 使用 `uv run douyin-wiki auth video`，`image_note` 或 `creator` 使用
 `uv run douyin-wiki auth douyin`；确认授权成功后再调用 `retry_job`。
 不得要求用户提供 Cookie；状态接口也不会返回 Cookie 值。

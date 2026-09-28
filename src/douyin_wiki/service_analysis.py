@@ -23,7 +23,7 @@ from .models import (
     TranscriptCorrection,
     TranscriptSegment,
 )
-from .review import _deduplicate_issues, detect_review_issues
+from .review import deduplicate_review_issues, detect_review_issues
 from .time_utils import utc_now
 from .vault import safe_filename
 
@@ -126,7 +126,7 @@ class AnalysisMixin:
             segment.model_copy(update={"text": by_id.get(segment.id, segment.text)})
             for segment in raw
         ]
-        issues = _deduplicate_issues([*detect_review_issues(raw), *(review_issues or [])])
+        issues = deduplicate_review_issues([*detect_review_issues(raw), *(review_issues or [])])
         artifact_update = {
             "transcript_corrected": [item.model_dump(mode="json") for item in corrected],
             "review_issues": [item.model_dump(mode="json") for item in issues],

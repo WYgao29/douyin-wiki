@@ -80,7 +80,7 @@ uv sync --extra dev --extra embeddings --extra asr --extra ocr --extra mlx
 
 新生成配置的 `[media]` 含 `asr_provider = "auto"` 与 `ocr_provider = "auto"`，优先使用 SenseVoiceSmall + FSMN-VAD 和 RapidOCR PP-OCRv6 small。已存在的配置若没有这两个字段，会继续使用 Whisper / Vision；要切换，可在 `[media]` 中明确加入这两个字段。`asr_provider = "sensevoice"` 或 `ocr_provider = "rapidocr"` 可要求指定模型，模型缺失时会显示错误。`whisper_provider` 只控制 Whisper 内部的 MLX/CLI 选择。首次安装或初始化可能下载权重；任务产物和完成结果记录实际后端及回退原因。OCR 推理失败仍按现有规则写入任务警告。
 
-SenseVoice 与 VAD 模型加载时不执行模型仓的远端 Python 代码。标准 SenseVoiceSmall 与 FSMN-VAD 可正常使用；若自定义 `asr_model` 或 `vad_model` 依赖模型仓自带 Python，实现无法加载时，显式 `sensevoice` 模式会报错，`auto` 模式会回退 Whisper。默认通过 `asr_model_revision` / `vad_model_revision` 钉住 ModelScope 权重版本（SenseVoice 为含 `model.pt` 的提交，VAD 为 `v2.0.4`）；升级权重需显式改配置。
+SenseVoice 与 VAD 模型加载时不执行模型仓的远端 Python 代码。标准 SenseVoiceSmall 与 FSMN-VAD 可正常使用；若自定义 `asr_model` 或 `vad_model` 依赖模型仓自带 Python，实现无法加载时，显式 `sensevoice` 模式会报错，`auto` 模式会回退 Whisper。默认通过 `asr_model_revision` / `vad_model_revision` 钉住 ModelScope 权重版本（SenseVoice 与 FSMN-VAD 均为提交哈希；VAD 对应上游标签 `v2.0.4` 尖端）；升级权重需显式改配置。
 
 转录分数缺失与低置信度分开处理：SenseVoice 当前接口不提供置信度分数，新任务不会仅因包含数字、`AI` 或单位而暂停。任务详情的“媒体识别模型”显示分数可用性；这只是说明，不把正常完成改成警告终态。有实际低分或模型报告的具体识别歧义时仍需复核。Whisper 的换算分数是启发式指标，不是识别正确率。历史任务已保存的疑点不会自动消除，仍按原复核流程处理。
 

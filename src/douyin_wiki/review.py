@@ -7,7 +7,7 @@ from .models import ReviewIssue, TranscriptSegment
 MATERIAL_PATTERN = re.compile(r"\d|元|块|折|%|[A-Za-z]{2,}")
 
 
-def _deduplicate_issues(issues: list[ReviewIssue]) -> list[ReviewIssue]:
+def deduplicate_review_issues(issues: list[ReviewIssue]) -> list[ReviewIssue]:
     result: list[ReviewIssue] = []
     seen: set[tuple[int, int, int | None, str]] = set()
     for issue in issues:

@@ -39,7 +39,7 @@ def test_media_engine_config_preserves_legacy_and_renders_new_defaults(tmp_path:
     assert current.media.asr_provider == "auto"
     assert current.media.ocr_provider == "auto"
     assert current.media.asr_model_revision.startswith("70514a3")
-    assert current.media.vad_model_revision == "v2.0.4"
+    assert current.media.vad_model_revision == "662fc7a38813d81305085696d59eb5b1141a204a"
 
     partial = tmp_path / "partial.toml"
     partial.write_text('[media]\nasr_provider = "sensevoice"\n', encoding="utf-8")
