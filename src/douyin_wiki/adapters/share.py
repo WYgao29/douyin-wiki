@@ -13,6 +13,7 @@ URL_PATTERN = re.compile(r"https?://[^\s<>\]\[\)\(]+", re.IGNORECASE)
 WORK_ID_PATTERNS = (
     re.compile(r"/(?:share/)?(?P<kind>video|note|gallery)/(?P<id>\d{10,})"),
     re.compile(r"[?&](?:aweme_id|item_id)=(?P<id>\d{10,})"),
+    re.compile(r"[?&]modal_id=(?P<id>\d{10,})"),
 )
 CREATOR_PATH_PATTERN = re.compile(r"/user/(?P<sec_uid>[A-Za-z0-9_-]{8,256})")
 ALLOWED_HOST_SUFFIXES = ("douyin.com", "iesdouyin.com")

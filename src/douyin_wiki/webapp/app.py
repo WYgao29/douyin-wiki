@@ -401,13 +401,16 @@ def create_app(
         return {**result, "warnings": warnings}
 
     def _local_write_origin_ok(request: Request) -> bool:
-        """Require Origin or Referer to match this local host when either is sent.
+        """Require Origin or Referer to match this local host on write requests.
 
-        The app binds to 127.0.0.1/localhost only. Browser writes send Origin
-        (fetch/XHR) or Referer (form posts); both must match http(s)://{Host}.
-        Requests with neither header (curl and other local API clients) are
-        allowed so legitimate automation keeps working.
+        The app binds to 127.0.0.1/localhost only. Same-origin browser UI always
+        sends Origin (fetch/XHR) or Referer (form posts); both must match
+        http(s)://{Host}. Fetch Metadata still rejects cross-site / same-site
+        writes. Headerless mutating clients (curl without -H Origin/Referer)
+        are rejected so a local process cannot CSRF the Web API blindly.
         """
+        if request.headers.get("sec-fetch-site", "").lower() in {"cross-site", "same-site"}:
+            return False
         host = (request.headers.get("host") or "").strip()
         if not host:
             return False
@@ -421,7 +424,7 @@ def create_app(
             if not parsed.scheme or not parsed.netloc:
                 return False
             return f"{parsed.scheme}://{parsed.netloc}" in allowed
-        return True
+        return False
 
     @app.middleware("http")
     async def same_origin(request: Request, call_next):

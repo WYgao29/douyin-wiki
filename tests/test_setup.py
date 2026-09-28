@@ -24,6 +24,28 @@ from douyin_wiki.vault import VaultWriter
 runner = CliRunner()
 
 
+def test_media_engine_config_preserves_legacy_and_renders_new_defaults(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.toml"
+    legacy.write_text('[media]\nwhisper_provider = "mlx"\n', encoding="utf-8")
+    old = load_config(legacy)
+    assert old.media.asr_provider == "whisper"
+    assert old.media.ocr_provider == "vision"
+    assert old.media.whisper_provider == "mlx"
+
+    rendered = render_default_config(AppConfig())
+    new = tmp_path / "new.toml"
+    new.write_text(rendered, encoding="utf-8")
+    current = load_config(new)
+    assert current.media.asr_provider == "auto"
+    assert current.media.ocr_provider == "auto"
+    assert current.media.asr_model_revision.startswith("70514a3")
+    assert current.media.vad_model_revision == "v2.0.4"
+
+    partial = tmp_path / "partial.toml"
+    partial.write_text('[media]\nasr_provider = "sensevoice"\n', encoding="utf-8")
+    assert load_config(partial).media.ocr_provider == "vision"
+
+
 def test_gateway_is_default_analysis_mode(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(render_default_config(AppConfig()), encoding="utf-8")
@@ -478,3 +500,37 @@ def test_render_default_config_preserves_llm_response_format(tmp_path: Path) -> 
     loaded = load_config(path)
     assert loaded.llm.response_format == "json_schema"
     assert loaded.llm.context_window_tokens == 32768
+
+def test_doctor_transcription_and_ocr_follow_media_providers(tmp_path: Path, monkeypatch) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    config = AppConfig(vault_path=vault)
+    config.media.asr_provider = "auto"
+    config.media.ocr_provider = "auto"
+
+    import importlib.util as importlib_util
+
+    real_find = importlib_util.find_spec
+
+    def fake_find(name, package=None):
+        if name in {"funasr", "rapidocr", "mlx_whisper"}:
+            return None
+        return real_find(name, package)
+
+    monkeypatch.setattr("importlib.util.find_spec", fake_find)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda command: None if command in {"whisper", "swift"} else "/bin/true",
+    )
+    checks = doctor(config)
+    assert checks["transcription"]["ok"] is False
+    assert "SenseVoice" in (checks["transcription"]["message"] or "")
+    assert checks["ocr"]["ok"] is False
+    assert "RapidOCR" in (checks["ocr"]["message"] or "")
+
+    config.media.asr_provider = "whisper"
+    config.media.ocr_provider = "vision"
+    checks = doctor(config)
+    assert checks["transcription"]["provider"] == "whisper"
+    assert checks["ocr"]["provider"] == "vision"
+    assert checks["ocr"]["ok"] is False

@@ -77,6 +77,14 @@ class MediaSettings(BaseModel):
     frame_interval_seconds: int = 10
     scene_threshold: float = 0.35
     max_frames: int = 60
+    asr_provider: Literal["auto", "sensevoice", "whisper"] = "auto"
+    ocr_provider: Literal["auto", "rapidocr", "vision"] = "auto"
+    asr_model: str = "iic/SenseVoiceSmall"
+    vad_model: str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+    # Pin hub revisions so weight pulls stay reproducible (SenseVoice model.pt commit; VAD tag).
+    asr_model_revision: str = "70514a3da51f1160f51d18449dab6128bbd4928b"
+    vad_model_revision: str = "v2.0.4"
+    asr_device: Literal["auto", "cpu", "mps"] = "auto"
     whisper_provider: str = "auto"
     whisper_model: str = "mlx-community/whisper-large-v3-turbo"
     whisper_cli_model: str = "large-v3-turbo"
@@ -182,6 +190,11 @@ def load_config(path: Path | None = None) -> AppConfig:
         return AppConfig()
     with config_path.open("rb") as handle:
         data = tomllib.load(handle)
+    media = data.setdefault("media", {})
+    if isinstance(media, dict):
+        # A pre-upgrade config must keep using the engines it was created with.
+        media.setdefault("asr_provider", "whisper")
+        media.setdefault("ocr_provider", "vision")
     return AppConfig.model_validate(data)
 
 
@@ -240,6 +253,13 @@ max_duration_minutes = {cfg.media.max_duration_minutes}
 frame_interval_seconds = {cfg.media.frame_interval_seconds}
 scene_threshold = {cfg.media.scene_threshold}
 max_frames = {cfg.media.max_frames}
+asr_provider = {_toml_string(cfg.media.asr_provider)}
+ocr_provider = {_toml_string(cfg.media.ocr_provider)}
+asr_model = {_toml_string(cfg.media.asr_model)}
+vad_model = {_toml_string(cfg.media.vad_model)}
+asr_model_revision = {_toml_string(cfg.media.asr_model_revision)}
+vad_model_revision = {_toml_string(cfg.media.vad_model_revision)}
+asr_device = {_toml_string(cfg.media.asr_device)}
 whisper_provider = {_toml_string(cfg.media.whisper_provider)}
 whisper_model = {_toml_string(cfg.media.whisper_model)}
 whisper_cli_model = {_toml_string(cfg.media.whisper_cli_model)}

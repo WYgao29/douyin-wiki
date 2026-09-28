@@ -16,10 +16,15 @@ from douyin_wiki.webapp.app import create_app
 from tests.test_web import _web_fixture
 
 
+def local_client(app, **kwargs):
+    headers = {"Origin": "http://testserver", **(kwargs.pop("headers", {}) or {})}
+    return TestClient(app, headers=headers, **kwargs)
+
+
 def test_model_health_reports_actual_provider_reachability(tmp_path, monkeypatch) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         assert client.get("/api/system/model-health").json()["status"] == "inactive"
 
     config.analysis_mode = AnalysisMode.PROVIDER
@@ -31,7 +36,7 @@ def test_model_health_reports_actual_provider_reachability(tmp_path, monkeypatch
         lambda **kwargs: client_type(transport=transport, **kwargs),
     )
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         assert client.get("/api/system/model-health").json()["status"] == "ready"
 
 
@@ -41,11 +46,22 @@ def test_evidence_audit_is_available_in_job_detail_only(tmp_path) -> None:
     audit = [{"kind": "knowledge_atom", "id": "a1", "reason": "引文无法定位"}]
     service.database.update_job(job.id, artifacts={"analysis_evidence_audit": audit})
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         detail = client.get(f"/api/jobs/{job.id}").json()
         listing = client.get("/api/jobs").json()
     assert detail["analysis_evidence_audit"] == audit
     assert all("analysis_evidence_audit" not in item for item in listing["items"])
+
+
+def test_media_provenance_is_available_in_job_detail(tmp_path) -> None:
+    config, service = _web_fixture(tmp_path)
+    job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    provenance = {"asr": {"provider": "sensevoice", "model": "iic/SenseVoiceSmall"}}
+    service.database.update_job(job.id, artifacts={"media_provenance": provenance})
+    app = create_app(config, service=service, start_watcher=False)
+    with local_client(app) as client:
+        detail = client.get(f"/api/jobs/{job.id}").json()
+    assert detail["media_provenance"] == provenance
 
 
 class FakeAuthDownloader:
@@ -98,7 +114,7 @@ class FakeDouyinAuth:
 def test_capture_options_persist_and_open_job_detail(tmp_path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.post(
             "/api/captures",
             json={
@@ -148,7 +164,7 @@ def test_job_list_filters_user_action_and_keeps_compat_fields(tmp_path) -> None:
         unlock=True,
     )
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         listing = client.get("/api/jobs").json()
         assert listing["total"] >= 3
         assert listing["items"][0]["state_label"]
@@ -180,7 +196,7 @@ def test_video_and_douyin_auth_channels_are_isolated(tmp_path) -> None:
         unlock=True,
     )
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         status = client.get("/api/auth/status").json()
         assert status["cookie_values_exposed"] is False
         assert status["channels"]["video"]["user_state"] != "authorized"
@@ -207,7 +223,7 @@ def test_video_and_douyin_auth_channels_are_isolated(tmp_path) -> None:
 def test_maintenance_and_rebuild_do_nothing_until_confirmed(tmp_path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         preview = client.post("/api/system/maintenance", json={"confirmed": False}).json()
         assert preview["preview"] is True
         assert preview["executed"] is False
@@ -236,7 +252,7 @@ def test_delete_import_history_keeps_entries(tmp_path) -> None:
         )
     entry_id = service.database.list_entries()[0].id
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         preview = client.request(
             "DELETE", f"/api/imports/{parent.id}", json={"confirmed": False}
         ).json()
@@ -270,7 +286,7 @@ def test_review_and_gateway_payloads(tmp_path) -> None:
     )
     service.database.update_job(job.id, status=JobStatus.NEEDS_REVIEW, unlock=True)
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         review = client.get(f"/api/jobs/{job.id}/review").json()
         assert review["issues"][0]["id"] == "iss-1"
         rejected = client.post(f"/api/jobs/{job.id}/review", json={"resolutions": {"other": "x"}})
@@ -282,7 +298,7 @@ def test_review_and_gateway_payloads(tmp_path) -> None:
 def test_spa_routes_and_same_origin_still_enforced(tmp_path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         for path in (
             "/imports",
             "/imports/single",

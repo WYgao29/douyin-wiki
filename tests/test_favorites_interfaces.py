@@ -99,7 +99,7 @@ class FakeFavoritesService:
 
 def _client(config, service, favorites: FakeFavoritesService):
     service.favorites = favorites
-    return TestClient(create_app(config, service=service, start_watcher=False))
+    return TestClient(create_app(config, service=service, start_watcher=False), headers={"Origin": "http://testserver"})
 
 
 def test_web_scan_only_creates_inventory_job(config, service) -> None:

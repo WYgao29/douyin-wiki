@@ -18,6 +18,10 @@ def test_extract_url_from_full_share_text() -> None:
 
 
 def test_extract_video_id_from_supported_urls() -> None:
+    assert extract_video_id(
+        "https://www.douyin.com/user/self?from_tab_name=main&modal_id=7689429622975314067"
+        "&showSubTab=video&showTab=favorite_collection"
+    ) == "7689429622975314067"
     assert extract_video_id("https://www.douyin.com/video/7672717300746907078") == (
         "7672717300746907078"
     )

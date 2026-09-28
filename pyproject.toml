@@ -24,6 +24,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+asr = ["funasr>=1.4.16,<1.5", "torch>=2.5,<3", "soundfile>=0.12.1,<1", "kaldi-native-fbank>=1.20,<2"]
+ocr = ["rapidocr>=3.9.2,<4", "onnxruntime>=1.30,<2"]
 embeddings = ["sentence-transformers>=6.1,<7"]
 mlx = ["mlx-whisper>=0.4,<1"]
 dev = [

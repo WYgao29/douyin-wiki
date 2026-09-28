@@ -106,7 +106,7 @@
     header.append(titleBox, pill);
     const progress = D.node("p", `阶段 ${job.stage_label} · 进度 ${Math.round((job.progress || 0) * 100)}%`);
     const modelProgress = D.node("p", "", "hint-copy");
-    if (job.analysis_progress) {
+    if (job.analysis_progress && job.status === "analyzing") {
       const state = job.analysis_progress;
       const phases = {correction: "字幕校正", analysis: "分段分析", merge: "汇总", evidence: "证据校验"};
       const count = state.phase === "merge" ? ` · 已完成 ${state.completed_chunks} 次合并`
@@ -116,7 +116,8 @@
       const waitingMinutes = state.last_response_at ? Math.floor((Date.now() - Date.parse(state.last_response_at)) / 60000) : 0;
       const waiting = job.status === "analyzing" && waitingMinutes >= 5 ? ` · 当前批次已等待 ${waitingMinutes} 分钟` : "";
       const totalCalls = job.llm_stats?.successful_calls ? ` · 累计成功调用 ${job.llm_stats.successful_calls} 次` : "";
-      modelProgress.textContent = `${phases[state.phase] || state.phase}${count} · 最近模型响应 ${responseAt}${usage}${totalCalls}${waiting}`;
+      const phaseLabel = state.waiting_for_resource ? "等待模型校正资源" : (phases[state.phase] || state.phase);
+      modelProgress.textContent = `${phaseLabel}${count} · 最近模型响应 ${responseAt}${usage}${totalCalls}${waiting}`;
     }
     const actions = D.node("div", null, "operation-actions");
     const action = actionButton(job.next_action, job.id);
@@ -127,6 +128,16 @@
       actions.append(link);
     }
     const analysis = D.node("p", `${job.analysis_mode_label || ""}`, "hint-copy");
+    const media = D.node("section", null, "review-panel");
+    const providers = job.media_provenance || {};
+    if (providers.asr || providers.ocr) {
+      media.append(D.node("h2", "媒体识别模型"));
+      for (const [label, info] of [["ASR", providers.asr], ["OCR", providers.ocr]]) {
+        if (!info?.provider && !info?.confidence_note) continue;
+        media.append(D.node("p", `${label}：${info.provider || "未记录"}${info.model ? ` · ${info.model}` : ""}${info.fallback_reason ? ` · 回退原因：${info.fallback_reason}` : ""}`));
+        if (info.confidence_note) media.append(D.node("p", info.confidence_note, "hint-copy"));
+      }
+    }
     const modelHealth = D.node("p", "", "hint-copy");
     const timeline = D.node("ol", null, "job-timeline");
     for (const event of job.timeline || []) {
@@ -200,7 +211,7 @@
         evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${item.timestamp_ms == null ? "" : ` · ${item.timestamp_ms}ms`}：${item.reason}`));
       }
     }
-    root.replaceChildren(header, progress, modelProgress, modelHealth, actions, analysis, timeline, children, review, evidenceAudit);
+    root.replaceChildren(header, progress, modelProgress, modelHealth, actions, analysis, media, timeline, children, review, evidenceAudit);
     if (job.analysis_mode === "provider") {
       try {
         const health = await D.api("/api/system/model-health");

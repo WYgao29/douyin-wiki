@@ -12,9 +12,9 @@ flowchart LR
     Q --> W["本地 Worker"]
     W --> K{"作品类型"}
     K -->|"视频"| D["yt-dlp 下载"]
-    D --> T["ffmpeg + Whisper + Vision OCR"]
+    D --> T["ffmpeg + 配置的 ASR/OCR 后端"]
     K -->|"图文"| P["Playwright 下载原图"]
-    P --> O["逐图 Vision OCR"]
+    P --> O["逐图 OCR"]
     T --> E["待 AI 处理事件"]
     O --> E
     E --> G
@@ -126,6 +126,43 @@ OpenClaw 的 STDIO MCP server 配置示例：
 7. 每个事件成功处理或投递后调用 `acknowledge_job_event`。确认操作是幂等的。未确认的最新可操作
    事件会保留，可在 Gateway 重启后继续处理；同一任务已经过时的旧事件会自动标记为 superseded。
 
+`get_analysis_context.media_provenance.asr` 的 `confidence_status` 表示分数可用性：
+`unavailable` 为没有分数，`partial` 为部分字幕有分数，`available` 为每段都有分数；
+均不代表已验证的正确率。`confidence_note` 是非阻塞说明。不要仅因缺少分数、出现数字或 `AI`
+创建人工疑点；若校正发现具体识别歧义或与对应字幕画面冲突，应提交原文、原因与候选文本。
+OCR 未出现对应内容不等于冲突，两个来源相同也不保证正确。历史未解决疑点仍需用户处理。
+
+以下是 MCP 工具参数的最小示例。`job_id`、片段 `id` 和原会话路由须替换为刚读取的实际值；
+视频先读 `get_analysis_context.phase`，图文和重新分析若直接返回 `analysis` 就跳过校正。
+这里的示例文本只说明字段结构，不能直接当作作品分析结果提交。
+
+```json
+{"share_text":"https://www.douyin.com/video/7689429622975314067","inspirations":[],"gateway_context":{"gateway":"my-agent","channel":"chat","conversation_id":"conversation-123"}}
+```
+
+上面是 `capture_douyin`。视频的 `submit_transcript_correction` 使用原始逐字稿中的全部实际 ID，
+每项 `text` 必须保留完整内容。若有疑点，`review_issues` 每项使用 `id`、`start_ms`、
+`end_ms`、`raw_text`、`reason`、`suggestions`（字符串数组）；图文疑点还可用
+`image_index` 标明原图编号。例：
+
+```json
+{"id":"agent-0","start_ms":0,"end_ms":41870,"raw_text":"待核实的完整原句","reason":"专有名词待核实","suggestions":["完整候选原句"]}
+```
+
+`Service` 直调需要 `TranscriptCorrection` / `ReviewIssue` 实例，MCP 工具包装层会校验并转换 JSON：
+
+```json
+{"job_id":"实际 job_id","corrections":[{"id":0,"text":"完整校正后的第 0 段原话"}],"producer":"my-agent","model":"当前模型"}
+```
+
+分析请求应以本次 `get_analysis_context.analysis_schema` 为准。以下 `other` 类型的
+`content_card.notes` 是字符串数组；若改用 `recommendation`，`criteria` 也必须是数组。
+没有可核验证据时保持 `knowledge_atoms`、`chapters` 等为空，不能伪造事实或时间戳：
+
+```json
+{"job_id":"实际 job_id","producer":"my-agent","model":"当前模型","analysis":{"analysis_version":2,"title":"示例标题","one_liner":"示例一句话","relevance_to_inspiration":"","takeaways":[],"content_type":"other","facets":[],"content_card":{"kind":"other","notes":[]},"chapters":[],"knowledge_atoms":[],"actions":[],"open_questions":[],"reminders":[],"tags":[],"concepts":[],"entities":[],"contradictions":[]}}
+```
+
 “需要登录授权”表示视频浏览器 Cookie 失效，或图文专用浏览器需要登录/验证码。本机 Worker 通常已经
 显示 macOS 授权引导；用户完成登录后，抖库会验证授权并自动重试相同授权通道中仍然暂停的任务。
 Gateway 应先调用 `get_auth_status` 和 `get_job` 复核最新状态，不要反复打开浏览器或重复调用
@@ -168,20 +205,53 @@ token，获得用户明确同意后才能调用 `approve_job`。超过 2 小时�
 ## 事件接续
 
 `list_job_events` 是持久事件游标，不是内存通知。它支持 `after_event_id`、只返回未确认事件，
-并携带原始 `gateway_context`。没有 `gateway_context` 的 CLI 任务不会进入投递队列。Gateway 可以选择：
+并携带原始 `gateway_context`。没有 `gateway_context` 的 CLI 任务不会进入投递队列。写入事件本身不会启动 Agent；
+安装时须由所选 Agent 提供后台续跑、定时任务或事件桥。调度归该 Agent 或其安装程序管理，
+抖库只负责持久事件和无模型监控命令。可选择：
 
 - 在支持后台任务续跑时，把 `job_id` 交给 Gateway 自身的后台任务；
 - 使用 Gateway 定时任务调用 `list_job_events`；
 - 使用无 Agent 的本地定时器运行 `uv run douyin-wiki jobs events`，再由 Gateway 的事件桥
   唤醒一次 Agent。
 
-最后一种方式的“事件桥”属于 OpenClaw/Hermes 的部署配置，不由本项目自动安装。这样可以让
-空轮询不消耗模型 token；只有出现可操作事件时才唤醒 Agent。Hermes 的定时任务与投递能力见
+最后一种方式的“事件桥”属于 Agent 的部署配置，不由本项目自动安装。空轮询只运行本地命令、
+不消耗模型 token；有可操作事件时才唤醒 Agent。安装 Agent 时应完成以下配置并在重启后复核：
+
+1. 配置上面的 MCP STDIO server，并让 Agent 能访问 `list_job_events`、`get_job`、
+   `get_analysis_context`、提交、复核和 `acknowledge_job_event` 工具。
+2. 配置一个随 Agent 启动并持续运行的无模型监控任务，定时在项目目录执行
+   `uv run douyin-wiki gateway monitor-events`。空输出不启动模型；非空 JSON 中每个事件
+   按 `gateway_context` 路由到原会话，唤醒一次处理。不要只依赖“输出变化”触发：交付失败时
+   同一个未确认事件会再次出现，必须按失败次数有界重试并退避；重启时重新扫描未确认事件。
+   只持久化 `after_event_id` 高水位会跳过早先失败的未确认事件。
+3. Agent 处理每个事件前重新调用 `get_job`，核对任务仍处于该事件对应的可操作阶段；
+   再调用 `get_analysis_context` 读取最新 `phase` 和 schema。`awaiting_agent_analysis`
+   可能先后对应 `transcript_correction` 和 `analysis`，状态相同也要处理新事件。
+4. 按当前阶段调用工具，成功提交或成功交付原会话后才确认事件。提交或交付失败时保留未确认，
+   供下一轮及重启后重试；不要先确认。以事件 ID、job ID 和 phase 识别重复投递，
+   但仍在提交前重读当前阶段，已推进的阶段不再重复提交。这是可重试投递，不保证恰好一次执行。
+   过时事件会标记 `superseded`，默认监控只返回仍可操作的未确认事件。
+
+可用下列伪代码接入任意支持定时任务和 MCP 的 Agent；实际唤醒与消息投递 API 由该 Agent 提供：
+
+```text
+every polling interval:
+    output = run_without_model("uv run douyin-wiki gateway monitor-events")
+    if output is empty: return
+    for event in parse_json(output):
+        job = mcp.get_job(event.job_id)
+        if event is obsolete for job: continue
+        context = mcp.get_analysis_context(event.job_id) when job requires AI
+        process current context.phase and deliver to event.gateway_context
+        mcp.acknowledge_job_event(event.id) only after successful processing/delivery
+```
+
+Hermes 的定时任务与投递能力见
 [Hermes Cron 文档](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron/)。
 
 Hermes 的 cron 配置可直接调用抖库 CLI 的监控命令：
 `uv run douyin-wiki gateway monitor-events`（请在项目根目录执行）。它在没有未确认事件时不输出任何内容。
-Hermes 会对输出做变更检测，未变化时不会启动 Agent。当前机器可用以下命令检查已部署任务：
+当前机器可用以下命令检查 Hermes 的部署状态（仅在选用 Hermes 时执行）：
 
 ```bash
 hermes mcp test douyin-wiki

@@ -267,6 +267,11 @@ def message_for_user(
             return "本地模式正在等待整理，不会调用外部模型。"
         return "等待后台模型接口继续整理。"
     if job.status == JobStatus.ANALYZING:
+        correction = (job.artifacts.get("analysis_progress") or {}).get("phase") == "correction"
+        if correction:
+            if job.artifacts["analysis_progress"].get("waiting_for_resource"):
+                return "等待模型校正资源。"
+            return "后台模型正在校正逐字稿。"
         if analysis_mode == AnalysisMode.GATEWAY.value:
             return "外部 Agent 正在提交分析。后台不会在 Gateway 模式下自行完成整理。"
         if analysis_mode == AnalysisMode.LOCAL.value:
@@ -296,7 +301,12 @@ def present_job(
         "state": job.status.value,
         "state_label": label_status(job.status),
         "stage": stage,
-        "stage_label": USER_STAGES[stage],
+        "stage_label": (
+            "LLM 校正"
+            if job.status == JobStatus.ANALYZING
+            and (job.artifacts.get("analysis_progress") or {}).get("phase") == "correction"
+            else USER_STAGES[stage]
+        ),
         "progress": job.progress,
         "message_for_user": message_for_user(job, analysis_mode=analysis_mode),
         "next_action": next_action_for(job, analysis_mode=analysis_mode),

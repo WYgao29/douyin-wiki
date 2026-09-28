@@ -21,7 +21,7 @@
 - 博主作品按“待入库、已入库、未入库”分区；所有用户可见日期时间统一使用北京时间。
 - 视频优先用专用 Playwright Profile 拦截 CDN 地址再下载；失败时才回退 `yt-dlp`（优先读专用 Profile Cookie，系统 Chrome 仅作最后手段）。
 - 图文与博主采集同样使用独立 Playwright 浏览器会话，不接触日常 Chrome Profile。
-- 通过 `ffmpeg`、MLX Whisper/Whisper CLI 和 macOS Vision 完成本地转录与 OCR。
+- 通过 `ffmpeg`、SenseVoiceSmall + FSMN-VAD 和 RapidOCR PP-OCRv6 small 完成本地转录与 OCR；Whisper 和 macOS Vision 可作为旧配置或回退后端。
 - 默认由 OpenClaw/Hermes 当前会话模型校正与分析文字；原视频不上传给模型。
 - 本地 Worker 在转录后暂停，通过持久任务事件把校正、人工确认和完成结果交回原会话。
 - 可选切换为后台 OpenAI-compatible provider，或无 token 的本地降级模式。
@@ -70,13 +70,21 @@ uv run douyin-wiki init --vault /absolute/path/to/抖库
 初始化后会注入 `.obsidian/`、`raw/`、`wiki/`、`index.md`、`log.md`、`AGENTS.md`、
 `.gitignore` 和 `.douyin-wiki/`。如果目标目录属于已有 Vault，原文件保持不变。
 
-本地中文语义 Embedding 和 Apple Silicon Whisper 是可选的大体积依赖：
+本地中文语义 Embedding、SenseVoice ASR、RapidOCR 和 Apple Silicon Whisper 是可选依赖：
 
 ```bash
-uv sync --extra dev --extra embeddings --extra mlx
+uv sync --extra dev --extra embeddings --extra asr --extra ocr --extra mlx
 ```
 
-未安装时会分别降级到字符 n-gram 向量与现有 `whisper` CLI。
+未安装时，Embedding 降级到字符 n-gram；新配置的 ASR/OCR `auto` 分别尝试 Whisper 和 macOS Vision。Whisper 的 `auto` 在没有 MLX 包时尝试 `whisper` CLI；若两个 ASR 后端都不可用，导入会报错。
+
+新生成配置的 `[media]` 含 `asr_provider = "auto"` 与 `ocr_provider = "auto"`，优先使用 SenseVoiceSmall + FSMN-VAD 和 RapidOCR PP-OCRv6 small。已存在的配置若没有这两个字段，会继续使用 Whisper / Vision；要切换，可在 `[media]` 中明确加入这两个字段。`asr_provider = "sensevoice"` 或 `ocr_provider = "rapidocr"` 可要求指定模型，模型缺失时会显示错误。`whisper_provider` 只控制 Whisper 内部的 MLX/CLI 选择。首次安装或初始化可能下载权重；任务产物和完成结果记录实际后端及回退原因。OCR 推理失败仍按现有规则写入任务警告。
+
+SenseVoice 与 VAD 模型加载时不执行模型仓的远端 Python 代码。标准 SenseVoiceSmall 与 FSMN-VAD 可正常使用；若自定义 `asr_model` 或 `vad_model` 依赖模型仓自带 Python，实现无法加载时，显式 `sensevoice` 模式会报错，`auto` 模式会回退 Whisper。默认通过 `asr_model_revision` / `vad_model_revision` 钉住 ModelScope 权重版本（SenseVoice 为含 `model.pt` 的提交，VAD 为 `v2.0.4`）；升级权重需显式改配置。
+
+转录分数缺失与低置信度分开处理：SenseVoice 当前接口不提供置信度分数，新任务不会仅因包含数字、`AI` 或单位而暂停。任务详情的“媒体识别模型”显示分数可用性；这只是说明，不把正常完成改成警告终态。有实际低分或模型报告的具体识别歧义时仍需复核。Whisper 的换算分数是启发式指标，不是识别正确率。历史任务已保存的疑点不会自动消除，仍按原复核流程处理。
+
+模型权重由上游包或模型仓下载，项目仓库不分发权重。来源与条款见 [SenseVoice 模型仓](https://github.com/QwenAudio/SenseVoice)及其 `MODEL_LICENSE`、[RapidOCR 模型列表](https://rapidai.github.io/RapidOCRDocs/main/model_list/)和 [RapidOCR 许可证](https://github.com/RapidAI/RapidOCR/blob/main/LICENSE)。
 
 ## 分析模式
 
@@ -182,7 +190,7 @@ uv run douyin-wiki auth video
 `auth status` 只返回状态、Cookie 来源和修复动作，从不返回 Cookie 值。视频侧路径会优先检查专用 Profile，
 并在文案中标明与系统 Chrome 的双来源关系；本地检查只读 Cookie 名/域名/过期时间，不解密 Cookie 值。
 最终服务器可用性仍会在实际下载时验证。专用浏览器目录与用户日常 Chrome Profile 完全分离。
-静态图文只执行图片下载和逐图 Vision OCR，不调用 yt-dlp、ffmpeg、Whisper 或逐字稿校正；
+静态图文只执行图片下载和逐图 OCR（按配置使用 RapidOCR 或 Vision），不调用 yt-dlp、ffmpeg、ASR 或逐字稿校正；
 背景音乐只保存曲名和作者元数据。
 
 自动授权引导默认启用，可在配置中调整最长等待时间和轮询间隔，或完全关闭：
@@ -470,7 +478,7 @@ python3.12 -m venv /tmp/douku-release-check
 ```
 
 发行包不会包含 Vault、SQLite、Cookie、媒体、模型密钥或本机配置。完整媒体处理仍要求 macOS
-以及系统中的 `yt-dlp`、`ffmpeg`、Whisper、Swift Vision 和浏览器授权。
+以及系统中的 `yt-dlp`、`ffmpeg`、SenseVoice/Whisper、RapidOCR/Swift Vision 和浏览器授权。
 
 ## 当前边界
 

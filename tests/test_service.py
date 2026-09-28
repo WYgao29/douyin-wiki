@@ -1840,9 +1840,10 @@ async def test_ocr_only_analysis_reports_recursive_chunk_progress(monkeypatch) -
     await provider.analyze([], ocr, [], {}, on_progress=lambda *args: progress.append(args))
     analysis_progress = [item for item in progress if item[0] == "analysis"]
     assert analysis_progress[0] == ("analysis", 0, 1)
-    assert ("analysis", 0, 2) in analysis_progress
-    assert ("analysis", 1, 2) in analysis_progress
-    assert analysis_progress[-1] == ("analysis", 2, 2)
+    # Split counts the failed parent attempt and schedules two child batches.
+    assert ("analysis", 1, 3) in analysis_progress
+    assert ("analysis", 2, 3) in analysis_progress
+    assert analysis_progress[-1] == ("analysis", 3, 3)
 
 
 @pytest.mark.asyncio

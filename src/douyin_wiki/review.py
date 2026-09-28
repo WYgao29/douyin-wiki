@@ -7,7 +7,19 @@ from .models import ReviewIssue, TranscriptSegment
 MATERIAL_PATTERN = re.compile(r"\d|元|块|折|%|[A-Za-z]{2,}")
 
 
+def _deduplicate_issues(issues: list[ReviewIssue]) -> list[ReviewIssue]:
+    result: list[ReviewIssue] = []
+    seen: set[tuple[int, int, int | None, str]] = set()
+    for issue in issues:
+        key = (issue.start_ms, issue.end_ms, issue.image_index, issue.raw_text)
+        if key not in seen:
+            seen.add(key)
+            result.append(issue)
+    return result
+
+
 def detect_review_issues(segments: list[TranscriptSegment]) -> list[ReviewIssue]:
+    """Missing scores are unknown, not low; only real low scores create issues."""
     issues: list[ReviewIssue] = []
     for segment in segments:
         low_confidence = (segment.confidence is not None and segment.confidence < 0.55) or (
@@ -42,3 +54,28 @@ def apply_review_resolutions(
         )
         for segment in segments
     ]
+
+
+def transcript_confidence_info(segments: list[TranscriptSegment]) -> dict[str, str]:
+    """Describe score availability without inventing a calibrated probability."""
+    if not segments:
+        return {}
+    scored = sum(
+        item.confidence is not None or item.avg_logprob is not None for item in segments
+    )
+    if not scored:
+        return {
+            "confidence_status": "unavailable",
+            "confidence_note": (
+                "当前转录结果未提供置信度分数；不代表识别质量低，不单独触发人工复核。"
+            ),
+        }
+    if scored < len(segments):
+        return {
+            "confidence_status": "partial",
+            "confidence_note": "部分字幕没有置信度分数；仅凭分数缺失不触发人工复核。",
+        }
+    return {
+        "confidence_status": "available",
+        "confidence_note": "转录包含模型分数或启发式分数，不等于经过校准的识别正确率。",
+    }

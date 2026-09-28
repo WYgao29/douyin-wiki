@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from douyin_wiki import mcp_server
 from douyin_wiki.adapters.embeddings import EmbeddingService
 from douyin_wiki.adapters.image_note import (
     _best_image_url,
@@ -17,9 +19,11 @@ from douyin_wiki.adapters.image_note import (
     _usable_auth_cookies,
 )
 from douyin_wiki.adapters.llm import AnalysisProvider
+from douyin_wiki.adapters.media_models import SelectedOCR
 from douyin_wiki.adapters.share import ResolvedShare
 from douyin_wiki.config import AppConfig, EmbeddingSettings, LLMSettings
 from douyin_wiki.errors import BrowserAuthRequiredError, LivePhotoUnsupportedError
+from douyin_wiki.mcp_server import mcp
 from douyin_wiki.models import (
     AnalysisMode,
     AnalysisResult,
@@ -281,8 +285,30 @@ async def test_image_note_pipeline_skips_video_tools_and_writes_ordered_images(
 
 
 @pytest.mark.asyncio
-async def test_image_note_gateway_skips_transcript_correction(tmp_path: Path) -> None:
+async def test_image_note_rapidocr_keeps_image_indexes_and_provenance(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    selected = SelectedOCR(service.config.media, Path("unused.swift"))
+    selected.rapidocr._engine = lambda path: SimpleNamespace(
+        txts=[f"第 {Path(path).stem} 页说明"], scores=[0.9]
+    )
+    service.ocr = selected
+    service.capture_douyin("https://v.douyin.com/oH4K0gee_Ok/")
+
+    completed = await Worker(service).run_once()
+
+    assert completed.status == JobStatus.COMPLETED
+    assert completed.result["media_provenance"]["ocr"]["provider"] == "rapidocr"
+    data = service.database.get_entry_data(completed.result["entry_id"])
+    assert [item["image_index"] for item in data["ocr"]] == [1, 2, 3]
+    assert all(item["timestamp_ms"] is None for item in data["ocr"])
+
+
+@pytest.mark.asyncio
+async def test_image_note_gateway_skips_transcript_correction(
+    tmp_path: Path, monkeypatch
+) -> None:
     service = make_service(tmp_path, mode=AnalysisMode.GATEWAY)
+    monkeypatch.setattr(mcp_server, "_SERVICE", service)
     job = service.capture_douyin(
         "https://v.douyin.com/oH4K0gee_Ok/",
         [InspirationInput(text="本地模型量化选择")],
@@ -293,10 +319,11 @@ async def test_image_note_gateway_skips_transcript_correction(tmp_path: Path) ->
     context = service.get_analysis_context(job.id)
     assert context["metadata"]["source_kind"] == "image_note"
     assert context["transcript_raw"] == []
+    await mcp.call_tool("get_analysis_context", {"job_id": job.id})
 
-    service.submit_gateway_analysis(
-        job.id,
-        {
+    await mcp.call_tool(
+        "submit_gateway_analysis",
+        {"job_id": job.id, "analysis": {
             "title": "图文分析",
             "one_liner": "图文总结",
             "takeaways": ["FP16", "Q8", "Q4"],
@@ -310,8 +337,7 @@ async def test_image_note_gateway_skips_transcript_correction(tmp_path: Path) ->
                     "image_index": 2,
                 }
             ],
-        },
-        producer="hermes",
+        }, "producer": "test-agent"},
     )
     completed = await Worker(service).run_once()
     assert completed.status == JobStatus.COMPLETED

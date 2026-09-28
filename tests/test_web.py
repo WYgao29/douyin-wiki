@@ -61,6 +61,12 @@ class TopicFakeProvider:
         )
 
 
+def local_client(app, **kwargs):
+    """TestClient with Origin so mutating requests pass the local CSRF gate."""
+    headers = {"Origin": "http://testserver", **(kwargs.pop("headers", {}) or {})}
+    return TestClient(app, headers=headers, **kwargs)
+
+
 def _web_fixture(tmp_path: Path) -> tuple[AppConfig, DouyinWikiService]:
     vault = tmp_path / "vault"
     source_dir = vault / "wiki" / "sources"
@@ -176,7 +182,7 @@ def test_catalog_skips_bad_date_and_keeps_valid_articles(tmp_path: Path) -> None
         encoding="utf-8",
     )
     app = create_app(config, service=service, start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.get("/api/library")
         assert response.status_code == 200
         assert {item["entry_id"] for item in response.json()["items"]} == {"dy-123"}
@@ -202,7 +208,7 @@ def test_library_article_rendering_and_media_security(tmp_path: Path) -> None:
         chat_provider=FakeChatProvider(),
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         library = client.get("/api/library").json()
         assert library["total"] == 1
         assert library["items"][0]["content_type_label"] == "教程"
@@ -250,7 +256,7 @@ content_type: explanation
     )
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         library = client.get("/api/library")
         assert library.status_code == 200
         item = next(item for item in library.json()["items"] if item["entry_id"] == "dy-456")
@@ -284,7 +290,7 @@ def test_web_can_favorite_and_unfavorite_an_article(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         initial = client.get("/api/library").json()["items"][0]
         assert initial["favorite"] is False
 
@@ -307,7 +313,7 @@ def test_web_favorite_queues_removed_media_restore_and_exposes_job(tmp_path: Pat
     service.database.upsert_entry(entry, service.database.get_entry_data(entry.id))
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.put("/api/articles/dy-123/favorite", json={"favorite": True})
         assert response.status_code == 202
         restore_job = response.json()["restore_job"]
@@ -324,7 +330,7 @@ def test_web_favorite_returns_404_for_missing_article(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.put("/api/articles/missing/favorite", json={"favorite": True})
     assert response.status_code == 404
 
@@ -339,7 +345,7 @@ def test_web_favorite_returns_committed_state_when_catalog_refresh_fails(
         raise OSError("catalog unavailable")
 
     monkeypatch.setattr(app.state.catalog, "refresh", broken_refresh)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.put("/api/articles/dy-123/favorite", json={"favorite": True})
 
     assert response.status_code == 200
@@ -363,7 +369,7 @@ def test_web_can_retry_media_restore_job(tmp_path: Path, status: JobStatus) -> N
     )
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.post(f"/api/jobs/{restore.id}/retry")
         repeated = client.post(f"/api/jobs/{restore.id}/retry")
 
@@ -389,7 +395,7 @@ def test_web_retry_reuses_replacement_media_restore_job(tmp_path: Path) -> None:
     assert replacement.id != failed.id
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.post(f"/api/jobs/{failed.id}/retry")
 
     assert response.status_code == 202
@@ -410,7 +416,7 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         chat_provider=FakeChatProvider(),
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         page = client.get("/")
         assert page.status_code == 200
         assert '<main class="library-main" id="main-content"' in page.text
@@ -507,7 +513,7 @@ def test_web_filter_popover_can_paint_above_sidebar(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         stylesheet = client.get("/static/app.css")
         script = client.get("/static/app.js")
 
@@ -533,7 +539,7 @@ def test_web_capture_queues_link_or_share_text(tmp_path: Path, share_text: str) 
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.post("/api/captures", json={"share_text": share_text})
 
     assert response.status_code == 202
@@ -546,7 +552,7 @@ def test_web_capture_rejects_text_without_douyin_link(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.post(
             "/api/captures",
             json={"share_text": "看看这个网页 https://example.com/video/123"},
@@ -573,7 +579,7 @@ def test_article_trash_restore_and_permanent_delete(tmp_path: Path) -> None:
     machine = config.vault_path / "wiki" / ".data" / "sources" / "123.md"
     source_before = source.read_bytes()
     machine_before = machine.read_bytes()
-    with TestClient(app) as client:
+    with local_client(app) as client:
         topic_id = service.create_topic("删除恢复测试", ["dy-123"], goal="验证专题来源恢复")[
             "topic"
         ]["id"]
@@ -696,7 +702,7 @@ def test_trash_batch_restore_and_permanent_delete(tmp_path: Path) -> None:
         chat_provider=FakeChatProvider(),
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         first = client.request("DELETE", "/api/articles/dy-123", json={"confirmed": True}).json()
         second = client.request("DELETE", "/api/articles/dy-456", json={"confirmed": True}).json()
         trash_ids = [first["trash_id"], second["trash_id"]]
@@ -887,7 +893,7 @@ def test_web_delete_survives_catalog_refresh_failure(tmp_path: Path, monkeypatch
         "refresh",
         lambda: (_ for _ in ()).throw(RuntimeError("目录故障")),
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         response = client.request("DELETE", "/api/articles/dy-123", json={"confirmed": True})
     assert response.status_code == 200
     assert any("网页目录刷新失败" in item for item in response.json()["warnings"])
@@ -904,7 +910,7 @@ def test_topic_web_flow_strict_chat_artifacts_and_note_confirmation(tmp_path: Pa
         chat_provider=provider,
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         created = client.post(
             "/api/topics",
             json={
@@ -963,7 +969,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         chat_provider=FakeChatProvider(),
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         page = client.get("/settings/model")
         assert page.status_code == 200
         assert "data-theme-select" in page.text
@@ -1007,7 +1013,7 @@ def test_chat_stream_persists_history_and_usage(tmp_path: Path, monkeypatch) -> 
         chat_provider=FakeChatProvider(),
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         session = client.post(
             "/api/chat/sessions",
             json={"scope": "entry", "context_entry_id": "dy-123"},
@@ -1044,12 +1050,23 @@ def test_local_host_and_same_origin_are_enforced(tmp_path: Path) -> None:
             headers={"referer": "https://evil.example/attack"},
         )
         assert blocked_referer.status_code == 403
+        # Fetch Metadata also rejects cross-site writes that omit both headers.
+        assert client.post(
+            "/api/chat/sessions",
+            json={"scope": "library"},
+            headers={"sec-fetch-site": "cross-site"},
+        ).status_code == 403
+        assert client.post(
+            "/api/chat/sessions",
+            json={"scope": "library"},
+            headers={"sec-fetch-site": "same-site"},
+        ).status_code == 403
         # Matching Origin is accepted.
         assert (
             client.post(
                 "/api/chat/sessions",
                 json={"scope": "library"},
-                headers={"origin": "http://testserver"},
+                headers={"origin": "http://testserver", "sec-fetch-site": "same-origin"},
             ).status_code
             == 201
         )
@@ -1062,8 +1079,8 @@ def test_local_host_and_same_origin_are_enforced(tmp_path: Path) -> None:
             ).status_code
             == 201
         )
-        # Neither Origin nor Referer — local API clients (curl) still work.
-        assert client.post("/api/chat/sessions", json={"scope": "library"}).status_code == 201
+        # Neither Origin nor Referer — headerless writes are rejected.
+        assert client.post("/api/chat/sessions", json={"scope": "library"}).status_code == 403
 
 
 def test_creator_sources_are_visible_and_machine_files_are_excluded(tmp_path: Path) -> None:
@@ -1095,7 +1112,7 @@ inspirations: []
     hidden.parent.mkdir(parents=True)
     hidden.write_text("---\ntype: source\nvideo_id: '999'\n---\n# 不应出现", encoding="utf-8")
     app = create_app(config, service=service, chat_provider=FakeChatProvider(), start_watcher=False)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         library = client.get("/api/library").json()
         assert {item["entry_id"] for item in library["items"]} == {"dy-123", "dy-456"}
         creator_item = next(item for item in library["items"] if item["entry_id"] == "dy-456")
@@ -1107,7 +1124,7 @@ inspirations: []
 def test_file_watcher_refreshes_library_without_generating_html(tmp_path: Path) -> None:
     config, service = _web_fixture(tmp_path)
     app = create_app(config, service=service, chat_provider=FakeChatProvider(), start_watcher=True)
-    with TestClient(app) as client:
+    with local_client(app) as client:
         assert client.get("/api/library").json()["total"] == 1
         added = config.vault_path / "wiki" / "sources" / "自动刷新_789.md"
         added.write_text(
@@ -1152,7 +1169,7 @@ def test_model_settings_save_to_keychain_without_changing_gateway_mode(
         chat_provider_factory=factory,
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         page = client.get("/settings/model")
         assert page.status_code == 200
         assert "API Key" in page.text
@@ -1203,7 +1220,7 @@ def test_web_can_switch_analysis_mode_without_silent_change(tmp_path: Path, monk
         service=service,
         start_watcher=False,
     )
-    with TestClient(app) as client:
+    with local_client(app) as client:
         before = client.get("/api/settings/model").json()
         assert before["analysis_mode"] == "gateway"
         assert {item["value"] for item in before["analysis_modes"]} == {
@@ -1251,7 +1268,7 @@ def test_model_settings_rejects_remote_http_before_secret_and_saves_loopback(
         start_watcher=False,
     )
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         rejected = client.post(
             "/api/settings/model",
             json={
@@ -1289,7 +1306,7 @@ def test_model_settings_validation_does_not_echo_credential_url(
     )
     credential_url = "https://user:secret@models.example/v1"
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         rejected = client.post(
             "/api/settings/model",
             json={
@@ -1318,7 +1335,7 @@ def test_loopback_model_endpoint_does_not_require_api_key(tmp_path: Path, monkey
     monkeypatch.setattr("douyin_wiki.webapp.chat.get_secret", lambda _: "")
     app = create_app(local_config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         status = client.get("/api/settings/model").json()
         assert status["configured"] is True
         assert status["api_key_required"] is False
@@ -1354,7 +1371,7 @@ def test_loopback_model_status_reports_configured_api_key_source(
     monkeypatch.setattr("douyin_wiki.webapp.chat.get_secret", lambda _: "omlx-local-key")
     app = create_app(local_config, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         status = client.get("/api/settings/model").json()
         assert status["api_key_configured"] is True
         assert status["api_key_required"] is False
@@ -1374,7 +1391,7 @@ def test_switching_cloud_endpoint_requires_a_new_provider_key(tmp_path: Path, mo
     )
     app = create_app(config, config_path=config_path, service=service, start_watcher=False)
 
-    with TestClient(app) as client:
+    with local_client(app) as client:
         rejected = client.post(
             "/api/settings/model",
             json={

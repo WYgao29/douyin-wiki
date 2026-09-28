@@ -1,5 +1,11 @@
 .DS_Store
 .test-env/
+.test-*/
+/.test-backup-20260927/
+/.test-r1-20260927/
+/.test-r2-20260928/
+/docs/_mcp-sim-evidence-20260927/
+/7686768044248452390/
 .env
 .obsidian/
 .venv/

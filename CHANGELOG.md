@@ -6,6 +6,8 @@
 
 ### 新增
 
+- 新安装可优先使用 SenseVoiceSmall + FSMN-VAD 和 RapidOCR PP-OCRv6 small；旧配置继续使用 Whisper / Vision。任务记录实际后端和回退原因，缺失可信 ASR 分数时保留复核入口。
+
 - 废纸篓支持勾选、全选/全不选，可一次恢复或彻底删除多条资料。
 
 - Web 成为日常操作主入口：授权中心区分抖音账号授权与视频下载授权，可从网页发起、检查并在成功后恢复暂停任务。
@@ -24,7 +26,10 @@
 
 - Playwright CDN 候选与目标作品绑定：优先匹配 aweme `play_addr` / URI / 作品 ID 特征；在已知目标地址时拒绝无关广告/推荐 CDN，避免 video_id 正确但内容错位。`require_match` 下作品 ID 子串只加分、不视为 matched；等待环在锚点就绪前不因 MIME 音视频对提前结束，以便迟到的目标 douyinvod 仍能进入候选。
 
-- Web 写请求在带 Origin/Referer 时校验为本机 Host；二者皆无时仍允许本地 API 客户端。Vault 写入/扫描与删除一致拒绝内部符号链接。yt-dlp Cookie 仅在 Playwright Profile 有可用抖音会话时优先，否则回退系统浏览器；creator 与 media 共用同一选择逻辑。json_schema 400 回退不再把空响应体或过宽关键词当作 schema 拒绝。
+- Web 写请求必须带匹配本机 Host 的 Origin 或 Referer；并拒绝 `Sec-Fetch-Site: cross-site` / `same-site`。同源浏览器 UI 不受影响；无头本地客户端需显式加头。Vault 写入/扫描与删除一致拒绝内部符号链接。yt-dlp Cookie 仅在 Playwright Profile 有可用抖音会话时优先，否则回退系统浏览器；creator 与 media 共用同一选择逻辑。json_schema 400 回退不再把空响应体或过宽关键词当作 schema 拒绝。
+- 分析阶段递归缩批时把失败父批计入进度并正确扩大 `total_chunks`，避免外层进度长时间停在同一格。
+- SenseVoice / FSMN-VAD 默认钉住 ModelScope revision；`doctor` 按 `asr_provider` / `ocr_provider` 检查 SenseVoice+RapidOCR 与 Whisper+Swift 回退栈。
+- 移除未使用的 `unknown_confidence` 形参；缺分语义仍由 `transcript_confidence_info` 说明。
 
 - 视频侧路径（auth 探测、`_fetch_info_json`、yt-dlp CDN 回退）优先使用专用 Playwright Profile Cookie，系统 Chrome 仅作最后手段；`check_auth` 文案标明双来源，README 改为 CDN 优先。
 - aweme `video.duration` 一律按毫秒换算；CDN 合并音视频与最终选片一致取最大文件。

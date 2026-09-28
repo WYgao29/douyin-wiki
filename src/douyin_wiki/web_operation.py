@@ -130,6 +130,7 @@ class WebOperationService:
             extra = {}
         extra["timeline"] = timeline
         extra["analysis_evidence_audit"] = job.artifacts.get("analysis_evidence_audit", [])
+        extra["media_provenance"] = job.artifacts.get("media_provenance", {})
         extra["children"] = children
         extra["child_stats"] = self._child_stats(children)
         if job.status == JobStatus.NEEDS_REVIEW:

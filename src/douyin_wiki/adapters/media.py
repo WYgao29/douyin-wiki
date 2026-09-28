@@ -67,6 +67,7 @@ AUTH_FAILURE_TERMS = (
     "sign in",
     "authentication required",
 )
+MEDIA_ID_QUERY_KEYS = {"video_id", "vid", "media_id", "item_id", "aweme_id"}
 
 
 
@@ -76,13 +77,29 @@ class CapturedCdnMedia:
 
     video_url: str
     audio_url: str | None = None
+    unbound_audio_seen: bool = False
     page_title: str | None = None
     info: dict[str, Any] = field(default_factory=dict)
 
 
+def _cdn_media_ids(url: str) -> tuple[str, ...]:
+    query = parse_qs(urlsplit(url).query)
+    return tuple(
+        sorted(
+            f"{key}={value}"
+            for key, values in query.items()
+            if key in MEDIA_ID_QUERY_KEYS
+            for value in values
+            if value
+        )
+    )
+
+
 def _cdn_url_identity(url: str) -> str:
     parsed = urlsplit(url)
-    return f"{(parsed.hostname or '').lower()}{parsed.path}"
+    base = f"{(parsed.hostname or '').lower()}{parsed.path}"
+    media_ids = _cdn_media_ids(url)
+    return f"{base}?{'&'.join(media_ids)}" if media_ids else base
 
 
 def _dedupe_cdn_urls(urls: list[str]) -> list[str]:
@@ -112,9 +129,9 @@ def _unique_candidate_rows(
             continue
         _, cur_type, cur_status = current
         # Complete responses beat partial ones; at equal status prefer richer MIME.
-        if status == 200 and cur_status != 200:
-            best[identity] = (url, content_type, status)
-        elif status == cur_status and len(content_type) > len(cur_type):
+        if (status == 200 and cur_status != 200) or (
+            status == cur_status and len(content_type) > len(cur_type)
+        ):
             best[identity] = (url, content_type, status)
     return list(best.values())
 
@@ -208,32 +225,54 @@ def _collect_aweme_media_anchors(
     detail: dict[str, Any], *, audio: bool = False
 ) -> tuple[list[str], set[str]]:
     """Collect play_addr CDN URLs and URI markers for the target aweme."""
-    container_key = "music" if audio else "video"
-    container = detail.get(container_key)
+    container = detail.get("video")
     if not isinstance(container, dict):
         container = {}
     urls: list[str] = []
     markers: set[str] = set()
-    for node in _iter_media_addr_nodes(container):
-        uri = str(node.get("uri") or "").strip()
+
+    def add_node(node: dict[str, Any]) -> None:
+        uri = str(node.get("uri") or node.get("audio_id") or "").strip()
         if uri:
             markers.add(uri)
-        for item in node.get("url_list") or []:
+        url_list = node.get("url_list") or []
+        if isinstance(url_list, dict):
+            candidates = url_list.values()
+        elif isinstance(url_list, (list, tuple)):
+            candidates = url_list
+        else:
+            candidates = []
+        for item in candidates:
             if isinstance(item, str) and item.startswith("http"):
                 urls.append(item)
                 markers.update(_significant_cdn_markers(item))
+
+    if audio:
+        # The video object's bitrate audio is the playback stream. The separate
+        # music.play_url describes attached music and must not replace narration.
+        bit_rate_audio = container.get("bit_rate_audio")
+        rows = bit_rate_audio if isinstance(bit_rate_audio, list) else [bit_rate_audio]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            node = row.get("audio_meta")
+            if isinstance(node, dict):
+                add_node(node)
+        video_audio = container.get("audio")
+        if isinstance(video_audio, dict):
+            add_node(video_audio)
+            for node in _iter_media_addr_nodes(video_audio):
+                add_node(node)
+        return _dedupe_cdn_urls(urls), markers
+
+    for node in _iter_media_addr_nodes(container):
+        add_node(node)
     # Top-level download_addr occasionally appears beside video/music.
     if not audio:
         nested = detail.get("download_addr")
         if isinstance(nested, dict):
             for node in _iter_media_addr_nodes({"download_addr": nested}):
-                uri = str(node.get("uri") or "").strip()
-                if uri:
-                    markers.add(uri)
-                for item in node.get("url_list") or []:
-                    if isinstance(item, str) and item.startswith("http"):
-                        urls.append(item)
-                        markers.update(_significant_cdn_markers(item))
+                add_node(node)
     return _dedupe_cdn_urls(urls), markers
 
 
@@ -242,6 +281,7 @@ def _cdn_binding_bonus(
     *,
     expected_work_id: str | None = None,
     markers: set[str] | None = None,
+    anchor_urls: list[str] | None = None,
     require_match: bool = False,
 ) -> tuple[int, bool]:
     """Return (score_delta, matched) for work-bound CDN selection."""
@@ -250,6 +290,29 @@ def _cdn_binding_bonus(
     identity = _cdn_url_identity(url).lower()
     bonus = 0
     matched = False
+    conflicting_base = False
+    for anchor in anchor_urls or []:
+        candidate_base = urlsplit(url)
+        anchor_base = urlsplit(anchor)
+        if (
+            candidate_base.hostname != anchor_base.hostname
+            or candidate_base.path != anchor_base.path
+        ):
+            continue
+        candidate_ids = set(_cdn_media_ids(url))
+        anchor_ids = set(_cdn_media_ids(anchor))
+        if (candidate_ids or anchor_ids) and (
+            not candidate_ids or not anchor_ids or candidate_ids.isdisjoint(anchor_ids)
+        ):
+            # Another bitrate URL at this endpoint may still match.
+            conflicting_base = True
+            continue
+        bonus += 1000
+        matched = True
+        break
+    if conflicting_base and not matched:
+        # Same endpoint can serve different media via its query string.
+        return -1000, False
     for marker in markers:
         token = marker.strip()
         if not token:
@@ -293,6 +356,7 @@ def _pick_best_cdn_url(
             item[0],
             expected_work_id=expected_work_id,
             markers=markers,
+            anchor_urls=anchor_urls,
             require_match=require_match,
         )
         return base + bonus, length
@@ -303,6 +367,7 @@ def _pick_best_cdn_url(
         best[0],
         expected_work_id=expected_work_id,
         markers=markers,
+        anchor_urls=anchor_urls,
         require_match=require_match,
     )
     if base_score + bonus < 0:
@@ -923,30 +988,37 @@ class YtDlpDownloader:
                     # still enter candidates. Exit early only on a bound match, or
                     # after a short settle / near deadline when anchors are absent.
                     mime_pair_since: float | None = None
+                    bound_video_since: float | None = None
                     loop_video_anchors: list[str] = []
                     loop_video_markers: set[str] = set()
                     loop_audio_anchors: list[str] = []
                     loop_audio_markers: set[str] = set()
                     while asyncio.get_running_loop().time() < deadline:
                         now = asyncio.get_running_loop().time()
-                        if payloads and not loop_video_markers:
-                            # Prefer a detail that actually carries play_addr markers;
-                            # a stub envelope must not freeze markers empty forever.
+                        if payloads:
+                            # A later detail can add anchors missing from an
+                            # earlier, partial envelope.
                             for payload in payloads:
                                 detail = _find_video_aweme_detail(
                                     payload, expected_work_id=expected_work_id
                                 )
                                 if not detail:
                                     continue
-                                (
-                                    loop_video_anchors,
-                                    loop_video_markers,
-                                ) = _collect_aweme_media_anchors(detail, audio=False)
-                                (
-                                    loop_audio_anchors,
-                                    loop_audio_markers,
-                                ) = _collect_aweme_media_anchors(detail, audio=True)
-                                if loop_video_markers:
+                                candidate_video, candidate_video_markers = (
+                                    _collect_aweme_media_anchors(detail, audio=False)
+                                )
+                                candidate_audio, candidate_audio_markers = (
+                                    _collect_aweme_media_anchors(detail, audio=True)
+                                )
+                                if candidate_video_markers and (
+                                    not loop_video_markers
+                                    or (candidate_audio_markers and not loop_audio_markers)
+                                ):
+                                    loop_video_anchors = candidate_video
+                                    loop_video_markers = candidate_video_markers
+                                    loop_audio_anchors = candidate_audio
+                                    loop_audio_markers = candidate_audio_markers
+                                if loop_video_markers and loop_audio_markers:
                                     break
 
                         near_deadline = now + 3.0 >= deadline
@@ -957,25 +1029,39 @@ class YtDlpDownloader:
                                 anchor_urls=loop_video_anchors,
                                 uri_markers=loop_video_markers,
                             )
-                            audio_url = _pick_best_cdn_url(
-                                _unique_candidate_rows(audio_candidates),
-                                audio=True,
-                                expected_work_id=expected_work_id,
-                                anchor_urls=loop_audio_anchors,
-                                uri_markers=loop_audio_markers,
+                            audio_url = (
+                                _pick_best_cdn_url(
+                                    _unique_candidate_rows(audio_candidates),
+                                    audio=True,
+                                    expected_work_id=expected_work_id,
+                                    anchor_urls=loop_audio_anchors,
+                                    uri_markers=loop_audio_markers,
+                                )
+                                if loop_audio_markers
+                                else None
                             )
                             # Bound pick available: stop once video is matched
                             # (audio may still be catching up near deadline).
-                            if video_url and (audio_url or near_deadline):
-                                break
+                            if video_url:
+                                if bound_video_since is None:
+                                    bound_video_since = now
+                                if (
+                                    audio_url
+                                    or near_deadline
+                                    or (
+                                        not loop_audio_markers
+                                        and now - bound_video_since >= 1.5
+                                    )
+                                ):
+                                    break
                         else:
                             video_url = _pick_best_cdn_url(
                                 _unique_candidate_rows(video_candidates)
                             )
-                            audio_url = _pick_best_cdn_url(
-                                _unique_candidate_rows(audio_candidates), audio=True
-                            )
-                            if video_url and audio_url:
+                            # An unbound audio stream may belong to an ad or a
+                            # recommended work; keep observing but never merge it.
+                            audio_url = None
+                            if video_url and audio_candidates:
                                 if mime_pair_since is None:
                                     mime_pair_since = now
                                 pending_json = any(
@@ -1014,7 +1100,7 @@ class YtDlpDownloader:
                                 asyncio.gather(*payload_tasks, return_exceptions=True),
                                 timeout=5.0,
                             )
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             for task in payload_tasks:
                                 if not task.done():
                                     task.cancel()
@@ -1044,14 +1130,25 @@ class YtDlpDownloader:
 
                     info_parts: list[dict[str, Any]] = []
                     aweme_detail: dict[str, Any] | None = None
+                    best_detail_score = (-1, -1)
                     for payload in payloads:
                         detail = _find_video_aweme_detail(
                             payload, expected_work_id=expected_work_id
                         )
-                        if detail:
+                        if not detail:
+                            continue
+                        _, detail_video_markers = _collect_aweme_media_anchors(detail)
+                        _, detail_audio_markers = _collect_aweme_media_anchors(
+                            detail, audio=True
+                        )
+                        score = (int(bool(detail_video_markers)), int(bool(detail_audio_markers)))
+                        if score > best_detail_score:
                             aweme_detail = detail
-                            info_parts.append(_info_from_aweme_detail(detail))
+                            best_detail_score = score
+                        if score == (1, 1):
                             break
+                    if aweme_detail is not None:
+                        info_parts.append(_info_from_aweme_detail(aweme_detail))
                     info_parts.append(
                         _info_from_dom_meta(
                             page_title=page_title or None,
@@ -1083,18 +1180,25 @@ class YtDlpDownloader:
                         anchor_urls=video_anchors,
                         uri_markers=video_markers,
                     )
-                    audio_url = _pick_best_cdn_url(
-                        _unique_candidate_rows(audio_candidates),
-                        audio=True,
-                        expected_work_id=expected_work_id,
-                        anchor_urls=audio_anchors,
-                        uri_markers=audio_markers,
+                    audio_url = (
+                        _pick_best_cdn_url(
+                            _unique_candidate_rows(audio_candidates),
+                            audio=True,
+                            expected_work_id=expected_work_id,
+                            anchor_urls=audio_anchors,
+                            uri_markers=audio_markers,
+                        )
+                        if audio_markers
+                        else None
                     )
-                    if not video_url:
+                    # Without both a target work ID and its media anchors, a
+                    # page CDN response may belong to an ad or recommendation.
+                    if not expected_work_id or not video_markers or not video_url:
                         return None
                     return CapturedCdnMedia(
                         video_url=video_url,
                         audio_url=audio_url,
+                        unbound_audio_seen=bool(audio_candidates and not audio_url),
                         page_title=page_title or info.get("title"),
                         info=info,
                     )
@@ -1140,6 +1244,53 @@ class YtDlpDownloader:
             logger.warning("CDN 路径元数据 JSON 无法解析")
             return {}
 
+    def _page_download_command(self, url: str, output_template: str) -> list[str]:
+        cookie_spec, _, _ = self._preferred_yt_dlp_cookie_spec()
+        return [
+            "yt-dlp",
+            "--no-playlist",
+            "--cookies-from-browser",
+            cookie_spec,
+            "--write-info-json",
+            "--write-thumbnail",
+            "--convert-thumbnails",
+            "jpg",
+            "--merge-output-format",
+            "mp4",
+            "--output",
+            output_template,
+            url,
+        ]
+
+    def _require_download_success(
+        self,
+        result: subprocess.CompletedProcess[str],
+        *,
+        tool: str,
+        page_fallback: bool,
+    ) -> None:
+        try:
+            _require_success(result, tool)
+        except CookieRequiredError as exc:
+            if page_fallback:
+                _, preferred_source, source_kind = self._preferred_yt_dlp_cookie_spec()
+                databases = (
+                    _playwright_profile_cookie_databases(self.profile_dir)
+                    if source_kind == "playwright_profile"
+                    else _chromium_cookie_databases(self.settings)
+                )
+                local_state, _, _ = _inspect_chromium_auth_cookies(databases)
+                if local_state == "available" and "fresh cookies" in (
+                    result.stderr or ""
+                ).lower():
+                    raise ExternalToolError(
+                        "yt-dlp 未能提取抖音作品；"
+                        f"{preferred_source} 已有未过期登录 Cookie，"
+                        "不能判定为需要重新登录",
+                        details=exc.details,
+                    ) from exc
+            raise
+
     async def download(self, url: str, video_id: str, target_dir: Path) -> VideoMetadata:
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1172,41 +1323,9 @@ class YtDlpDownloader:
             command.append(video_url)
         else:
             # Fallback: prefer dedicated Playwright profile cookies; system Chrome last.
-            cookie_spec, _, _ = self._preferred_yt_dlp_cookie_spec()
-            command[2:2] = [
-                "--cookies-from-browser",
-                cookie_spec,
-                "--write-info-json",
-                "--write-thumbnail",
-                "--convert-thumbnails",
-                "jpg",
-                "--merge-output-format",
-                "mp4",
-            ]
-            command.append(url)
+            command = self._page_download_command(url, output_template)
         result = await asyncio.to_thread(_run, command, timeout=7200)
-        try:
-            _require_success(result, "yt-dlp")
-        except CookieRequiredError as exc:
-            _, preferred_source, source_kind = self._preferred_yt_dlp_cookie_spec()
-            if source_kind == "playwright_profile":
-                local_state, _, _ = _inspect_chromium_auth_cookies(
-                    _playwright_profile_cookie_databases(self.profile_dir)
-                )
-            else:
-                local_state, _, _ = _inspect_chromium_auth_cookies(
-                    _chromium_cookie_databases(self.settings)
-                )
-            if cdn_result is None and local_state == "available" and "fresh cookies" in (
-                result.stderr or ""
-            ).lower():
-                raise ExternalToolError(
-                    "yt-dlp 未能提取抖音作品；"
-                    f"{preferred_source} 已有未过期登录 Cookie，"
-                    "不能判定为需要重新登录",
-                    details=exc.details,
-                ) from exc
-            raise
+        self._require_download_success(result, tool="yt-dlp", page_fallback=cdn_result is None)
 
         def media_files(prefix: str) -> list[Path]:
             return [
@@ -1220,6 +1339,46 @@ class YtDlpDownloader:
         video_files = media_files("original")
         if not video_files:
             raise ExternalToolError("yt-dlp 未生成视频文件")
+        if cdn_result is not None and (audio_url or cdn_result.unbound_audio_seen):
+            video_path = max(video_files, key=lambda path: path.stat().st_size)
+            probe = await asyncio.to_thread(
+                _run,
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a",
+                    "-show_entries",
+                    "stream=index",
+                    "-of",
+                    "csv=p=0",
+                    str(video_path),
+                ],
+                timeout=60,
+            )
+            _require_success(probe, "ffprobe 音轨检查")
+            if probe.stdout.strip():
+                # The video already carries its original audio. Never replace it
+                # with a separate music/CDN response from the page.
+                audio_url = None
+            elif not audio_url and cdn_result.unbound_audio_seen:
+                # Never analyze a silent CDN video while an observed separate
+                # audio stream cannot be tied to this work.
+                for path in video_files:
+                    path.unlink()
+                fallback = await asyncio.to_thread(
+                    _run, self._page_download_command(url, output_template), timeout=7200
+                )
+                self._require_download_success(
+                    fallback, tool="yt-dlp 页面回退下载", page_fallback=True
+                )
+                cdn_result = None
+                page_title = None
+                page_info = {}
+                video_files = media_files("original")
+                if not video_files:
+                    raise ExternalToolError("页面回退下载未生成视频文件")
         if audio_url:
             audio_command = [
                 "yt-dlp",
@@ -1479,6 +1638,7 @@ class FFmpegMediaProcessor:
 class WhisperTranscriber:
     def __init__(self, settings: MediaSettings) -> None:
         self.settings = settings
+        self.provenance: dict[str, str] = {}
 
     async def transcribe(self, audio_path: Path, output_dir: Path) -> list[TranscriptSegment]:
         return await asyncio.to_thread(self._transcribe_sync, audio_path, output_dir)
@@ -1487,11 +1647,15 @@ class WhisperTranscriber:
         provider = self.settings.whisper_provider
         if provider in {"auto", "mlx"}:
             try:
-                return self._transcribe_mlx(audio_path)
+                result = self._transcribe_mlx(audio_path)
+                self.provenance = {"provider": "whisper-mlx", "model": self.settings.whisper_model}
+                return result
             except (ImportError, ModuleNotFoundError) as exc:
                 if provider == "mlx":
                     raise ExternalToolError("未安装 mlx-whisper；运行 uv sync --extra mlx") from exc
-        return self._transcribe_cli(audio_path, output_dir)
+        result = self._transcribe_cli(audio_path, output_dir)
+        self.provenance = {"provider": "whisper-cli", "model": self.settings.whisper_cli_model}
+        return result
 
     def _transcribe_mlx(self, audio_path: Path) -> list[TranscriptSegment]:
         import mlx_whisper  # type: ignore[import-not-found]

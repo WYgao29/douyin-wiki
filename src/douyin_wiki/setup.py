@@ -474,17 +474,68 @@ def doctor(config: AppConfig) -> dict[str, Any]:
         "ok": importlib.util.find_spec("mlx_whisper") is not None,
         "message": "未安装时自动使用 whisper CLI",
     }
-    checks["transcription"] = {
-        "ok": checks["mlx_whisper"]["ok"] or checks["whisper"]["ok"],
-        "message": (
-            None
-            if checks["mlx_whisper"]["ok"] or checks["whisper"]["ok"]
-            else "既未安装 MLX Whisper，也找不到 Whisper CLI；视频无法转录"
-        ),
+    funasr_ok = importlib.util.find_spec("funasr") is not None
+    checks["funasr"] = {
+        "ok": funasr_ok,
+        "message": None if funasr_ok else "未安装 asr extra（funasr）；SenseVoice 不可用",
     }
+    rapidocr_ok = importlib.util.find_spec("rapidocr") is not None
+    checks["rapidocr"] = {
+        "ok": rapidocr_ok,
+        "message": None if rapidocr_ok else "未安装 ocr extra（rapidocr）；RapidOCR 不可用",
+    }
+    asr_provider = config.media.asr_provider
+    whisper_asr_ok = checks["mlx_whisper"]["ok"] or checks["whisper"]["ok"]
+    sensevoice_ok = checks["funasr"]["ok"]
+    if asr_provider == "sensevoice":
+        transcription_ok = sensevoice_ok
+        transcription_message = (
+            None
+            if transcription_ok
+            else "asr_provider=sensevoice 但未安装 funasr；运行 uv sync --extra asr"
+        )
+    elif asr_provider == "whisper":
+        transcription_ok = whisper_asr_ok
+        transcription_message = (
+            None
+            if transcription_ok
+            else "asr_provider=whisper 但既未安装 MLX Whisper，也找不到 Whisper CLI"
+        )
+    else:
+        transcription_ok = sensevoice_ok or whisper_asr_ok
+        transcription_message = (
+            None
+            if transcription_ok
+            else "未安装 SenseVoice（uv sync --extra asr）且无 Whisper/MLX；视频无法转录"
+        )
+    checks["transcription"] = {
+        "ok": transcription_ok,
+        "provider": asr_provider,
+        "message": transcription_message,
+    }
+    ocr_provider = config.media.ocr_provider
+    vision_ocr_ok = checks["swift"]["ok"]
+    if ocr_provider == "rapidocr":
+        ocr_ok = rapidocr_ok
+        ocr_message = (
+            None
+            if ocr_ok
+            else "ocr_provider=rapidocr 但未安装 rapidocr；运行 uv sync --extra ocr"
+        )
+    elif ocr_provider == "vision":
+        ocr_ok = vision_ocr_ok
+        ocr_message = None if ocr_ok else "ocr_provider=vision 但缺少 Swift；OCR 不可用"
+    else:
+        ocr_ok = rapidocr_ok or vision_ocr_ok
+        ocr_message = (
+            None
+            if ocr_ok
+            else "未安装 RapidOCR（uv sync --extra ocr）且缺少 Swift；视频和图文 OCR 不可用"
+        )
     checks["ocr"] = {
-        "ok": checks["swift"]["ok"],
-        "message": None if checks["swift"]["ok"] else "缺少 Swift；视频和图文 OCR 不可用",
+        "ok": ocr_ok,
+        "provider": ocr_provider,
+        "message": ocr_message,
     }
     checks["reminders"] = {
         "ok": checks["osascript"]["ok"],
@@ -547,6 +598,7 @@ class LaunchAgentInstaller:
         common_env = {
             "DOUYIN_WIKI_CONFIG": str(self.config_path),
             "PATH": launch_path,
+            "PYTHONUNBUFFERED": "1",
         }
         worker = {
             "Label": self.WORKER_LABEL,
@@ -641,6 +693,7 @@ class WebLaunchAgentInstaller:
             "EnvironmentVariables": {
                 "DOUYIN_WIKI_CONFIG": str(self.config_path),
                 "PATH": launch_path,
+                "PYTHONUNBUFFERED": "1",
             },
             "StandardOutPath": str(self.logs / "web.log"),
             "StandardErrorPath": str(self.logs / "web-error.log"),

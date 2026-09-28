@@ -12,7 +12,7 @@ from tests.test_favorites import A, B, FakeFavoritesAdapter, snapshot
 
 def test_web_inventory_to_selection_to_explicit_queue(config, service):
     service.favorites.adapter = FakeFavoritesAdapter(snapshot())
-    with TestClient(create_app(config, service=service, start_watcher=False)) as client:
+    with TestClient(create_app(config, service=service, start_watcher=False), headers={"Origin": "http://testserver"}) as client:
         submitted = client.post("/api/favorites/imports", json={})
         assert submitted.status_code == 202
         parent_id = submitted.json()["job_id"]
@@ -35,7 +35,7 @@ def test_web_inventory_to_selection_to_explicit_queue(config, service):
 
 def test_web_unproven_inventory_requires_acceptance_and_rejects_unknown_selection(config, service):
     service.favorites.adapter = FakeFavoritesAdapter(snapshot(complete=False))
-    with TestClient(create_app(config, service=service, start_watcher=False)) as client:
+    with TestClient(create_app(config, service=service, start_watcher=False), headers={"Origin": "http://testserver"}) as client:
         parent_id = client.post("/api/favorites/imports", json={}).json()["job_id"]
         asyncio.run(service.process_claimed_job(service.database.get_job(parent_id)))
         result = client.post(

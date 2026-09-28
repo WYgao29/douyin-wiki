@@ -237,6 +237,8 @@ async def test_cdn_download_merges_audio_after_both_streams_exist(
     calls: list[str] = []
 
     def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[0] == "ffmpeg":
             assert (tmp_path / "original.mp4").exists()
             assert (tmp_path / "audio.mp4").exists()
@@ -266,6 +268,42 @@ async def test_cdn_download_merges_audio_after_both_streams_exist(
 
 
 @pytest.mark.asyncio
+async def test_cdn_video_with_existing_audio_does_not_replace_original_track(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            audio_url="https://cdn.douyinvod.com/media-audio.mp4",
+            page_title="目标视频",
+        )
+
+    async def no_secondary(_url: str, _target_dir: Path):
+        return {}
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+    monkeypatch.setattr(downloader, "_fetch_info_json", no_secondary)
+    calls: list[str] = []
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            calls.append("probe")
+            return subprocess.CompletedProcess(command, 0, "1\n", "")
+        assert "media-video.mp4" in command[-1]
+        calls.append("video")
+        (tmp_path / "original.mp4").write_bytes(b"video-with-original-audio")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    metadata = await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert calls == ["video", "probe"]
+    assert Path(metadata.media_path).read_bytes() == b"video-with-original-audio"
+    assert not list(tmp_path.glob("audio.*"))
+
+
+@pytest.mark.asyncio
 async def test_cdn_audio_failure_does_not_return_silent_video(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -286,6 +324,8 @@ async def test_cdn_audio_failure_does_not_return_silent_video(
     monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
 
     def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, "", "")
         if "media-video.mp4" in command[-1]:
             (tmp_path / "original.mp4").write_bytes(b"video")
             return subprocess.CompletedProcess(command, 0, "", "")
@@ -294,6 +334,86 @@ async def test_cdn_audio_failure_does_not_return_silent_video(
     monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
     with pytest.raises(ExternalToolError):
         await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_silent_cdn_video_with_unbound_audio_uses_page_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            unbound_audio_seen=True,
+        )
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+    calls: list[str] = []
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            calls.append("probe")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "media-video.mp4" in command[-1]:
+            calls.append("cdn")
+            (tmp_path / "original.mp4").write_bytes(b"silent-cdn")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        assert command[-1] == "https://www.douyin.com/video/123"
+        assert "--cookies-from-browser" in command
+        calls.append("fallback")
+        assert not (tmp_path / "original.mp4").exists()
+        (tmp_path / "original.mp4").write_bytes(b"page-video-with-audio")
+        (tmp_path / "original.info.json").write_text(
+            '{"id":"123","title":"目标视频"}', encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    metadata = await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert calls == ["cdn", "probe", "fallback"]
+    assert Path(metadata.media_path).read_bytes() == b"page-video-with-audio"
+
+
+@pytest.mark.asyncio
+async def test_silent_cdn_page_fallback_does_not_mislabel_fresh_cookie_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    profile = tmp_path / "Default"
+    database = profile / "Network" / "Cookies"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER)")
+        connection.execute(
+            "INSERT INTO cookies VALUES (?, ?, ?)",
+            (".douyin.com", "sessionid", 99_999_999_999_999_999),
+        )
+    downloader = YtDlpDownloader(
+        MediaSettings(browser="chrome", browser_profile=str(profile)), tmp_path / "browser"
+    )
+
+    async def captured(_url: str):
+        return CapturedCdnMedia(
+            video_url="https://cdn.douyinvod.com/media-video.mp4",
+            unbound_audio_seen=True,
+        )
+
+    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+
+    def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if "media-video.mp4" in command[-1]:
+            (tmp_path / "original.mp4").write_bytes(b"silent-cdn")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(
+            command, 1, "", "ERROR: Fresh cookies (not necessarily logged in) are needed"
+        )
+
+    monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
+    with pytest.raises(ExternalToolError, match="不能判定为需要重新登录") as exc_info:
+        await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
+    assert not isinstance(exc_info.value, CookieRequiredError)
 
 
 @pytest.mark.asyncio
@@ -374,14 +494,36 @@ def test_cdn_url_selection_prefers_work_bound_over_higher_mime_score() -> None:
     # Without binding, the ad URL wins on .mp4 path bonus.
     assert _pick_best_cdn_url(rows) == unrelated
 
-    play_addr = f"{target}?video_id=v0200targeturi0001"
+    play_addr = f"{target}?dy_q=1790346473"
     bound = _pick_best_cdn_url(
         rows,
         expected_work_id=work_id,
         anchor_urls=[play_addr],
-        uri_markers={"v0200targeturi0001"},
+        uri_markers=set(),
     )
     assert bound == target
+
+
+def test_cdn_query_media_ids_remain_distinct_and_cannot_cross_bind() -> None:
+    wrong = "https://v1.douyinvod.com/video/play?video_id=other123456"
+    target = "https://v1.douyinvod.com/video/play?video_id=target123456"
+    rows = _unique_candidate_rows([(wrong, "video/mp4", 200), (target, "video/mp4", 200)])
+    assert len(rows) == 2
+    assert _pick_best_cdn_url(rows, anchor_urls=[target]) == target
+    assert _pick_best_cdn_url(rows[:1], anchor_urls=[target]) is None
+
+
+def test_cdn_query_media_id_requires_candidate_id_on_shared_path() -> None:
+    candidate = "https://v1.douyinvod.com/video/play?dy_q=1790346473"
+    target = "https://v1.douyinvod.com/video/play?video_id=target123456"
+    assert _pick_best_cdn_url([(candidate, "video/mp4", 200)], anchor_urls=[target]) is None
+
+
+def test_cdn_candidate_can_match_later_bitrate_anchor_on_same_path() -> None:
+    low = "https://v1.douyinvod.com/video/play?video_id=low123456"
+    high = "https://v1.douyinvod.com/video/play?video_id=high123456"
+    rows = _unique_candidate_rows([(high, "video/mp4", 200)])
+    assert _pick_best_cdn_url(rows, anchor_urls=[low, high]) == high
 
 
 def test_cdn_url_selection_rejects_unrelated_when_play_addr_known() -> None:
@@ -453,11 +595,20 @@ def test_collect_aweme_media_anchors_reads_play_addr_and_uri() -> None:
                     }
                 }
             ],
+            "bit_rate_audio": [
+                {
+                    "audio_meta": {
+                        "audio_id": "audio-uri-1",
+                        "url_list": {
+                            "main_url": "https://v3.douyinvod.com/target/media-audio/a"
+                        },
+                    }
+                }
+            ],
         },
         "music": {
             "play_url": {
-                "uri": "audio-uri-1",
-                "url_list": ["https://v3.douyinvod.com/target/media-audio/a"],
+                "url_list": ["https://v9.douyinvod.com/background/media-audio/music"]
             }
         },
     }
@@ -467,6 +618,7 @@ def test_collect_aweme_media_anchors_reads_play_addr_and_uri() -> None:
     assert "v0200targeturi0001" in video_markers
     assert audio_urls and "media-audio" in audio_urls[0]
     assert "audio-uri-1" in audio_markers
+    assert all("background" not in url for url in audio_urls)
 
 
 @pytest.mark.asyncio
@@ -509,6 +661,14 @@ async def test_capture_rebinds_cdn_to_aweme_play_addr(
                 )
             )
             self._handler(FakeResponse(ad, {}, content_type="video/mp4"))
+            # A partial detail may arrive before the play_addr-bearing detail.
+            self._handler(
+                FakeResponse(
+                    f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={work_id}",
+                    {"aweme_detail": {"aweme_id": work_id, "desc": "简略详情"}},
+                    content_type="application/json",
+                )
+            )
             self._handler(
                 FakeResponse(
                     f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={work_id}",
@@ -526,7 +686,7 @@ async def test_capture_rebinds_cdn_to_aweme_play_addr(
                                 "play_addr": {
                                     "uri": "v0200targeturi0001",
                                     "url_list": [
-                                        f"{target}?video_id=v0200targeturi0001",
+                                        target,
                                     ],
                                 },
                                 "cover": {"url_list": ["https://example.invalid/c.jpg"]},
@@ -580,6 +740,9 @@ async def test_capture_rebinds_cdn_to_aweme_play_addr(
     assert captured is not None
     assert captured.video_url == target
     assert captured.info.get("id") == work_id
+    assert captured.info.get("description") == "目标作品"
+    # This detail has no music/audio anchor; the observed audio is untrusted.
+    assert captured.audio_url is None
 
 
 @pytest.mark.asyncio
@@ -657,9 +820,22 @@ async def test_capture_keeps_collecting_for_late_target_after_mime_pair(
                                     "play_addr": {
                                         "uri": "v0200targeturi0001",
                                         "url_list": [
-                                            f"{target}?video_id=v0200targeturi0001",
+                                            target,
                                         ],
                                     },
+                                    "bit_rate_audio": [
+                                        {
+                                            "audio_meta": {
+                                                "audio_id": "target-audio-uri",
+                                                "url_list": {
+                                                    "main_url": (
+                                                        "https://v3.douyinvod.com/"
+                                                        "target/media-audio/a"
+                                                    )
+                                                },
+                                            }
+                                        }
+                                    ],
                                     "cover": {
                                         "url_list": ["https://example.invalid/c.jpg"]
                                     },
@@ -705,6 +881,7 @@ async def test_capture_keeps_collecting_for_late_target_after_mime_pair(
     )
     assert captured is not None
     assert captured.video_url == target
+    assert captured.audio_url == "https://v3.douyinvod.com/target/media-audio/a"
     assert captured.info.get("id") == work_id
 
 
@@ -731,6 +908,8 @@ async def test_cdn_download_renames_retained_audio_to_mp4(
     monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
 
     def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[0] == "ffmpeg":
             Path(command[-1]).write_bytes(b"merged")
         elif "media-video.mp4" in command[-1]:
@@ -846,6 +1025,12 @@ async def test_capture_awaits_aweme_payload_tasks_before_merge(
                             },
                             "video": {
                                 "duration": 5000,
+                                "play_addr": {
+                                    "uri": "v0200targeturi0001",
+                                    "url_list": [
+                                        "https://v3.douyinvod.com/path/media-video/seg"
+                                    ],
+                                },
                                 "cover": {"url_list": ["https://example.invalid/c.jpg"]},
                             },
                         }
@@ -1005,9 +1190,7 @@ async def test_capture_does_not_stall_on_hung_aweme_json(
         downloader._capture_cdn_url(f"https://www.douyin.com/video/{work_id}"),
         timeout=12.0,
     )
-    assert captured is not None
-    assert captured.video_url is not None
-    assert captured.audio_url is not None
+    assert captured is None
 
 def test_aweme_duration_is_always_milliseconds() -> None:
     """Aweme video.duration is ms; long second-like values must not be kept raw."""
@@ -1169,6 +1352,8 @@ async def test_cdn_merge_picks_largest_video_and_audio(
     merge_inputs: list[str] = []
 
     def fake_run(command: list[str], *, timeout: float = 3600):
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[0] == "ffmpeg":
             # Locate both -i operands.
             indexes = [i for i, part in enumerate(command) if part == "-i"]
@@ -1188,4 +1373,3 @@ async def test_cdn_merge_picks_largest_video_and_audio(
     await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
     assert merge_inputs[0].endswith("original.mp4")
     assert merge_inputs[1].endswith("audio.mp4")
-

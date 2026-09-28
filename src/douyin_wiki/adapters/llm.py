@@ -1201,7 +1201,9 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     ) from exc
                 if len(chunk) >= 2:
                     middle = len(chunk) // 2
-                    total_chunks += 1
+                    # Parent attempt finished; two child batches remain.
+                    completed_chunks += 1
+                    total_chunks += 2
                     report_progress()
                     return [
                         *await analyze_chunk(chunk[:middle], focus_ocr, index),
@@ -1233,7 +1235,8 @@ class OpenAICompatibleProvider(AnalysisProvider):
                         add_piece(source, halves[0], path * 2),
                         add_piece(source, halves[1], path * 2 + 1),
                     ]
-                    total_chunks += 1
+                    completed_chunks += 1
+                    total_chunks += 2
                     report_progress()
                     return [
                         *await analyze_chunk([children[0]], focus_ocr, index),
@@ -1241,7 +1244,8 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     ]
                 if not chunk and len(focus_ocr) >= 2:
                     middle = len(focus_ocr) // 2
-                    total_chunks += 1
+                    completed_chunks += 1
+                    total_chunks += 2
                     report_progress()
                     return [
                         *await analyze_chunk([], focus_ocr[:middle], index),
