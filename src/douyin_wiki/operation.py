@@ -83,7 +83,7 @@ CHANNEL_LABELS = {
 
 CHANNEL_PURPOSES = {
     "video": (
-        "视频下载通道：用本机日常浏览器的登录 Cookie 下载原片（yt-dlp）。"
+        "视频下载通道：专用 Playwright Profile 走 CDN 主路径；系统浏览器 Cookie 仅作 yt-dlp 最后回退。"
         "与下方「抖音账号授权」相互独立；账号已登录不代表本通道可下载。"
     ),
     "douyin": (
