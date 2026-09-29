@@ -95,7 +95,7 @@ class WorkerSettings(BaseModel):
     poll_seconds: float = 2
     download_concurrency: int = 2
     media_concurrency: int = 1
-    analysis_concurrency: int = 2
+    analysis_concurrency: int = 1
     lease_seconds: int = 180
     heartbeat_seconds: int = 30
 
