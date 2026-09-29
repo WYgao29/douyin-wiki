@@ -343,8 +343,13 @@ def present_job(
 
 def cookie_source_label(channel: str, cookie_source: str | None = None) -> str:
     if channel == "video":
-        return "本机日常浏览器的登录 Cookie（抖库不会读取或显示 Cookie 内容）"
-    return "抖库专用浏览器配置（与视频下载通道相互独立）"
+        source = (cookie_source or "").lower()
+        if "playwright" in source or "browser_profile" in source or "profile" in source:
+            return "专用 Playwright Profile（主下载/CDN 路径；抖库不会读取或显示 Cookie 内容）"
+        if source:
+            return "系统浏览器 Cookie（仅作 yt-dlp 最后回退；抖库不会读取或显示 Cookie 内容）"
+        return "专用 Playwright Profile（主路径）；系统 Chrome Cookie 仅作 yt-dlp 回退"
+    return "抖库专用浏览器配置（账号/收藏等通道，与视频下载主路径相互独立）"
 
 
 def present_auth_check(
