@@ -288,7 +288,8 @@ function setLibraryError(error) {
 }
 
 async function refreshAuthChannelBanners() {
-  const targets = ["library-auth-banner", "imports-auth-banner"]
+  // 资料库首页不展示授权横幅；仅导入枢纽提醒。
+  const targets = ["imports-auth-banner"]
     .map((id) => document.getElementById(id))
     .filter(Boolean);
   if (!targets.length) return;
