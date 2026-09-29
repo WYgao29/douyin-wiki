@@ -45,6 +45,9 @@
 
   function completionLine(job) {
     const warnings = Array.isArray(job.result?.warnings) ? job.result.warnings.filter(Boolean) : [];
+    if (job.status === "completed_with_warnings" && !warnings.length && (job.child_job_ids || []).length) {
+      return "有提示在子任务里，打开后可以查看。";
+    }
     if (job.status === "completed_with_warnings" && warnings.length) {
       const first = String(warnings[0]);
       return warnings.length > 1 ? `${first}（另有 ${warnings.length - 1} 条提示）` : first;
@@ -103,6 +106,30 @@
     return button;
   }
 
+  function followLink(href, label, className = "secondary-button") {
+    const link = D.node("a", label, className);
+    link.href = href;
+    link.addEventListener("click", (event) => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      D.navigate(href);
+    });
+    return link;
+  }
+
+  function quietAction(job) {
+    const action = job.next_action;
+    if (!action?.href || job.requires_user_action) return null;
+    if (action.code !== "open_entry" && action.code !== "view_children") return null;
+    return followLink(action.href, action.label);
+  }
+
+  function creatorRepaste(job) {
+    if (job.kind !== "creator_import" || job.status !== "failed") return null;
+    return followLink("/imports/creators", "去导入页重贴");
+  }
+
   function dismissButton(job, {reloadDetail = false} = {}) {
     if (job.status !== "failed" || job.dismissed || !job.requires_user_action) return null;
     const button = D.node("button", "不再提醒", "secondary-button");
@@ -145,11 +172,15 @@
       const action = actionButton(job.next_action);
       if (action) actions.append(action);
     }
+    const quiet = quietAction(job);
+    if (quiet) actions.append(quiet);
+    const repaste = creatorRepaste(job);
+    if (repaste) actions.append(repaste);
     const dismiss = dismissButton(job);
     if (dismiss) actions.append(dismiss);
     if (actions.childNodes.length) row.append(actions);
     row.addEventListener("click", (event) => {
-      if (event.target.closest("button")) return;
+      if (event.target.closest("button, a")) return;
       D.navigate(`/jobs/${job.id}`);
     });
     row.addEventListener("keydown", (event) => {
@@ -208,7 +239,9 @@
       if (params.get("requires_user_action") === "1") action.value = "waiting";
       else {
         const status = params.get("status") || "all";
-        action.value = status === "completed_with_warnings" ? "completed" : status;
+        action.value = status === "completed_with_warnings" ? "completed"
+          : status === "进行中" ? "in_progress"
+          : status;
       }
     }
   }
@@ -244,6 +277,15 @@
     const actions = D.node("div", null, "operation-actions");
     const action = actionButton(job.next_action);
     if (action) actions.append(action);
+    const importedIds = (job.imported_entry_ids || []).filter((entryId) => !(
+      job.next_action?.code === "open_entry" && job.entry_id === entryId
+    )).slice(0, 5);
+    importedIds.forEach((entryId, index) => {
+      const label = importedIds.length > 1 ? `打开已入库资料 ${index + 1}` : "打开已入库资料";
+      actions.append(followLink(`/articles/${encodeURIComponent(entryId)}`, label));
+    });
+    const repaste = creatorRepaste(job);
+    if (repaste) actions.append(repaste);
     const dismiss = dismissButton(job, {reloadDetail: true});
     if (dismiss) actions.append(dismiss);
     const openEntryViaAction = job.next_action?.code === "open_entry";
@@ -257,7 +299,7 @@
     const providers = job.media_provenance || {};
     if (providers.asr || providers.ocr) {
       media.append(D.node("h2", "媒体识别模型"));
-      for (const [label, info] of [["ASR", providers.asr], ["OCR", providers.ocr]]) {
+      for (const [label, info] of [["语音识别", providers.asr], ["画面文字", providers.ocr]]) {
         if (!info?.provider && !info?.confidence_note) continue;
         media.append(D.node("p", `${label}：${info.provider || "未记录"}${info.model ? ` · ${info.model}` : ""}${info.fallback_reason ? ` · 回退原因：${info.fallback_reason}` : ""}`));
         if (info.confidence_note) media.append(D.node("p", info.confidence_note, "hint-copy"));
@@ -291,7 +333,13 @@
     const warnings = Array.isArray(job.result?.warnings) ? job.result.warnings.filter(Boolean) : [];
     if (warnings.length) {
       warningsPanel.append(D.node("h2", "提示"));
-      warningsPanel.append(D.node("p", "任务已结束，但仍有需要留意的提示：", "hint-copy"));
+      warningsPanel.append(D.node(
+        "p",
+        job.result?.warnings_from_children
+          ? "父任务本身没有提示，下面来自子任务："
+          : "任务已结束，但仍有需要留意的提示：",
+        "hint-copy",
+      ));
       const list = D.node("ul", null, "job-warning-list");
       for (const warning of warnings) {
         list.append(D.node("li", String(warning)));
@@ -303,7 +351,15 @@
       review.append(D.node("h2", "历史校对疑点"));
       review.append(D.node("p", "此任务按旧策略暂停。点击“按新模型校对策略重试”会重新校正并继续分析。", "hint-copy"));
       job.review_issues.forEach((issue) => {
-        review.append(D.node("p", `疑点 ${issue.id}（${issue.start_ms}-${issue.end_ms}ms${issue.image_index ? ` · 图 ${issue.image_index}` : ""}）：${issue.raw_text}；${issue.reason || ""}`));
+        const clock = (ms) => {
+          const total = Math.max(0, Math.round(Number(ms) / 1000));
+          if (!Number.isFinite(total)) return "";
+          return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+        };
+        const span = Number.isFinite(Number(issue.start_ms))
+          ? `${clock(issue.start_ms)}–${clock(issue.end_ms)}`
+          : "";
+        review.append(D.node("p", `疑点 ${issue.id}${span ? `（${span}）` : ""}${issue.image_index ? ` · 图 ${issue.image_index}` : ""}：${issue.raw_text}；${issue.reason || ""}`));
       });
     }
     const evidenceAudit = D.node("section", null, "review-panel");
@@ -313,7 +369,19 @@
         evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${item.timestamp_ms == null ? "" : ` · ${item.timestamp_ms}ms`}：${item.reason}`));
       }
     }
+    const selectionNote = D.node("p", "", "hint-copy");
+    if (job.status === "needs_selection") {
+      selectionNote.textContent = job.kind === "creator_import"
+        ? "清点已经完成。点下面的按钮进入选片：勾选作品并确认后才会下载。这一页不重复清单，避免两处状态不一致。"
+        : "清点已经完成。点下面的按钮去勾选作品，确认后才会导入。";
+    }
+    const gatewayNote = D.node("p", "", "hint-copy");
+    if (job.status === "awaiting_agent_analysis" || (job.analysis_mode === "gateway" && job.status === "analyzing")) {
+      gatewayNote.textContent = "网页不会自动分析。这一步要等外部 Agent 接续，停在「待 AI 处理」不代表已经整理完成。";
+    }
     const parts = [header, progress];
+    if (selectionNote.textContent) parts.push(selectionNote);
+    if (gatewayNote.textContent) parts.push(gatewayNote);
     if (modelProgress.textContent) parts.push(modelProgress);
     if (job.analysis_mode === "provider") {
       parts.push(modelHealth);

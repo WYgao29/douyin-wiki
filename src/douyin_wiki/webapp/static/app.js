@@ -287,14 +287,30 @@ function setLibraryError(error) {
   $("#result-count").textContent = "载入失败";
 }
 
+function renderTodoBanners(count) {
+  const total = Number(count) || 0;
+  for (const id of ["library-todo", "imports-todo"]) {
+    const node = document.getElementById(id);
+    if (!node) continue;
+    if (total > 0) {
+      node.classList.remove("hidden");
+      node.textContent = `待办 ${total} · 去任务中心`;
+    } else {
+      node.classList.add("hidden");
+      node.textContent = "";
+    }
+  }
+}
+
 async function refreshAuthChannelBanners() {
-  // 资料库首页不展示授权横幅；仅导入枢纽提醒。
+  // 资料库首页不展示授权横幅；仅导入枢纽提醒。待办条在资料库和导入枢纽都显示。
   const targets = ["imports-auth-banner"]
     .map((id) => document.getElementById(id))
     .filter(Boolean);
   if (!targets.length) return;
   try {
     const data = await window.Douku.api("/api/overview");
+    renderTodoBanners(data.jobs?.requires_user_action);
     const video = data.auth?.channels?.video;
     const alert = (data.alerts || []).find((item) =>
       item.code === "video_auth_unverified" || item.code === "video_auth"
@@ -334,6 +350,7 @@ async function refreshAuthChannelBanners() {
       node.replaceChildren(copy, actions);
     }
   } catch (_) {
+    renderTodoBanners(0);
     for (const node of targets) {
       node.classList.add("hidden");
       node.replaceChildren();
@@ -538,8 +555,8 @@ function currentEntryItem() {
 function updateFavoriteButton(button, favorite) {
   button.classList.toggle("active", favorite);
   button.setAttribute("aria-pressed", String(favorite));
-  button.setAttribute("aria-label", favorite ? "取消收藏" : "收藏");
-  button.title = favorite ? "取消收藏" : "收藏";
+  button.setAttribute("aria-label", favorite ? "取消库内收藏" : "标为库内收藏");
+  button.title = favorite ? "取消库内收藏" : "标为库内收藏";
 }
 
 async function pollRestoreJob(jobId) {
@@ -549,16 +566,16 @@ async function pollRestoreJob(jobId) {
     const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
     if (!terminal.has(job.status)) continue;
     if (job.status === "completed" || job.status === "completed_with_warnings") {
-      toast(job.result?.skipped ? "已取消视频恢复" : "收藏视频已重新下载到本地");
+      toast(job.result?.skipped ? "已取消视频恢复" : "库内收藏的视频已重新下载到本地");
       await loadLibrary({showLoading: false});
     } else if (job.status === "needs_auth") {
-      showRestoreRetry(jobId, "已收藏；更新抖音登录后可重试下载");
+      showRestoreRetry(jobId, "已标为库内收藏；更新抖音登录后可重试下载");
     } else {
-      showRestoreRetry(jobId, "已收藏；视频恢复失败");
+      showRestoreRetry(jobId, "已标为库内收藏；视频恢复失败");
     }
     return;
   }
-  toast("已收藏；视频仍在后台恢复");
+  toast("已标为库内收藏；视频仍在后台恢复");
 }
 
 function makeFavoriteButton(item, className = "") {
@@ -581,10 +598,10 @@ function makeFavoriteButton(item, className = "") {
       Object.assign(item, response.item);
       syncFavoriteItem(response.item);
       updateFavoriteButton(button, response.item.favorite);
-      toast(response.item.favorite ? "已收藏，视频会永久保留在本地" : "已取消收藏");
+      toast(response.item.favorite ? "已标为库内收藏，视频会永久保留在本地" : "已取消库内收藏");
       if (!$("#library-view").classList.contains("hidden")) renderLibrary();
       if (response.restore_job) pollRestoreJob(response.restore_job.id).catch(() => {
-        toast("已收藏；暂时无法读取视频恢复进度");
+        toast("已标为库内收藏；暂时无法读取视频恢复进度");
       });
     } catch (error) {
       toast(error.message || "收藏操作失败");
@@ -735,7 +752,12 @@ function renderLibraryEmptyState(items) {
   $("#empty-library").classList.toggle("hidden", items.length > 0 || hasCatalogItems);
   $("#empty-results").classList.toggle("hidden", items.length > 0 || !hasCatalogItems);
   if (!items.length && hasCatalogItems) {
-    $("#empty-results-copy").textContent = state.query
+    const favoriteOnly = state.section === "favorite" && !state.query
+      && !state.authors.length && !state.types.length && !state.tags.length
+      && !state.sources.length && !state.inspirationOnly;
+    $("#empty-results-copy").textContent = favoriteOnly
+      ? "还没有库内收藏。打开一篇资料，点「库内收藏」，视频会永久留在本机。"
+      : state.query
       ? `没有包含“${state.query}”的文章。请调整关键词或清除筛选。`
       : "当前筛选条件没有匹配文章。请调整或清除筛选。";
   }
@@ -743,11 +765,11 @@ function renderLibraryEmptyState(items) {
 
 function renderLibrary() {
   const items = filteredItems();
-  const titles = {all: "资料库", recent: "最近加入", favorite: "收藏", inspiration: "灵感"};
+  const titles = {all: "资料库", recent: "最近加入", favorite: "库内收藏", inspiration: "灵感"};
   const summaries = {
     all: "整理并检索已经入库的抖音知识",
     recent: "最近采集和更新的知识资料",
-    favorite: "永久保留在本地的收藏资料",
+    favorite: "你在资料库里标过星、会永久留在本机的资料",
     inspiration: "带有你原始灵感的文章",
   };
   $("#view-title").textContent = titles[state.section];
@@ -1329,13 +1351,34 @@ function makeArticleHeader(item) {
     labels.className = "favorite-label";
     const off = document.createElement("span");
     off.dataset.favoriteOff = "";
-    off.textContent = "收藏";
+    off.textContent = "库内收藏";
     const on = document.createElement("span");
     on.dataset.favoriteOn = "";
-    on.textContent = "取消收藏";
+    on.textContent = "取消库内收藏";
     labels.append(off, on);
     favorite.append(labels);
     actions.append(favorite);
+  }
+  if (isDatabaseManaged(item)) {
+    const reanalyze = document.createElement("button");
+    reanalyze.type = "button";
+    reanalyze.className = "secondary-button";
+    reanalyze.textContent = "重新分析";
+    reanalyze.addEventListener("click", async () => {
+      reanalyze.disabled = true;
+      try {
+        const job = await api(`/api/articles/${encodeURIComponent(item.entry_id)}/reanalyze`, {
+          method: "POST",
+          body: JSON.stringify({force: false}),
+        });
+        toast("已提交重新分析");
+        window.Douku?.navigate(`/jobs/${job.id}`);
+      } catch (error) {
+        toast(error.message || "重新分析失败");
+        reanalyze.disabled = false;
+      }
+    });
+    actions.append(reanalyze);
   }
   if (item.original_url) {
     const source = document.createElement("a");
@@ -1710,7 +1753,7 @@ async function loadSessions(preferNew = false) {
     state.sessions = data.sessions;
     $("#model-label").textContent = `模型：${data.configured ? data.model : "未配置"}`;
     $("#chat-persistent-error").classList.toggle("hidden", data.configured);
-    $("#chat-persistent-error").textContent = data.configured ? "" : "尚未配置对话模型。资料浏览不受影响，请前往模型设置完成配置。";
+    $("#chat-persistent-error").textContent = data.configured ? "" : "尚未配置共用模型。资料浏览不受影响，请到「共用模型」完成配置。对话和后台整理用的是同一套接口。";
     if (preferNew) {
       await createSession();
     } else {
@@ -2077,18 +2120,26 @@ function openInspiration(text, trigger) {
 }
 
 async function saveInspiration() {
-  const start = $("#inspiration-start").value;
-  const end = $("#inspiration-end").value;
+  const errorNode = $("#inspiration-error");
+  errorNode.classList.add("hidden");
+  let startMs = null;
+  let endMs = null;
+  try {
+    startMs = window.Douku.parseClockToMs($("#inspiration-start").value);
+    endMs = window.Douku.parseClockToMs($("#inspiration-end").value);
+  } catch (error) {
+    errorNode.textContent = error.message;
+    errorNode.classList.remove("hidden");
+    return;
+  }
   const payload = {
     entry_id: $("#inspiration-entry").value,
     text: $("#inspiration-text").value,
     quote: $("#inspiration-quote").value || null,
-    start_ms: start ? Number(start) : null,
-    end_ms: end ? Number(end) : null,
+    start_ms: startMs,
+    end_ms: endMs,
     confirmed: true,
   };
-  const errorNode = $("#inspiration-error");
-  errorNode.classList.add("hidden");
   try {
     await api("/api/inspirations/confirm", {method: "POST", body: JSON.stringify(payload)});
     $("#inspiration-dialog").close();
@@ -2308,6 +2359,17 @@ function bindEvents() {
       $("#imports-view").classList.remove("hidden");
       document.title = "导入内容 · 抖库";
       refreshAuthChannelBanners();
+      return;
+    }
+    if (path === "/settings") {
+      hideLegacyViews();
+      window.Douku?.setPage("settings");
+      $("#settings-view")?.classList.remove("hidden");
+      document.title = "设置 · 抖库";
+      return;
+    }
+    if (path === "/auth") {
+      window.Douku?.navigate("/settings/auth");
       return;
     }
     if (!window.Douku?.isKnownAppPath(path) && !path.startsWith("/api/") && !path.startsWith("/static/") && !path.startsWith("/media/")) {

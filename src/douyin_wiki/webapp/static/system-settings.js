@@ -21,11 +21,11 @@
     obsidian_vault: "Obsidian 库",
     database: "数据库",
     llm: "后台模型",
-    web_llm: "对话模型",
+    web_llm: "共用模型",
     embeddings: "向量检索",
     mlx_whisper: "MLX Whisper",
-    transcription: "转录",
-    ocr: "OCR",
+    transcription: "语音识别",
+    ocr: "画面文字识别",
     reminders: "提醒事项",
   };
 
@@ -137,6 +137,8 @@
       row("队列", String(worker.queue_length ?? 0)),
       row("正在执行", worker.running_job_id ? "有任务" : "空闲"),
       row("分析方式", analysis.mode_label || "未设置"),
+      row("语音识别", health.media?.asr_label || "未记录"),
+      row("画面文字识别", health.media?.ocr_label || "未记录"),
       row("最近维护", shortTime(health.last_maintenance_display)),
     );
     D.$("system-storage").replaceChildren(
@@ -157,10 +159,19 @@
       result.overall ? "system-preview-kicker is-ok" : "system-preview-kicker is-bad",
     ));
     const rows = D.node("div", null, "system-rows");
+    const providerNames = {
+      sensevoice: "SenseVoice 语音识别",
+      whisper: "Whisper 语音识别",
+      rapidocr: "RapidOCR 文字识别",
+      vision: "苹果 Vision 文字识别",
+      auto: "自动选择",
+    };
     Object.entries(CHECK_LABELS).forEach(([key, label]) => {
       const check = result[key];
       if (!check || typeof check !== "object") return;
-      const item = row(label, check.ok ? "正常" : "异常", check.ok ? "authorized" : "failed");
+      const provider = check.provider ? (providerNames[check.provider] || check.provider) : "";
+      const value = provider ? `${check.ok ? "正常" : "异常"} · ${provider}` : (check.ok ? "正常" : "异常");
+      const item = row(label, value, check.ok ? "authorized" : "failed");
       if (check.message) {
         item.classList.add("has-copy");
         item.append(D.node("small", check.message));

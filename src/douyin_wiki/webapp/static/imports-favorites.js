@@ -57,7 +57,7 @@
     current = data;
     $("status").textContent = `${data.nickname || "收藏任务"} · ${data.status_label || data.status}`;
     const summary = data.summary;
-    const waits = {needs_auth: "需要登录", awaiting_agent_analysis: "待 AI 处理",
+    const waits = {needs_auth: "需要登录", awaiting_agent_analysis: "待外部 Agent（网页不自动分析）",
       waiting_confirmation: "待确认", needs_review: "待复核"};
     $("waits").textContent = Object.entries(waits).filter(([status]) => summary.child_status_counts?.[status])
       .map(([status, label]) => `${label} ${summary.child_status_counts[status]}`).join(" · ");
@@ -77,7 +77,7 @@
       label.append(input, node("span", `${folder.name}${folder.reported_count == null ? "" : `（${folder.reported_count}）`}`));
       $("folders").append(label);
     }
-    if (!data.folders?.length) $("folders").append(node("p", "暂无可识别的收藏夹。可选择全部收藏。"));
+    if (!data.folders?.length) $("folders").append(node("p", "暂无可识别的收藏夹。可选择全部抖音收藏。"));
     const filter = $("filter").value;
     $("filter").replaceChildren(node("option", "全部收藏夹")); $("filter").firstChild.value = "";
     for (const folder of data.folders || []) {
@@ -150,7 +150,7 @@
     D.setPage("imports-favorites");
     D.setNav("imports-nav");
     view.classList.remove("hidden");
-    document.title = "我的收藏 · 抖库";
+    document.title = "导入抖音收藏 · 抖库";
     const params = new URLSearchParams(location.search);
     if (params.get("job")) jobId = params.get("job");
     await run(async () => { await history(); if (jobId) await load(); });

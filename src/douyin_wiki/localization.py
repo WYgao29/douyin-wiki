@@ -105,7 +105,7 @@ DISPLAY_MODE_LABELS = {"all": "全部", "paginated": "分页"}
 JOB_KIND_LABELS = {
     "capture": "单条采集",
     "creator_import": "博主批量采集",
-    "favorites_import": "收藏批量导入",
+    "favorites_import": "抖音收藏批量",
     "reanalyze": "重新分析",
     "media_restore": "媒体恢复",
     "overview": "专题总览",

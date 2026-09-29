@@ -9,8 +9,10 @@ from douyin_wiki.models import (
 )
 from douyin_wiki.operation import (
     job_display_title,
+    job_is_in_progress,
     looks_secret_key,
     message_for_user,
+    next_action_for,
     present_job,
     requires_user_action,
     sanitize_public_payload,
@@ -50,6 +52,8 @@ def test_gateway_waiting_is_not_described_as_automatic_analysis() -> None:
     message = message_for_user(job, analysis_mode="gateway")
     presented = present_job(job, analysis_mode="gateway")
     assert "后台不会自动完成" in message
+    assert "网页不会自动分析" in message
+    assert "外部 Agent" in message
     assert presented["next_action"]["code"] == "wait_gateway"
     assert "正在自动" not in message
 
@@ -107,7 +111,7 @@ def test_display_title_names_the_creator_or_explains_a_failed_link() -> None:
     )
     assert job_display_title(named) == "博主批量 · 叫我舒老师"
     assert job_display_title(failed) == "博主批量 · 链接未能识别博主"
-    assert job_display_title(favorites) == "收藏批量 · 小明"
+    assert job_display_title(favorites) == "抖音收藏 · 小明"
     assert present_job(named, analysis_mode="provider")["display_title"] == "博主批量 · 叫我舒老师"
 
 
@@ -181,3 +185,38 @@ def test_worker_heartbeat_freshness_window() -> None:
     assert worker_is_fresh(now, now=now)
     assert not worker_is_fresh(now - timedelta(seconds=120), now=now)
     assert not worker_is_fresh(None, now=now)
+
+
+def test_in_progress_is_machine_work_only() -> None:
+    assert job_is_in_progress(_job(JobStatus.QUEUED))
+    assert job_is_in_progress(_job(JobStatus.INVENTORYING))
+    assert job_is_in_progress(_job(JobStatus.DOWNLOADING))
+    assert job_is_in_progress(_job(JobStatus.ANALYZING))
+    assert not job_is_in_progress(_job(JobStatus.NEEDS_SELECTION))
+    assert not job_is_in_progress(_job(JobStatus.FAILED))
+    assert not job_is_in_progress(_job(JobStatus.AWAITING_AGENT_ANALYSIS))
+    assert not job_is_in_progress(_job(JobStatus.COMPLETED))
+    assert not job_is_in_progress(_job(JobStatus.COMPLETED_WITH_WARNINGS))
+
+
+def test_completed_parent_without_an_entry_points_at_children() -> None:
+    parent = _job(
+        JobStatus.COMPLETED_WITH_WARNINGS,
+        result={"child_job_ids": ["b" * 32], "warnings": []},
+    )
+    action = next_action_for(parent, analysis_mode="provider")
+    assert action["code"] == "view_children"
+    assert action["label"] == "查看子任务"
+    with_entry = _job(
+        JobStatus.COMPLETED,
+        result={"entry_id": "entry-1", "child_job_ids": ["b" * 32]},
+    )
+    assert next_action_for(with_entry, analysis_mode="provider")["code"] == "open_entry"
+
+
+def test_failed_creator_message_names_the_next_step() -> None:
+    job = _job(JobStatus.FAILED, kind="creator_import", error_message="无法解析")
+    message = message_for_user(job, analysis_mode="provider")
+    assert message.startswith("无法解析")
+    assert "导入博主" in message
+    assert "重新粘贴" in message

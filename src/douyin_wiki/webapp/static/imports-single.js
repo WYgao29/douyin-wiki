@@ -16,17 +16,17 @@
     event.preventDefault();
     const error = D.$("single-error");
     error.classList.add("hidden");
-    const inspirations = [];
-    const text = D.$("single-inspiration").value.trim();
-    if (text) {
-      inspirations.push({
-        text,
-        quote: D.$("single-quote").value.trim() || null,
-        start_ms: D.$("single-start").value ? Number(D.$("single-start").value) : null,
-        end_ms: D.$("single-end").value ? Number(D.$("single-end").value) : null,
-      });
-    }
     try {
+      const inspirations = [];
+      const text = D.$("single-inspiration").value.trim();
+      if (text) {
+        inspirations.push({
+          text,
+          quote: D.$("single-quote").value.trim() || null,
+          start_ms: D.parseClockToMs(D.$("single-start").value),
+          end_ms: D.parseClockToMs(D.$("single-end").value),
+        });
+      }
       const job = await D.api("/api/captures", {
         method: "POST",
         body: JSON.stringify({

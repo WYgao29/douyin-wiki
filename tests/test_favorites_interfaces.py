@@ -257,7 +257,7 @@ def test_favorites_payload_adds_chinese_labels_without_replacing_codes() -> None
     )
 
     assert payload["kind"] == "favorites_import"
-    assert payload["kind_label"] == "收藏批量导入"
+    assert payload["kind_label"] == "抖音收藏批量"
     assert payload["scope_label"] == "收藏清点"
     assert payload["source_kind_label"] == "文章"
     assert payload["disposition_label"] == "暂不支持"

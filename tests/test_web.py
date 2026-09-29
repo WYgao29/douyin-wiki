@@ -14,7 +14,7 @@ from douyin_wiki.config import AppConfig, LLMSettings, load_config
 from douyin_wiki.errors import EntryNotFoundError
 from douyin_wiki.models import EntryRecord, InspirationInput, JobStatus, RetentionPolicy
 from douyin_wiki.service import DouyinWikiService
-from douyin_wiki.webapp.app import create_app
+from douyin_wiki.webapp.app import WEB_VERSION, create_app
 from douyin_wiki.webapp.chat import ChatChunk, OpenAICompatibleChatProvider
 
 
@@ -447,7 +447,12 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert "全部图文" not in page.text
         assert "导入单条" in page.text
         assert "导入博主" in page.text
-        assert "导入收藏" in page.text
+        assert "导入抖音收藏" in page.text
+        assert "库内收藏" in page.text
+        assert 'id="library-todo"' in page.text
+        assert 'id="settings-view"' in page.text
+        assert 'value="in_progress"' in page.text
+        assert 'id="creator-focus-bar"' in page.text
         assert 'id="imports-single-view"' in page.text
         assert 'id="single-share"' in page.text
         assert 'id="capture-dialog"' not in page.text
@@ -978,8 +983,9 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="analysis-view"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.2.20" in page.text
+        assert f"/static/model-settings.js?v={WEB_VERSION}" in page.text
         assert "对话模型" in page.text
+        assert "共用模型" in page.text
         assert 'name="analysis-mode"' in page.text
         assert "保存分析方式" in page.text
         assert 'href="/settings/analysis"' in page.text
@@ -992,7 +998,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="app-shell"' in analysis.text
         assert "导入后的分析方式" in analysis.text
         assert 'value="provider"' in analysis.text
-        assert "/static/analysis-settings.js?v=0.2.20" in analysis.text
+        assert f"/static/analysis-settings.js?v={WEB_VERSION}" in analysis.text
         assert 'href="/settings/model"' in analysis.text
         assert 'data-route="/settings/analysis"' in analysis.text
 

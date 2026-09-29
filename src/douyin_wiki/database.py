@@ -1606,12 +1606,16 @@ class Database:
         decision: CreatorWorkDecision | None = None,
         source_kind: SourceKind | None = None,
         query: str | None = None,
+        not_imported: bool = False,
     ) -> tuple[list[CreatorInventoryItem], int]:
         clauses = ["r.job_id=?"]
         params: list[Any] = [job_id]
         if decision:
             clauses.append("w.decision=?")
             params.append(decision.value)
+        if not_imported:
+            clauses.append("w.decision!=?")
+            params.append(CreatorWorkDecision.IMPORTED.value)
         if source_kind:
             clauses.append("w.source_kind=?")
             params.append(source_kind.value)

@@ -403,3 +403,81 @@ def test_worker_heartbeat_and_reload_request(service) -> None:
     assert heartbeat["worker_id"] == worker.worker_id
     service.database.request_worker_reload()
     assert worker.reload_requested()
+
+
+def test_in_progress_filter_child_warnings_and_settings_aliases(tmp_path) -> None:
+    config, service = _web_fixture(tmp_path)
+    running = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    service.database.update_job(running.id, status=JobStatus.ANALYZING, unlock=True)
+    queued = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    selecting = service.database.create_job(
+        CaptureRequest(share_text="https://www.douyin.com/user/abc"),
+        kind="creator_import",
+        status=JobStatus.NEEDS_SELECTION,
+    )
+    gateway = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    service.database.update_job(gateway.id, status=JobStatus.AWAITING_AGENT_ANALYSIS, unlock=True)
+    failed = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    service.database.update_job(failed.id, status=JobStatus.FAILED, error_message="模拟失败", unlock=True)
+    child = service.database.create_job(
+        CaptureRequest(share_text="https://www.douyin.com/video/1"),
+        status=JobStatus.COMPLETED_WITH_WARNINGS,
+        progress=1,
+    )
+    service.database.update_job(
+        child.id,
+        result={"warnings": ["字幕有缺口"], "entry_id": "entry-child-1"},
+        unlock=True,
+    )
+    parent = service.database.create_job(
+        CaptureRequest(share_text="https://www.douyin.com/user/batch"),
+        kind="creator_import",
+        status=JobStatus.COMPLETED_WITH_WARNINGS,
+        progress=1,
+    )
+    service.database.update_job(
+        parent.id,
+        result={"warnings": [], "child_job_ids": [child.id], "creator_name": "批次博主"},
+        unlock=True,
+    )
+    app = create_app(config, service=service, start_watcher=False)
+    with local_client(app) as client:
+        active = client.get("/api/jobs", params={"status": "in_progress"}).json()
+        active_ids = {item["id"] for item in active["items"]}
+        assert running.id in active_ids
+        assert queued.id in active_ids
+        assert selecting.id not in active_ids
+        assert gateway.id not in active_ids
+        assert failed.id not in active_ids
+        assert parent.id not in active_ids
+        chinese = client.get("/api/jobs", params={"status": "进行中"}).json()
+        assert {item["id"] for item in chinese["items"]} == active_ids
+        listed = next(item for item in client.get("/api/jobs").json()["items"] if item["id"] == parent.id)
+        assert listed["next_action"]["code"] == "view_children"
+        assert listed["requires_user_action"] is False
+        detail = client.get(f"/api/jobs/{parent.id}").json()
+        assert "字幕有缺口" in detail["result"]["warnings"]
+        assert detail["result"]["warnings_from_children"] is True
+        assert detail["imported_entry_ids"] == ["entry-child-1"]
+        overview = client.get("/api/overview").json()
+        assert overview["jobs"]["requires_user_action"] >= 2
+        health = client.get("/api/system/health").json()
+        assert health["web"]["version"] == WEB_VERSION
+        assert health["web"]["version"] != "0.2.0"
+        assert "SenseVoice" in health["media"]["asr_label"]
+        assert "RapidOCR" in health["media"]["ocr_label"]
+        auth = client.get("/auth", follow_redirects=False)
+        assert auth.status_code == 307
+        assert auth.headers["location"].endswith("/settings/auth")
+        settings = client.get("/settings")
+        assert settings.status_code == 200
+        assert 'id="settings-view"' in settings.text
+        assert "共用模型" in settings.text
+        creators = client.get("/static/imports-creators.js?v=" + WEB_VERSION).text
+        assert "2500" in creators
+        assert "source_kind_label" in creators
+        assert "北京时间" in creators
+        app_js = client.get("/static/app.js?v=" + WEB_VERSION).text
+        assert "重新分析" in app_js
+        assert "待办" in app_js
+        assert "库内收藏" in app_js

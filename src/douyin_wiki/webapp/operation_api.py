@@ -7,7 +7,7 @@ import json
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..errors import DouyinWikiError, EntryNotFoundError, JobStateError
@@ -125,7 +125,15 @@ def register_operation_routes(
 
     @app.get("/imports/favorites", response_class=HTMLResponse)
     async def imports_favorites_page(request: Request):
-        return spa(request, "我的收藏")
+        return spa(request, "导入抖音收藏")
+
+    @app.get("/auth")
+    async def auth_alias():
+        return RedirectResponse(url="/settings/auth", status_code=307)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_hub(request: Request):
+        return spa(request, "设置")
 
     @app.get("/jobs", response_class=HTMLResponse)
     async def jobs_page(request: Request):
@@ -344,6 +352,7 @@ def register_operation_routes(
         decision: CreatorWorkDecision | None = None,
         source_kind: SourceKind | None = None,
         query: str | None = None,
+        not_imported: bool = False,
     ):
         try:
             data = core.get_creator_inventory(
@@ -353,6 +362,7 @@ def register_operation_routes(
                 decision=decision,
                 source_kind=source_kind,
                 query=query,
+                not_imported=not_imported,
             )
         except JobStateError as exc:
             raise _http_error(exc) from exc

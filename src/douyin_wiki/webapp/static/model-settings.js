@@ -121,7 +121,7 @@
     D.setPage("model");
     D.setNav("model-nav");
     D.$("model-view").classList.remove("hidden");
-    document.title = "对话模型 · 抖库";
+    document.title = "共用模型 · 抖库";
     bind();
     await loadSettings();
   });

@@ -24,11 +24,11 @@
     panel.classList.toggle("hidden", !needsProvider);
     if (!needsProvider || !currentSettings) return;
     if (currentSettings.configured) {
-      D.$("provider-model-title").textContent = "将使用对话模型";
-      D.$("provider-model-copy").textContent = `${currentSettings.model} · ${currentSettings.base_url}`;
+      D.$("provider-model-title").textContent = "将使用共用模型";
+      D.$("provider-model-copy").textContent = `${currentSettings.model} · ${currentSettings.base_url}。对话和后台整理是这一套接口。`;
     } else {
-      D.$("provider-model-title").textContent = "需要先配置对话模型";
-      D.$("provider-model-copy").textContent = "后台整理会调用同一套模型接口。网关 Agent 和本地模式不需要这一步。";
+      D.$("provider-model-title").textContent = "需要先配置共用模型";
+      D.$("provider-model-copy").textContent = "后台整理会调用共用模型页的同一套接口，没有第二套地址。网关 Agent 和本地模式不需要这一步。";
     }
   }
 

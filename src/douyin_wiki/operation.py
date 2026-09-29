@@ -157,7 +157,7 @@ _HASHTAG_RE = re.compile(r"#[^\s#]+#?")
 _KIND_PREFIX = {
     "capture": "单条采集",
     "creator_import": "博主批量",
-    "favorites_import": "收藏批量",
+    "favorites_import": "抖音收藏",
     "reanalyze": "重新分析",
     "media_restore": "媒体恢复",
 }
@@ -235,6 +235,11 @@ def requires_user_action(job: JobRecord) -> bool:
     if job.status in USER_ACTION_STATUSES:
         return True
     return job.status == JobStatus.FAILED
+
+
+def job_is_in_progress(job: JobRecord) -> bool:
+    """Machine is working. Excludes finished jobs, operator todos, and Gateway waits."""
+    return job.status in RUNNING_STATUSES and not requires_user_action(job)
 
 
 def retryable(job: JobRecord) -> bool:
@@ -317,6 +322,15 @@ def next_action_for(
             "label": "打开知识资料",
             "href": f"/articles/{entry_id}",
         }
+    if (
+        job.status in {JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_WARNINGS}
+        and child_job_ids(job)
+    ):
+        return {
+            "code": "view_children",
+            "label": "查看子任务",
+            "href": f"/jobs/{job.id}",
+        }
     if job.status in RUNNING_STATUSES:
         return {
             "code": "wait_worker",
@@ -331,6 +345,9 @@ def message_for_user(
     *,
     analysis_mode: str,
 ) -> str:
+    if job.status == JobStatus.FAILED and job.kind == "creator_import":
+        reason = job.error_message or "任务失败，可在确认原因后重试。"
+        return f"{reason} 下一步：换一条博主主页链接，或到「导入博主」重新粘贴。"
     if job.error_message and job.status in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}:
         return job.error_message
     if job.status == JobStatus.NEEDS_AUTH:
@@ -346,7 +363,7 @@ def message_for_user(
         return "清点已完成，请选择要导入的作品并确认。"
     if job.status == JobStatus.AWAITING_AGENT_ANALYSIS:
         if analysis_mode == AnalysisMode.GATEWAY.value:
-            return "当前为 Gateway 模式，等待外部 Agent 接续分析。后台不会自动完成 AI 整理。"
+            return "当前为 Gateway 模式。网页不会自动分析，需要外部 Agent 接续。后台不会自动完成 AI 整理。"
         if analysis_mode == AnalysisMode.LOCAL.value:
             return "本地模式正在等待整理，不会调用外部模型。"
         return "等待后台模型接口继续整理。"

@@ -4,7 +4,7 @@
     "library-view", "article-view", "topics-view", "topic-view", "trash-view",
     "imports-view", "imports-single-view", "imports-creators-view", "imports-favorites-view",
     "jobs-view", "job-detail-view", "auth-view", "system-view",
-    "analysis-view", "model-view", "not-found-view",
+    "analysis-view", "model-view", "settings-view", "not-found-view",
   ];
   const Douku = window.Douku || {};
   Douku.$ = (id) => document.getElementById(id);
@@ -89,9 +89,31 @@
   Douku.isOperationPath = (path) => (
     path === "/imports" || path.startsWith("/imports/")
     || path === "/jobs" || path.startsWith("/jobs/")
+    || path === "/settings" || path === "/auth"
     || path === "/settings/auth" || path === "/settings/system"
     || path === "/settings/analysis" || path === "/settings/model"
   );
+  Douku.parseClockToMs = (value) => {
+    const text = String(value ?? "").trim();
+    if (!text) return null;
+    if (/^\d+$/.test(text)) return Number(text);
+    const parts = text.split(":");
+    if (parts.length < 2 || parts.length > 3 || parts.some((part) => !/^\d+$/.test(part))) {
+      throw new Error("时间请用分:秒，例如 1:05；只填整数则按毫秒");
+    }
+    const nums = parts.map((part) => Number(part));
+    let seconds = 0;
+    if (nums.length === 2) {
+      const [minutes, secs] = nums;
+      if (secs >= 60) throw new Error("秒数要小于 60，例如 1:05");
+      seconds = minutes * 60 + secs;
+    } else {
+      const [hours, minutes, secs] = nums;
+      if (minutes >= 60 || secs >= 60) throw new Error("分和秒都要小于 60，例如 1:02:03");
+      seconds = hours * 3600 + minutes * 60 + secs;
+    }
+    return seconds * 1000;
+  };
   Douku.isKnownAppPath = (path) => (
     path === "/" || path === "/topics" || path === "/trash"
     || path.startsWith("/articles/") || path.startsWith("/topics/")

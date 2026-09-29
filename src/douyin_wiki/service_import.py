@@ -72,6 +72,7 @@ class ImportMixin:
         decision: CreatorWorkDecision | None = None,
         source_kind: SourceKind | None = None,
         query: str | None = None,
+        not_imported: bool = False,
     ) -> dict[str, Any]:
         job = self.database.get_job(job_id)
         if job.kind != "creator_import":
@@ -86,6 +87,7 @@ class ImportMixin:
             decision=decision,
             source_kind=source_kind,
             query=query,
+            not_imported=not_imported,
         )
         return {
             "job_id": job_id,

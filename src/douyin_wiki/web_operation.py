@@ -18,6 +18,7 @@ from .operation import (
     USER_ACTION_STATUSES,
     analysis_presentation,
     job_display_title,
+    job_is_in_progress,
     parent_job_id,
     present_auth_check,
     present_job,
@@ -113,7 +114,8 @@ class WebOperationService:
     ) -> dict[str, Any]:
         if page < 1 or not 1 <= limit <= 200:
             raise ValueError("page 必须大于零，limit 必须在 1 到 200 之间")
-        if status:
+        in_progress = status in {"in_progress", "进行中"}
+        if status and not in_progress:
             try:
                 JobStatus(status)
             except ValueError as exc:
@@ -123,7 +125,9 @@ class WebOperationService:
             jobs = [job for job in jobs if parent_job_id(job) is None]
         if kind:
             jobs = [job for job in jobs if job.kind == kind]
-        if status == JobStatus.COMPLETED.value:
+        if in_progress:
+            jobs = [job for job in jobs if job_is_in_progress(job)]
+        elif status == JobStatus.COMPLETED.value:
             done = {JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_WARNINGS}
             jobs = [job for job in jobs if job.status in done]
         elif status:
@@ -193,6 +197,29 @@ class WebOperationService:
         extra["media_provenance"] = job.artifacts.get("media_provenance", {})
         extra["children"] = children
         extra["child_stats"] = self._child_stats(children)
+        imported_ids: list[str] = []
+        child_warnings: list[str] = []
+        own_warnings = [
+            str(item).strip()
+            for item in (job.result or {}).get("warnings") or []
+            if str(item).strip()
+        ]
+        for child in children:
+            entry_id = child.get("entry_id")
+            if entry_id and entry_id not in imported_ids:
+                imported_ids.append(str(entry_id))
+            for warning in (child.get("result") or {}).get("warnings") or []:
+                text = str(warning).strip()
+                if text and text not in own_warnings and text not in child_warnings:
+                    child_warnings.append(text)
+        if imported_ids:
+            extra["imported_entry_ids"] = imported_ids
+        if child_warnings:
+            extra["result"] = {
+                **(job.result or {}),
+                "warnings": [*own_warnings, *child_warnings],
+                "warnings_from_children": not own_warnings,
+            }
         if job.status == JobStatus.NEEDS_REVIEW:
             extra["review_issues"] = [
                 issue.model_dump(mode="json")
@@ -239,6 +266,7 @@ class WebOperationService:
     async def overview(self) -> dict[str, Any]:
         auth = await self.auth_status()
         counts = self.job_counts()
+        counts["requires_user_action"] = self.list_jobs(requires_user_action=True, limit=1)["total"]
         recent = [
             self.present(job)
             for job in self.core.list_jobs(limit=8)
@@ -443,18 +471,38 @@ class WebOperationService:
         return self.present(self.core.get_job(job.id))
 
     def system_health(self) -> dict[str, Any]:
+        from douyin_wiki.webapp.app import WEB_VERSION
+
         heartbeat = self.core.database.get_worker_heartbeat()
         raw_heartbeat = heartbeat.get("at") if heartbeat else None
         heartbeat_at = parse_datetime(raw_heartbeat) if raw_heartbeat else None
         running = worker_is_fresh(heartbeat_at)
         counts = self.job_counts()
         last_maintenance = self.core.database.last_maintenance_at("weekly")
+        asr = self.core.config.media.asr_provider
+        ocr = self.core.config.media.ocr_provider
+        asr_labels = {
+            "auto": "自动（优先 SenseVoice，否则 Whisper）",
+            "sensevoice": "SenseVoice",
+            "whisper": "Whisper",
+        }
+        ocr_labels = {
+            "auto": "自动（优先 RapidOCR，否则苹果 Vision）",
+            "rapidocr": "RapidOCR",
+            "vision": "苹果 Vision",
+        }
         return sanitize_public_payload(
             {
                 "web": {
-                    "version": "0.2.0",
+                    "version": WEB_VERSION,
                     "running": True,
                     "bind": f"{self.core.config.web.host}:{self.core.config.web.port}",
+                },
+                "media": {
+                    "asr_provider": asr,
+                    "asr_label": asr_labels.get(asr, asr),
+                    "ocr_provider": ocr,
+                    "ocr_label": ocr_labels.get(ocr, ocr),
                 },
                 "worker": {
                     "running": running,

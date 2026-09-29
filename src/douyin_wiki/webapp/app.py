@@ -50,22 +50,22 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.2.26"
+WEB_VERSION = "0.2.27"
 
 ANALYSIS_MODE_INFO = {
     "gateway": {
         "label": "网关 Agent",
         "web_copy": "等待外部 Agent 接续",
         "detail": (
-            "下载和本地提取由后台完成；校正和分析要等 OpenClaw/Hermes 等 Agent。"
-            "网页不能单独完成入库整理。"
+            "下载和本地提取由后台完成；校正和分析要等 OpenClaw/Hermes 等外部 Agent。"
+            "网页不会自动分析，也不能单独完成入库整理。"
         ),
         "web_can_complete": False,
     },
     "provider": {
         "label": "后台模型接口",
         "web_copy": "后台模型接口自动整理",
-        "detail": "导入后由 Worker 使用对话模型页的接口自动校正和分析，可能消耗 Token。",
+        "detail": "导入后由 Worker 使用「共用模型」页的同一套接口自动校正和分析，可能消耗 Token。没有第二套地址或密钥。",
         "web_can_complete": True,
     },
     "local": {
