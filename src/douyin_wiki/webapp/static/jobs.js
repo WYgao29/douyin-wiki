@@ -189,8 +189,10 @@
         evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${item.timestamp_ms == null ? "" : ` · ${item.timestamp_ms}ms`}：${item.reason}`));
       }
     }
-    root.replaceChildren(header, progress, modelProgress, modelHealth, actions, analysis, media, timeline, children, warningsPanel, review, evidenceAudit);
+    const parts = [header, progress];
+    if (modelProgress.textContent) parts.push(modelProgress);
     if (job.analysis_mode === "provider") {
+      parts.push(modelHealth);
       try {
         const health = await D.api("/api/system/model-health");
         modelHealth.textContent = `模型服务：${health.message}`;
@@ -198,6 +200,15 @@
         modelHealth.textContent = `模型服务状态暂不可查：${error.message}`;
       }
     }
+    if (actions.childNodes.length) parts.push(actions);
+    if ((analysis.textContent || "").trim()) parts.push(analysis);
+    if (media.childNodes.length) parts.push(media);
+    if (timeline.childNodes.length) parts.push(timeline);
+    if (children.childNodes.length) parts.push(children);
+    if (warningsPanel.childNodes.length) parts.push(warningsPanel);
+    if (review.childNodes.length) parts.push(review);
+    if (evidenceAudit.childNodes.length) parts.push(evidenceAudit);
+    root.replaceChildren(...parts);
   }
 
   async function loadFromPath(path) {
