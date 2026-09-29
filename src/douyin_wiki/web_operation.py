@@ -10,18 +10,21 @@ from typing import Any
 import httpx
 
 from .config import llm_is_configured
-from .errors import JobStateError
-from .models import CaptureOptions, InspirationInput, JobStatus, RetentionPolicy
+from .errors import EntryNotFoundError, JobStateError
+from .models import CaptureOptions, InspirationInput, JobRecord, JobStatus, RetentionPolicy
 from .operation import (
     RUNNING_STATUSES,
     TERMINAL_STATUSES,
     USER_ACTION_STATUSES,
     analysis_presentation,
+    job_display_title,
+    parent_job_id,
     present_auth_check,
     present_job,
     sanitize_public_payload,
     worker_is_fresh,
 )
+from .operation import requires_user_action as job_needs_user
 from .secrets import get_secret
 from .setup import doctor
 from .time_utils import beijing_iso, format_beijing, parse_datetime
@@ -38,7 +41,65 @@ class WebOperationService:
         return self.core.config.analysis_mode.value
 
     def present(self, job, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        return present_job(job, analysis_mode=self.analysis_mode, extra=extra)
+        merged = dict(extra or {})
+        merged["display_title"] = job_display_title(job, hints=self._title_hints(job))
+        return present_job(job, analysis_mode=self.analysis_mode, extra=merged)
+
+    def dismiss_job(self, job_id: str):
+        job = self.core.database.get_job(job_id)
+        if job.status != JobStatus.FAILED:
+            raise JobStateError("只有失败任务可以不再提醒")
+        if job.artifacts.get("user_dismissed"):
+            return job
+        return self.core.database.update_job(job_id, artifacts={"user_dismissed": True})
+
+    def _title_hints(self, job: JobRecord) -> dict[str, str]:
+        hints: dict[str, str] = {}
+        artifacts = job.artifacts or {}
+        result = job.result or {}
+        if job.kind == "favorites_import":
+            try:
+                snapshot = self.core.favorites.store.load(job.id).get("snapshot") or {}
+            except JobStateError:
+                snapshot = {}
+            nickname = snapshot.get("nickname")
+            if isinstance(nickname, str) and nickname.strip():
+                hints["nickname"] = nickname.strip()
+        if job.kind == "creator_import":
+            creator_id = str(result.get("creator_id") or artifacts.get("creator_id") or "")
+            if creator_id:
+                try:
+                    creator = self.core.database.get_creator(creator_id)
+                except JobStateError:
+                    creator = None
+                if creator and creator.nickname:
+                    hints["creator_name"] = creator.nickname
+        context = artifacts.get("creator_context")
+        if isinstance(context, dict) and context.get("id") and context.get("work_id"):
+            try:
+                work = self.core.database.get_creator_work(
+                    str(context["id"]), str(context["work_id"])
+                )
+            except JobStateError:
+                work = None
+            if work and work.title:
+                hints["work_title"] = work.title
+        entry_id = (
+            result.get("entry_id")
+            or artifacts.get("entry_id")
+            or artifacts.get("reanalyze_entry_id")
+        )
+        if entry_id:
+            try:
+                entry = self.core.database.get_entry(str(entry_id))
+            except EntryNotFoundError:
+                entry = None
+            if entry is not None:
+                if entry.title:
+                    hints["entry_title"] = entry.title
+                if entry.summary:
+                    hints["entry_summary"] = entry.summary
+        return hints
 
     def list_jobs(
         self,
@@ -46,6 +107,7 @@ class WebOperationService:
         kind: str | None = None,
         status: str | None = None,
         requires_user_action: bool | None = None,
+        parents_only: bool = True,
         page: int = 1,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -57,22 +119,19 @@ class WebOperationService:
             except ValueError as exc:
                 raise ValueError("不支持的任务状态") from exc
         jobs = self.core.list_jobs(limit=None)
+        if parents_only:
+            jobs = [job for job in jobs if parent_job_id(job) is None]
         if kind:
             jobs = [job for job in jobs if job.kind == kind]
-        if status:
+        if status == JobStatus.COMPLETED.value:
+            done = {JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_WARNINGS}
+            jobs = [job for job in jobs if job.status in done]
+        elif status:
             jobs = [job for job in jobs if job.status.value == status]
         if requires_user_action is True:
-            jobs = [
-                job
-                for job in jobs
-                if job.status in USER_ACTION_STATUSES or job.status == JobStatus.FAILED
-            ]
+            jobs = [job for job in jobs if job_needs_user(job)]
         elif requires_user_action is False:
-            jobs = [
-                job
-                for job in jobs
-                if job.status not in USER_ACTION_STATUSES and job.status != JobStatus.FAILED
-            ]
+            jobs = [job for job in jobs if not job_needs_user(job)]
         total = len(jobs)
         start = (page - 1) * limit
         sliced = jobs[start : start + limit]

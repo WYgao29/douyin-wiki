@@ -140,7 +140,8 @@
     await load(); await history();
   }
   window.addEventListener("douku:route", async (event) => {
-    if (event.detail.path !== "/imports/favorites") {
+    const path = String(event.detail.path || "").split("?")[0];
+    if (path !== "/imports/favorites") {
       stopPolling();
       generation += 1;
       return;

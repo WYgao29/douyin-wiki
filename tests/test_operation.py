@@ -8,9 +8,11 @@ from douyin_wiki.models import (
     JobStatus,
 )
 from douyin_wiki.operation import (
+    job_display_title,
     looks_secret_key,
     message_for_user,
     present_job,
+    requires_user_action,
     sanitize_public_payload,
     stage_for_status,
     worker_is_fresh,
@@ -89,6 +91,62 @@ def test_sanitize_public_payload_drops_secret_fields_but_keeps_token_hint() -> N
     assert payload["nested"]["ok"] is True
     assert looks_secret_key("cookie")
     assert not looks_secret_key("token_hint")
+
+
+def test_display_title_names_the_creator_or_explains_a_failed_link() -> None:
+    named = _job(
+        JobStatus.NEEDS_SELECTION,
+        kind="creator_import",
+        result={"creator_name": "叫我舒老师"},
+    )
+    failed = _job(JobStatus.FAILED, kind="creator_import", result={})
+    favorites = _job(
+        JobStatus.NEEDS_SELECTION,
+        kind="favorites_import",
+        result={"nickname": "小明"},
+    )
+    assert job_display_title(named) == "博主批量 · 叫我舒老师"
+    assert job_display_title(failed) == "博主批量 · 链接未能识别博主"
+    assert job_display_title(favorites) == "收藏批量 · 小明"
+    assert present_job(named, analysis_mode="provider")["display_title"] == "博主批量 · 叫我舒老师"
+
+
+def test_display_title_uses_work_title_summary_or_share_caption() -> None:
+    titled = _job(
+        JobStatus.COMPLETED,
+        artifacts={"metadata": {"title": "春季穿搭分享"}},
+        result={"summary": "一条摘要"},
+    )
+    generic = _job(
+        JobStatus.COMPLETED,
+        artifacts={"metadata": {"title": "抖音视频"}},
+        result={"summary": "真正的作品摘要"},
+    )
+    long_summary = "一二三四五六七八九十" * 4
+    summarized = _job(JobStatus.COMPLETED, result={"summary": long_summary})
+    caption = _job(
+        JobStatus.QUEUED,
+        request=CaptureRequest(share_text="春季穿搭\nhttps://v.douyin.com/abc/"),
+    )
+    bare = _job(JobStatus.QUEUED)
+    assert job_display_title(titled) == "单条采集 · 春季穿搭分享"
+    assert job_display_title(generic) == "单条采集 · 真正的作品摘要"
+    subject = job_display_title(summarized).split(" · ", 1)[1]
+    assert len(subject) == 36
+    assert subject.endswith("…")
+    assert job_display_title(caption) == "单条采集 · 春季穿搭"
+    assert job_display_title(bare) == "单条采集"
+    assert job_display_title(bare, hints={"entry_title": "资料标题"}) == "单条采集 · 资料标题"
+
+
+def test_dismissed_failure_is_not_waiting_on_the_user() -> None:
+    dismissed = _job(JobStatus.FAILED, artifacts={"user_dismissed": True})
+    failed = _job(JobStatus.FAILED)
+    selecting = _job(JobStatus.NEEDS_SELECTION, kind="creator_import")
+    assert requires_user_action(dismissed) is False
+    assert present_job(dismissed, analysis_mode="provider")["dismissed"] is True
+    assert requires_user_action(failed) is True
+    assert requires_user_action(selecting) is True
 
 
 def test_worker_heartbeat_freshness_window() -> None:

@@ -107,7 +107,8 @@
   }
 
   window.addEventListener("douku:route", async (event) => {
-    if (event.detail.path !== "/imports/creators") return;
+    const path = String(event.detail.path || "").split("?")[0];
+    if (path !== "/imports/creators") return;
     D.hideAllViews();
     D.setPage("imports-creators");
     D.setNav("imports-nav");

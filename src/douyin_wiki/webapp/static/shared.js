@@ -99,7 +99,8 @@
   );
   Douku.navigate = (path, push = true) => {
     if (push) history.pushState({}, "", path);
-    window.dispatchEvent(new CustomEvent("douku:route", {detail: {path}}));
+    const routePath = String(path).split("?")[0];
+    window.dispatchEvent(new CustomEvent("douku:route", {detail: {path: routePath}}));
   };
   Douku.emptyState = (title, copy, actionLabel, action) => {
     const section = Douku.node("section", null, "empty-state");

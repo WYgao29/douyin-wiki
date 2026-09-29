@@ -307,7 +307,10 @@ class DouyinWikiService(
         """Retry a failed job or explicitly reprocess a legacy review job."""
         job = self.database.get_job(job_id)
         if job.kind == "media_restore":
-            return self.database.requeue_job_deduplicated(job_id, match_artifact="entry_id")
+            updated = self.database.requeue_job_deduplicated(job_id, match_artifact="entry_id")
+            if updated.id == job_id and updated.artifacts.get("user_dismissed"):
+                return self.database.update_job(job_id, remove_artifacts={"user_dismissed"})
+            return updated
         if job.status == JobStatus.NEEDS_REVIEW:
             archived = [
                 *(job.artifacts.get("previous_review_attempts") or []),
@@ -325,6 +328,7 @@ class DouyinWikiService(
                 remove_artifacts={
                     "transcript_corrected", "transcript_edits", "correction_notes",
                     "review_resolved", "analysis", "analysis_candidate", "llm_checkpoints",
+                    "user_dismissed",
                 },
                 clear_review_issues=True,
                 expected_updated_at=job.updated_at,
@@ -336,7 +340,7 @@ class DouyinWikiService(
         # previously failed candidate forever — clear it on ordinary retries.
         return self.database.requeue_job(
             job_id,
-            remove_artifacts={"analysis_candidate"},
+            remove_artifacts={"analysis_candidate", "user_dismissed"},
             expected_updated_at=job.updated_at,
         )
 

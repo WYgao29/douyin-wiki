@@ -145,12 +145,87 @@ def parent_job_id(job: JobRecord) -> str | None:
     return None
 
 
+def user_dismissed(job: JobRecord) -> bool:
+    return bool((job.artifacts or {}).get("user_dismissed"))
+
+
+_GENERIC_SUBJECTS = {"抖音视频", "抖音作品", "抖音博主", "抖音图文", "未命名"}
+_KIND_PREFIX = {
+    "capture": "单条采集",
+    "creator_import": "博主批量",
+    "favorites_import": "收藏批量",
+    "reanalyze": "重新分析",
+    "media_restore": "媒体恢复",
+}
+
+
+def _clean_subject(value: Any, *, limit: int = 36) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if not text or text in _GENERIC_SUBJECTS:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _share_caption(share_text: str) -> str:
+    for raw in str(share_text or "").splitlines():
+        text = " ".join(raw.split())
+        if not text or text.startswith(("http://", "https://")):
+            continue
+        if "douyin.com" in text and " " not in text:
+            continue
+        return _clean_subject(text)
+    return ""
+
+
+def job_display_title(job: JobRecord, *, hints: dict[str, str] | None = None) -> str:
+    """Human title for a job row: kind plus the object name when we know it."""
+    hints = hints or {}
+    prefix = _KIND_PREFIX.get(job.kind) or JOB_KIND_LABELS.get(job.kind, job.kind)
+    result = job.result or {}
+    artifacts = job.artifacts or {}
+    subject = ""
+    if job.kind == "creator_import":
+        subject = _clean_subject(
+            result.get("creator_name") or artifacts.get("creator_name") or hints.get("creator_name")
+        )
+        if not subject and job.status == JobStatus.FAILED:
+            subject = "链接未能识别博主"
+    elif job.kind == "favorites_import":
+        subject = _clean_subject(
+            result.get("nickname") or artifacts.get("nickname") or hints.get("nickname")
+        )
+    else:
+        metadata = artifacts.get("metadata") if isinstance(artifacts.get("metadata"), dict) else {}
+        for candidate in (
+            result.get("title"),
+            result.get("entry_title"),
+            metadata.get("title"),
+            hints.get("work_title"),
+            hints.get("entry_title"),
+            result.get("summary"),
+            hints.get("entry_summary"),
+            _share_caption(job.request.share_text),
+        ):
+            subject = _clean_subject(candidate)
+            if subject:
+                break
+    if not subject or subject == prefix:
+        return prefix
+    return f"{prefix} · {subject}"
+
+
 def child_job_ids(job: JobRecord) -> list[str]:
     raw = job.result.get("child_job_ids") or []
     return [str(item) for item in raw if item]
 
 
 def requires_user_action(job: JobRecord) -> bool:
+    if user_dismissed(job):
+        return False
     if job.status in USER_ACTION_STATUSES:
         return True
     return job.status == JobStatus.FAILED
@@ -313,8 +388,10 @@ def present_job(
         "progress": job.progress,
         "message_for_user": message_for_user(job, analysis_mode=analysis_mode),
         "next_action": next_action_for(job, analysis_mode=analysis_mode),
+        "display_title": job_display_title(job),
         "retryable": retryable(job),
         "requires_user_action": requires_user_action(job),
+        "dismissed": user_dismissed(job),
         "updated_at": beijing_iso(job.updated_at),
         "updated_display": format_beijing(job.updated_at),
         "created_at": beijing_iso(job.created_at),

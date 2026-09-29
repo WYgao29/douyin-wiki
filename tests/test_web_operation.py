@@ -12,7 +12,7 @@ from douyin_wiki.models import (
     JobStatus,
     ReviewIssue,
 )
-from douyin_wiki.webapp.app import create_app
+from douyin_wiki.webapp.app import WEB_VERSION, create_app
 from tests.test_web import _web_fixture
 
 
@@ -178,6 +178,74 @@ def test_job_list_filters_user_action_and_keeps_compat_fields(tmp_path) -> None:
         approved = client.post(f"/api/jobs/{waiting.id}/approve")
         assert approved.status_code == 202
         assert approved.json()["status"] == "queued"
+
+
+def test_job_center_lists_parents_with_names_and_can_dismiss_failures(tmp_path) -> None:
+    config, service = _web_fixture(tmp_path)
+    parent = service.database.create_job(
+        CaptureRequest(share_text="https://www.douyin.com/user/abc"),
+        kind="creator_import",
+        status=JobStatus.NEEDS_SELECTION,
+        progress=0.5,
+    )
+    service.database.update_job(parent.id, result={"creator_name": "叫我舒老师"}, unlock=True)
+    child = service.database.create_job(
+        CaptureRequest(share_text="https://www.douyin.com/video/1"),
+        artifacts={"creator_context": {"parent_job_id": parent.id, "id": "c1", "work_id": "w1"}},
+    )
+    warned = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
+    service.database.update_job(
+        warned.id,
+        status=JobStatus.COMPLETED_WITH_WARNINGS,
+        progress=1,
+        result={"warnings": ["有一条提示"], "summary": "完成摘要"},
+        unlock=True,
+    )
+    failed = service.database.create_job(
+        CaptureRequest(share_text="not-a-creator"),
+        kind="creator_import",
+        status=JobStatus.FAILED,
+    )
+    service.database.update_job(failed.id, error_message="无法解析", unlock=True)
+    app = create_app(config, service=service, start_watcher=False)
+    with local_client(app) as client:
+        listing = client.get("/api/jobs").json()
+        ids = {item["id"] for item in listing["items"]}
+        assert parent.id in ids
+        assert child.id not in ids
+        titled = next(item for item in listing["items"] if item["id"] == parent.id)
+        assert titled["display_title"] == "博主批量 · 叫我舒老师"
+        unnamed = next(item for item in listing["items"] if item["id"] == failed.id)
+        assert unnamed["display_title"] == "博主批量 · 链接未能识别博主"
+        completed = client.get("/api/jobs", params={"status": "completed"}).json()
+        assert warned.id in {item["id"] for item in completed["items"]}
+        exact = client.get("/api/jobs", params={"status": "completed_with_warnings"}).json()
+        assert {item["id"] for item in exact["items"]} == {warned.id}
+        visible_children = client.get("/api/jobs", params={"parents_only": False}).json()
+        assert child.id in {item["id"] for item in visible_children["items"]}
+        dismissed = client.post(f"/api/jobs/{failed.id}/dismiss")
+        assert dismissed.status_code == 200
+        assert dismissed.json()["dismissed"] is True
+        assert dismissed.json()["requires_user_action"] is False
+        waiting = client.get("/api/jobs", params={"requires_user_action": True}).json()
+        waiting_ids = {item["id"] for item in waiting["items"]}
+        assert parent.id in waiting_ids
+        assert failed.id not in waiting_ids
+        assert client.post(f"/api/jobs/{parent.id}/dismiss").status_code == 409
+        retried = client.post(f"/api/jobs/{failed.id}/retry")
+        assert retried.status_code == 202
+        assert retried.json()["status"] == "queued"
+        assert retried.json()["dismissed"] is False
+        scripts = {
+            name: client.get(f"/static/{name}?v={WEB_VERSION}").text
+            for name in ("jobs.js", "imports-creators.js", "imports-favorites.js", "shared.js")
+        }
+    assert 'split("?")' in scripts["imports-creators.js"]
+    assert 'split("?")' in scripts["imports-favorites.js"]
+    assert 'split("?")' in scripts["shared.js"]
+    assert "等待你" in scripts["jobs.js"]
+    assert "不再提醒" in scripts["jobs.js"]
+    assert "display_title" in scripts["jobs.js"]
 
 
 def test_video_and_douyin_auth_channels_are_isolated(tmp_path) -> None:

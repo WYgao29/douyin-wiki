@@ -152,6 +152,7 @@ def register_operation_routes(
         kind: str | None = None,
         status: str | None = None,
         requires_user_action: bool | None = None,
+        parents_only: bool = True,
         page: int = Query(1, ge=1),
         limit: int = Query(50, ge=1, le=200),
     ):
@@ -160,6 +161,7 @@ def register_operation_routes(
                 kind=kind,
                 status=status,
                 requires_user_action=requires_user_action,
+                parents_only=parents_only,
                 page=page,
                 limit=limit,
             )
@@ -180,6 +182,15 @@ def register_operation_routes(
             "warnings": warnings,
             "status": job["status"],
         }
+
+    @app.post("/api/jobs/{job_id}/dismiss")
+    async def dismiss_job(job_id: str):
+        try:
+            job = operations.dismiss_job(job_id)
+        except JobStateError as exc:
+            raise _http_error(exc) from exc
+        await notifier.publish("jobs")
+        return operations.present(job)
 
     @app.post("/api/jobs/{job_id}/approve", status_code=202)
     async def approve_job(job_id: str):
