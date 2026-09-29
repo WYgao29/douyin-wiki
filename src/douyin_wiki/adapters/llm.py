@@ -125,9 +125,12 @@ def _normalize_correction_segments(
     """Map model correction rows onto local chunk indices ``0..n-1``.
 
     Live models sometimes emit 1-based ids (``1..n``), unknown extras, or
-    duplicates. Prefer exact local ids, then 1-based remapping, then
-    positional fallback when the usable row count matches. Gaps keep the
-    original chunk text so a single bad id does not fail the whole job.
+    duplicates. Remap 1-based only when the returned id set is exactly
+    ``1..n``; partial subsets that omit ``0`` stay local so text is not
+    shifted onto adjacent segments. Prefer exact local ids, then that full
+    1-based remapping, then positional fallback when the usable row count
+    matches. Gaps keep the original chunk text so a single bad id does not
+    fail the whole job.
     """
     if not isinstance(returned, list):
         raise ValueError("模型校正结果缺少 segments 数组")
@@ -163,12 +166,10 @@ def _normalize_correction_segments(
             one_based[identifier] = row["text"]
 
     returned_ids = [row["id"] for row in rows]
-    looks_one_based = (
-        bool(returned_ids)
-        and min(returned_ids) >= 1
-        and max(returned_ids) <= size
-        and 0 not in returned_ids
-    )
+    # Only remap when the model returned the complete 1..n set. Partial
+    # subsets that happen to omit 0 (e.g. only id=1) stay local 0-based so
+    # we do not shift corrected text onto the wrong adjacent segment.
+    looks_one_based = set(returned_ids) == set(range(1, size + 1))
 
     if looks_one_based and len(one_based) >= max(len(local), 1):
         return filled(one_based)

@@ -91,6 +91,73 @@ def test_normalize_correction_rejects_non_list():
         _normalize_correction_segments(_segments(1), {"segments": []})
 
 
+def test_normalize_correction_full_zero_based_ids():
+    chunk = _segments(4)
+    returned = [{"id": index, "text": f"改{index}"} for index in range(4)]
+    assert _normalize_correction_segments(chunk, returned) == [
+        {"id": 0, "text": "改0"},
+        {"id": 1, "text": "改1"},
+        {"id": 2, "text": "改2"},
+        {"id": 3, "text": "改3"},
+    ]
+
+
+def test_normalize_correction_full_one_based_ids():
+    chunk = _segments(4)
+    returned = [{"id": index + 1, "text": f"校对{index}"} for index in range(4)]
+    assert _normalize_correction_segments(chunk, returned) == [
+        {"id": 0, "text": "校对0"},
+        {"id": 1, "text": "校对1"},
+        {"id": 2, "text": "校对2"},
+        {"id": 3, "text": "校对3"},
+    ]
+
+
+def test_normalize_correction_partial_without_zero_stays_local():
+    # R6-1: missing 0 must NOT trigger 1-based remap (would shift FIXED onto index 0).
+    chunk = _segments(5)
+    returned = [{"id": 1, "text": "FIXED"}]
+    assert _normalize_correction_segments(chunk, returned) == [
+        {"id": 0, "text": "原片段0"},
+        {"id": 1, "text": "FIXED"},
+        {"id": 2, "text": "原片段2"},
+        {"id": 3, "text": "原片段3"},
+        {"id": 4, "text": "原片段4"},
+    ]
+
+
+def test_normalize_correction_partial_subset_without_zero_stays_local():
+    chunk = _segments(5)
+    returned = [
+        {"id": 1, "text": "改1"},
+        {"id": 2, "text": "改2"},
+        {"id": 3, "text": "改3"},
+    ]
+    assert _normalize_correction_segments(chunk, returned) == [
+        {"id": 0, "text": "原片段0"},
+        {"id": 1, "text": "改1"},
+        {"id": 2, "text": "改2"},
+        {"id": 3, "text": "改3"},
+        {"id": 4, "text": "原片段4"},
+    ]
+
+
+def test_normalize_correction_duplicates_and_unknown_ids():
+    chunk = _segments(3)
+    returned = [
+        {"id": 1, "text": "首改"},
+        {"id": 1, "text": "重复忽略"},
+        {"id": 99, "text": "未知忽略"},
+        {"id": -1, "text": "越界忽略"},
+        {"id": 2, "text": "末改"},
+    ]
+    assert _normalize_correction_segments(chunk, returned) == [
+        {"id": 0, "text": "原片段0"},
+        {"id": 1, "text": "首改"},
+        {"id": 2, "text": "末改"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_correct_transcript_survives_one_based_chunk_ids(monkeypatch):
     monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
