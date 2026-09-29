@@ -304,13 +304,41 @@ class DouyinWikiService(
 
 
     def retry_job(self, job_id: str) -> JobRecord:
-        """Retry a failed job from its last persisted stage checkpoint."""
+        """Retry a failed job or explicitly reprocess a legacy review job."""
         job = self.database.get_job(job_id)
         if job.kind == "media_restore":
             return self.database.requeue_job_deduplicated(job_id, match_artifact="entry_id")
+        if job.status == JobStatus.NEEDS_REVIEW:
+            archived = [
+                *(job.artifacts.get("previous_review_attempts") or []),
+                {
+                    "review_issues": [
+                        issue.model_dump(mode="json")
+                        for issue in self.database.get_review_issues(job_id)
+                    ],
+                    "transcript_corrected": job.artifacts.get("transcript_corrected"),
+                },
+            ]
+            updated = self.database.requeue_job(
+                job_id,
+                artifacts={"previous_review_attempts": archived, "review_issues": []},
+                remove_artifacts={
+                    "transcript_corrected", "transcript_edits", "correction_notes",
+                    "review_resolved", "analysis", "analysis_candidate", "llm_checkpoints",
+                },
+                clear_review_issues=True,
+                expected_updated_at=job.updated_at,
+            )
+            return updated
         if job.status not in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}:
-            raise JobStateError("只有“失败”或“需要登录授权”的任务可以重试")
-        return self.database.requeue_job(job_id)
+            raise JobStateError("只有“失败”“需要登录授权”或历史“需要人工复核”的任务可以重试")
+        # Sticky analysis_candidate would skip the next model call and replay a
+        # previously failed candidate forever — clear it on ordinary retries.
+        return self.database.requeue_job(
+            job_id,
+            remove_artifacts={"analysis_candidate"},
+            expected_updated_at=job.updated_at,
+        )
 
 
 
@@ -531,14 +559,16 @@ class DouyinWikiService(
         """Persist an entry while the caller already owns the operation lock."""
         if require_existing:
             self.database.get_entry(entry.id)
-        self.write_entry_documents(
-            entry,
-            data,
-            action=action,
-            log_summary=log_summary,
-            commit_message=commit_message,
+        return self.database.persist_entry_bundle(
+            entry, data, chunks, relations, reminders,
+            publish_documents=lambda: self.write_entry_documents(
+                entry,
+                data,
+                action=action,
+                log_summary=log_summary,
+                commit_message=commit_message,
+            ),
         )
-        return self.database.persist_entry_bundle(entry, data, chunks, relations, reminders)
 
 
 

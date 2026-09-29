@@ -9,7 +9,7 @@
 
 ## Web 主入口
 
-日常操作默认走本机 Web（仅绑定 127.0.0.1）：授权中心、导入单条/博主/收藏、任务中心、人工复核、失败重试和系统维护。CLI 用于首次安装、Web 无法启动时的故障恢复和高级调试；MCP 用于外部 Agent。
+日常操作默认走本机 Web（仅绑定 127.0.0.1）：授权中心、导入单条/博主/收藏、任务中心、模型校对记录、失败重试和系统维护。CLI 用于首次安装、Web 无法启动时的故障恢复和高级调试；MCP 用于外部 Agent。
 
 收藏导入按「授权 → 更新收藏 → 选择 → 确认」线性完成，支持增量/完整更新。本次开发用临时 Vault 和模拟数据验证，尚未做真实抖音端到端验收。见 [收藏批量导入说明](docs/favorites-import.md) 与 [操作指南](docs/operation-guide.md)。
 
@@ -82,7 +82,7 @@ uv sync --extra dev --extra embeddings --extra asr --extra ocr --extra mlx
 
 SenseVoice 与 VAD 模型加载时不执行模型仓的远端 Python 代码。标准 SenseVoiceSmall 与 FSMN-VAD 可正常使用；若自定义 `asr_model` 或 `vad_model` 依赖模型仓自带 Python，实现无法加载时，显式 `sensevoice` 模式会报错，`auto` 模式会回退 Whisper。默认通过 `asr_model_revision` / `vad_model_revision` 钉住 ModelScope 权重版本（SenseVoice 与 FSMN-VAD 均为提交哈希；VAD 对应上游标签 `v2.0.4` 尖端）；升级权重需显式改配置。
 
-转录分数缺失与低置信度分开处理：SenseVoice 当前接口不提供置信度分数，新任务不会仅因包含数字、`AI` 或单位而暂停。任务详情的“媒体识别模型”显示分数可用性；这只是说明，不把正常完成改成警告终态。有实际低分或模型报告的具体识别歧义时仍需复核。Whisper 的换算分数是启发式指标，不是识别正确率。历史任务已保存的疑点不会自动消除，仍按原复核流程处理。
+视频由当前模型一次校对后直接分析入库，不增加独立复核模型，也不要求人工校对。模型结合前后文与对应 OCR 修复同音词、错字和断句；没有依据的数字、金额、人名保留原表述，不扩写或补造事实。长稿按预算分片，每片附有界前后文；原稿、校正版和修改记录均保存。ASR 缺分、低分和普通文字疑点不会暂停新任务或单独产生完成警告；图文 OCR 低分同样只记录说明。模型超限等技术错误仍会重试或失败。SenseVoice 分数缺失、Whisper 启发式分数均不代表经过校准的正确率。历史待复核任务不会自动改动，可在 Web 点击“按新模型校对策略重试”，归档旧疑点并重新校对。
 
 模型权重由上游包或模型仓下载，项目仓库不分发权重。来源与条款见 [SenseVoice 模型仓](https://github.com/QwenAudio/SenseVoice)及其 `MODEL_LICENSE`、[RapidOCR 模型列表](https://rapidai.github.io/RapidOCRDocs/main/model_list/)和 [RapidOCR 许可证](https://github.com/RapidAI/RapidOCR/blob/main/LICENSE)。
 

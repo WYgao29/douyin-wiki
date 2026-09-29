@@ -1054,6 +1054,9 @@ def create_app(
                 app.state.config = updated
                 core.config = updated
                 app.state.chat_provider = await asyncio.to_thread(provider_factory, llm)
+                if updated.analysis_mode == AnalysisMode.PROVIDER:
+                    core.analysis = await asyncio.to_thread(OpenAICompatibleProvider, llm)
+                reload_result = operations.request_worker_reload()
         except (DouyinWikiError, OSError) as exc:
             raise HTTPException(status_code=500, detail=f"保存模型配置失败：{exc}") from exc
         current_provider = app.state.chat_provider
@@ -1061,6 +1064,8 @@ def create_app(
         key_required = llm_api_key_required(llm.base_url)
         return {
             "status": "配置已保存",
+            "worker_reload": reload_result["status"],
+            "worker_reload_note": reload_result["note"],
             "configured": current_provider.configured,
             "model": current_provider.model or "未配置",
             "api_key_configured": key_present,

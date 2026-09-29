@@ -26,12 +26,16 @@ from .models import (
 from .service import DouyinWikiService
 
 INSTRUCTIONS = """这是抖库，本地抖音知识库默认由当前 Gateway Agent 完成 AI 校正与分析。
-工具会保留英文内部状态码供程序判断，并同时返回对应的中文 label 字段。轮询与分支必须读英文 `status`（或事件中的机读状态），禁止用 `status_label` / `state_label` / `stage_label` 做相等判断；面向用户回复时只能使用中文 label，不得展示英文状态码。
+工具会保留英文内部状态码供程序判断，并同时返回对应的中文 label 字段。
+轮询与分支必须读英文 `status`（或事件中的机读状态），禁止用中文 label 做相等判断；
+面向用户回复时只能使用中文 label，不得展示英文状态码。
 采集时调用 capture_douyin，并传入 gateway_context 以便异步结果回到原会话。任务显示为
-“待 AI 处理”后：调用 get_analysis_context；先调用 submit_transcript_correction，
+“待 AI 处理”后：调用 get_analysis_context；根据原话上下文及对应 OCR 用当前模型直接校正，
+只修复识别错误、不扩写，无依据的数字或金额保留原表述；再调用 submit_transcript_correction，
 如 source_kind=image_note 且 phase=analysis，则直接根据 analysis_schema 调用
-submit_gateway_analysis；视频在无人工疑点后再提交分析。显示“需要人工复核”时必须向用户展示
-疑点并调用 resolve_review；显示“需要登录授权”时先调用 get_auth_status，再根据 auth_scope
+submit_gateway_analysis；视频校正后直接提交分析，不调用独立复核模型。历史任务若显示
+“需要人工复核”，仅在用户明确要求继续该任务时调用 retry_job，不自动重跑；显示“需要登录授权”时
+先调用 get_auth_status，再根据 auth_scope
 提示用户运行
 douyin-wiki auth video 或 douyin-wiki auth douyin，并在登录后重试；
 “等待用户确认”表示长视频将消耗 Agent 模型
@@ -290,7 +294,7 @@ def submit_transcript_correction(
     model: str = "agent",
     review_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Gateway Agent 提交逐字稿校正版；原始 ASR 永不覆盖。"""
+    """校对阶段提交全部原稿 ID（未修改也须回传），不可缺段；原始 ASR 永不覆盖。"""
     return _payload(
         _service().submit_transcript_correction(
             job_id,
@@ -323,7 +327,7 @@ def approve_job(job_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def retry_job(job_id: str) -> dict[str, Any]:
-    """重试失败或需要登录授权的任务；保留已完成阶段产物并从最近检查点继续。"""
+    """重试失败或需要授权的任务；历史人工复核任务重新执行模型校正。"""
     return _payload(_service().retry_job(job_id))
 
 
@@ -331,7 +335,7 @@ def retry_job(job_id: str) -> dict[str, Any]:
 def resolve_review(
     job_id: str, resolutions: dict[str, str] | None = None, accept_uncertain: bool = False
 ) -> dict[str, Any]:
-    """解决全部低置信逐字稿或逐图 OCR 疑点，或明确接受不确定内容。"""
+    """兼容旧版人工复核任务；新任务校正后直接分析，建议用 retry_job 重跑旧任务。"""
     return _payload(
         _service().resolve_review(job_id, resolutions, accept_uncertain=accept_uncertain)
     )

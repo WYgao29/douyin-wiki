@@ -156,7 +156,7 @@ def requires_user_action(job: JobRecord) -> bool:
 def retryable(job: JobRecord) -> bool:
     if job.kind == "media_restore":
         return job.status in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}
-    return job.status in {JobStatus.FAILED, JobStatus.NEEDS_AUTH}
+    return job.status in {JobStatus.FAILED, JobStatus.NEEDS_AUTH, JobStatus.NEEDS_REVIEW}
 
 
 def _auth_scope(job: JobRecord) -> str | None:
@@ -191,10 +191,10 @@ def next_action_for(
         }
     if job.status == JobStatus.NEEDS_REVIEW:
         return {
-            "code": "review",
-            "label": "处理人工复核疑点",
+            "code": "retry",
+            "label": "按新模型校对策略重试",
             "href": f"/jobs/{job.id}",
-            "endpoint": f"/api/jobs/{job.id}/review",
+            "endpoint": f"/api/jobs/{job.id}/retry",
         }
     if job.status == JobStatus.NEEDS_SELECTION:
         href = (
@@ -257,7 +257,7 @@ def message_for_user(
     if job.status == JobStatus.WAITING_CONFIRMATION:
         return "该视频较长，需要你明确批准后才会继续下载或分析。"
     if job.status == JobStatus.NEEDS_REVIEW:
-        return "本地提取完成，但有低置信疑点需要你复核。"
+        return "历史任务停在人工复核；可按当前模型校对策略重新处理。"
     if job.status == JobStatus.NEEDS_SELECTION:
         return "清点已完成，请选择要导入的作品并确认。"
     if job.status == JobStatus.AWAITING_AGENT_ANALYSIS:

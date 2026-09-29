@@ -81,7 +81,8 @@ class MediaSettings(BaseModel):
     ocr_provider: Literal["auto", "rapidocr", "vision"] = "auto"
     asr_model: str = "iic/SenseVoiceSmall"
     vad_model: str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-    # Pin hub revisions so weight pulls stay reproducible (SenseVoice model.pt commit; FSMN-VAD tip of tag v2.0.4).
+    # Pin hub revisions so weight pulls stay reproducible.
+    # SenseVoice model.pt commit; FSMN-VAD tip of tag v2.0.4.
     asr_model_revision: str = "70514a3da51f1160f51d18449dab6128bbd4928b"
     vad_model_revision: str = "662fc7a38813d81305085696d59eb5b1141a204a"
     asr_device: Literal["auto", "cpu", "mps"] = "auto"

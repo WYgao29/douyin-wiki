@@ -5,7 +5,7 @@ import re
 import sqlite3
 import unicodedata
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -381,7 +381,7 @@ class Database:
                 "AND lease_expires_at>?", (job_id, active[1], utc_now().isoformat())
             ).fetchone()
             if row is None:
-                raise JobLeaseLostError("收藏清点任务的 Worker 租约已失效")
+                raise JobLeaseLostError("任务的 Worker 租约已失效")
 
     def initialize(self) -> None:
         from .favorites_store import FAVORITES_SCHEMA
@@ -1007,11 +1007,15 @@ class Database:
         status: JobStatus | None = None,
         progress: float | None = None,
         artifacts: dict[str, Any] | None = None,
+        remove_artifacts: set[str] | None = None,
+        clear_review_issues: bool = False,
         result: dict[str, Any] | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
         unlock: bool = False,
         expected_child_updates: dict[str, str] | None = None,
+        expected_updated_at: datetime | None = None,
+        expected_statuses: set[JobStatus] | None = None,
     ) -> JobRecord:
         active_claim = _ACTIVE_CLAIM.get()
         expected_owner = active_claim[1] if active_claim and active_claim[0] == job_id else None
@@ -1021,6 +1025,10 @@ class Database:
             if current_row is None:
                 raise JobStateError(f"job not found: {job_id}")
             current = self._job_from_row(current_row)
+            if expected_statuses is not None and current.status not in expected_statuses:
+                raise JobStateError("任务状态已改变，请重新读取后再操作")
+            if expected_updated_at is not None and current.updated_at != expected_updated_at:
+                raise JobStateError("任务已被其他操作更新，请重新读取后再操作")
             if expected_child_updates is not None:
                 # Check the aggregation snapshot under the same write lock as publication.
                 for child_id, observed_at in expected_child_updates.items():
@@ -1038,8 +1046,10 @@ class Database:
                 assignments.append("progress=?")
                 values.append(max(0.0, min(1.0, progress)))
             merged_artifacts = current.artifacts
-            if artifacts is not None:
-                merged_artifacts = {**current.artifacts, **artifacts}
+            if artifacts is not None or remove_artifacts:
+                merged_artifacts = {**current.artifacts, **(artifacts or {})}
+                for key in remove_artifacts or ():
+                    merged_artifacts.pop(key, None)
                 assignments.append("artifacts_json=?")
                 values.append(json.dumps(merged_artifacts, ensure_ascii=False))
             if result is not None:
@@ -1063,6 +1073,8 @@ class Database:
             ).rowcount
             if expected_owner is not None and not changed:
                 raise JobLeaseLostError(f"任务 {job_id} 的 Worker 租约已失效")
+            if clear_review_issues:
+                conn.execute("DELETE FROM review_issues WHERE job_id=?", (job_id,))
             if (
                 status is not None
                 and status != current.status
@@ -1103,21 +1115,30 @@ class Database:
             updated_row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._job_from_row(updated_row)
 
-    def requeue_job(self, job_id: str, *, artifacts: dict[str, Any] | None = None) -> JobRecord:
-        job = self.get_job(job_id)
-        if job.status not in {
-            JobStatus.AWAITING_AGENT_ANALYSIS,
-            JobStatus.NEEDS_AUTH,
-            JobStatus.NEEDS_REVIEW,
-            JobStatus.NEEDS_SELECTION,
-            JobStatus.WAITING_CONFIRMATION,
-            JobStatus.FAILED,
-        }:
-            raise JobStateError(f"任务 {job_id} 当前状态不允许重新排队")
+    def requeue_job(
+        self,
+        job_id: str,
+        *,
+        artifacts: dict[str, Any] | None = None,
+        remove_artifacts: set[str] | None = None,
+        clear_review_issues: bool = False,
+        expected_updated_at: datetime | None = None,
+    ) -> JobRecord:
+        # Validate the original snapshot under the same write lock as requeueing.
+        # A late retry must never clear a lease acquired by a newer worker.
+        observed = expected_updated_at or self.get_job(job_id).updated_at
         return self.update_job(
             job_id,
             status=JobStatus.QUEUED,
             artifacts=artifacts,
+            remove_artifacts=remove_artifacts,
+            clear_review_issues=clear_review_issues,
+            expected_updated_at=observed,
+            expected_statuses={
+                JobStatus.AWAITING_AGENT_ANALYSIS, JobStatus.NEEDS_AUTH,
+                JobStatus.NEEDS_REVIEW, JobStatus.NEEDS_SELECTION,
+                JobStatus.WAITING_CONFIRMATION, JobStatus.FAILED,
+            },
             error_code="",
             error_message="",
             unlock=True,
@@ -2107,9 +2128,18 @@ class Database:
         chunks: list[dict[str, Any]],
         relations: list[dict[str, Any]],
         reminders: list[ReminderCandidate],
+        *,
+        publish_documents: Callable[[], None] | None = None,
     ) -> EntryRecord:
         """Atomically replace one entry and every rebuildable SQLite projection."""
         with self.connect() as conn:
+            # Hold the writer reservation across publication: recovery/claiming
+            # cannot transfer ownership after validation and before publication.
+            conn.execute("BEGIN IMMEDIATE")
+            if active := _ACTIVE_CLAIM.get():
+                self.assert_job_claim(conn, active[0])
+            if publish_documents is not None:
+                publish_documents()
             self._persist_entry_bundle_conn(conn, entry, data, chunks, relations, reminders)
         return self.get_entry(entry.id)
 

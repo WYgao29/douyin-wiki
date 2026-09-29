@@ -215,6 +215,13 @@ class TranscriptCorrection(BaseModel):
     id: int
     text: str = Field(min_length=1, max_length=20_000)
 
+    @field_validator("text")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("校正文本不能仅包含空白")
+        return value
+
 
 class ReviewIssue(BaseModel):
     id: str

@@ -427,14 +427,12 @@ async def test_image_note_auth_and_low_confidence_review(tmp_path: Path) -> None
     review_service = make_service(tmp_path / "review", ocr=NoteOCR(low_confidence=True))
     review_job = review_service.capture_douyin("https://v.douyin.com/oH4K0gee_Ok/")
     review = await Worker(review_service).run_once()
-    assert review.status == JobStatus.NEEDS_REVIEW
-    issue = review_service.get_job(review_job.id).result["review_issues"][0]
-    assert issue["image_index"] == 2
-    review_service.resolve_review(review_job.id, {issue["id"]: "Q4 需要 6GB 显存"})
-    completed = await Worker(review_service).run_once()
-    assert completed.status == JobStatus.COMPLETED
-    data = review_service.database.get_entry_data(completed.result["entry_id"])
-    assert data["ocr"][1]["text"] == "Q4 需要 6GB 显存"
+    assert review.status == JobStatus.COMPLETED
+    assert review_service.database.get_review_issues(review_job.id) == []
+    assert review.artifacts["ocr_quality_notes"][0]["image_index"] == 2
+    data = review_service.database.get_entry_data(review.result["entry_id"])
+    assert data["ocr_quality_notes"] == review.artifacts["ocr_quality_notes"]
+
 
 
 def test_image_note_auth_check_rejects_expired_cookie_and_challenge() -> None:

@@ -998,7 +998,10 @@ class VaultWriter:
         metadata = payload.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ValueError("metadata 必须是对象")
-        for field in ("ocr", "review_issues", "relations", "reminder_states"):
+        for field in (
+            "ocr", "review_issues", "transcript_edits", "correction_notes",
+            "ocr_quality_notes", "relations", "reminder_states",
+        ):
             if not isinstance(payload.get(field, []), list):
                 raise ValueError(f"{field} 必须是数组")
         creator_payload = payload.get("creator", {})
@@ -1018,6 +1021,9 @@ class VaultWriter:
             "metadata": metadata,
             "ocr": payload.get("ocr", []),
             "review_issues": payload.get("review_issues", []),
+            "transcript_edits": payload.get("transcript_edits", []),
+            "correction_notes": payload.get("correction_notes", []),
+            "ocr_quality_notes": payload.get("ocr_quality_notes", []),
             "relations": payload.get("relations", []),
             "creator": creator_payload,
             "analysis": analysis.model_dump(mode="json"),
@@ -1327,6 +1333,11 @@ class VaultWriter:
         for item in data.get("ocr", []):
             lines.append(f"- [{format_timestamp(item.get('timestamp_ms'))}] {item.get('text', '')}")
         lines.extend(["", "## 校对记录", ""])
+        for item in data.get("transcript_edits", []):
+            lines.append(
+                f"- [{format_timestamp(item.get('start_ms'))}] "
+                f"`{item.get('raw_text', '')}` → `{item.get('corrected_text', '')}`（模型校正）"
+            )
         for item in data.get("review_issues", []):
             resolution = item.get("resolution") or "未人工修正"
             lines.append(
@@ -1551,6 +1562,9 @@ class VaultWriter:
             "metadata": data.get("metadata", {}),
             "ocr": data.get("ocr", []),
             "review_issues": data.get("review_issues", []),
+            "transcript_edits": data.get("transcript_edits", []),
+            "correction_notes": data.get("correction_notes", []),
+            "ocr_quality_notes": data.get("ocr_quality_notes", []),
             "relations": data.get("relations", []),
             "creator": data.get("creator", {}),
             "reminder_states": data.get("reminder_states", []),

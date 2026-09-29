@@ -157,52 +157,11 @@
     }
     const review = D.node("section", null, "review-panel");
     if (job.review_issues?.length) {
-      review.append(D.node("h2", "人工复核"));
-      const form = document.createElement("form");
+      review.append(D.node("h2", "历史校对疑点"));
+      review.append(D.node("p", "此任务按旧策略暂停。点击“按新模型校对策略重试”会重新校正并继续分析。", "hint-copy"));
       job.review_issues.forEach((issue) => {
-        const label = D.node("label", `疑点 ${issue.id}（${issue.start_ms}-${issue.end_ms}ms${issue.image_index ? ` · 图 ${issue.image_index}` : ""}）`);
-        const input = document.createElement("textarea");
-        input.rows = 2;
-        input.value = issue.raw_text;
-        input.dataset.issue = issue.id;
-        label.append(input, D.node("small", issue.reason || ""));
-        form.append(label);
+        review.append(D.node("p", `疑点 ${issue.id}（${issue.start_ms}-${issue.end_ms}ms${issue.image_index ? ` · 图 ${issue.image_index}` : ""}）：${issue.raw_text}；${issue.reason || ""}`));
       });
-      const save = D.node("button", "提交修改", "primary-button");
-      save.type = "submit";
-      const accept = D.node("button", "接受全部不确定内容", "secondary-button");
-      accept.type = "button";
-      accept.addEventListener("click", async () => {
-        try {
-          await D.api(`/api/jobs/${encodeURIComponent(jobId)}/review`, {
-            method: "POST",
-            body: JSON.stringify({accept_uncertain: true}),
-          });
-          D.toast("已接受不确定内容");
-          loadDetail(jobId);
-        } catch (error) {
-          D.toast(error.message);
-        }
-      });
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const resolutions = {};
-        form.querySelectorAll("textarea[data-issue]").forEach((input) => {
-          resolutions[input.dataset.issue] = input.value;
-        });
-        try {
-          await D.api(`/api/jobs/${encodeURIComponent(jobId)}/review`, {
-            method: "POST",
-            body: JSON.stringify({resolutions}),
-          });
-          D.toast("复核已提交");
-          loadDetail(jobId);
-        } catch (error) {
-          D.toast(error.message);
-        }
-      });
-      form.append(save, accept);
-      review.append(form);
     }
     const evidenceAudit = D.node("section", null, "review-panel");
     if (job.analysis_evidence_audit?.length) {

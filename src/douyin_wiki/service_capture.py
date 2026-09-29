@@ -29,8 +29,8 @@ from .models import (
     VideoMetadata,
 )
 from .review import (
-    deduplicate_review_issues,
     apply_review_resolutions,
+    deduplicate_review_issues,
     detect_review_issues,
     transcript_confidence_info,
 )
@@ -528,25 +528,35 @@ class CaptureMixin:
                     [self.ocr_model(item) for item in ocr_items],
                     **correction_kwargs,
                 )
-            issues = deduplicate_review_issues([*detect_review_issues(transcript_raw), *llm_issues])
             artifacts["transcript_corrected"] = [item.model_dump(mode="json") for item in corrected]
-            artifacts["review_issues"] = [item.model_dump(mode="json") for item in issues]
+            artifacts["transcript_edits"] = [
+                {
+                    "id": raw.id,
+                    "start_ms": raw.start_ms,
+                    "end_ms": raw.end_ms,
+                    "raw_text": raw.text,
+                    "corrected_text": item.text,
+                }
+                for raw, item in zip(transcript_raw, corrected, strict=True)
+                if raw.text != item.text
+            ]
+            artifacts["correction_notes"] = [
+                item.model_dump(mode="json")
+                for item in deduplicate_review_issues(
+                    [*detect_review_issues(transcript_raw), *llm_issues]
+                )
+            ]
+            artifacts["review_issues"] = []
             self.database.update_job(
                 job.id,
                 artifacts={
                     "transcript_corrected": artifacts["transcript_corrected"],
+                    "transcript_edits": artifacts["transcript_edits"],
+                    "correction_notes": artifacts["correction_notes"],
                     "review_issues": artifacts["review_issues"],
                 },
                 progress=0.66,
             )
-            if issues and not artifacts.get("review_resolved"):
-                self.database.replace_review_issues(job.id, issues)
-                return self.database.update_job(
-                    job.id,
-                    status=JobStatus.NEEDS_REVIEW,
-                    result={"review_issue_count": len(issues)},
-                    unlock=True,
-                )
 
         corrected = [
             TranscriptSegment.model_validate(item) for item in artifacts["transcript_corrected"]
@@ -726,6 +736,8 @@ class CaptureMixin:
             "metadata": metadata.model_dump(mode="json"),
             "transcript_raw": artifacts["transcript_raw"],
             "transcript_corrected": artifacts["transcript_corrected"],
+            "transcript_edits": artifacts.get("transcript_edits", []),
+            "correction_notes": artifacts.get("correction_notes", []),
             "ocr": ocr_items,
             "review_issues": [item.model_dump(mode="json") for item in review_issues]
             or artifacts.get("review_issues", []),
@@ -946,18 +958,9 @@ class CaptureMixin:
 
         issues = self.detect_image_review_issues(ocr_models, metadata.post_text or "")
         if issues and not artifacts.get("review_resolved"):
-            artifacts["review_issues"] = [item.model_dump(mode="json") for item in issues]
-            self.database.replace_review_issues(job.id, issues)
-            return self.database.update_job(
-                job.id,
-                status=JobStatus.NEEDS_REVIEW,
-                progress=0.62,
-                artifacts={"review_issues": artifacts["review_issues"]},
-                result={
-                    "phase": "image_ocr_review",
-                    "review_issue_count": len(issues),
-                },
-                unlock=True,
+            artifacts["ocr_quality_notes"] = [item.model_dump(mode="json") for item in issues]
+            self.database.update_job(
+                job.id, artifacts={"ocr_quality_notes": artifacts["ocr_quality_notes"]}
             )
         if artifacts.get("review_resolved"):
             resolved_issues = self.database.get_review_issues(job.id)
@@ -990,9 +993,32 @@ class CaptureMixin:
                 ]
             )
             analysis_metadata["existing_knowledge"] = self.indexer.find_related_claims(context_text)
+            checkpoints = artifacts.setdefault("llm_checkpoints", {})
+
+            def save_checkpoint(_fingerprint: str, _value: dict[str, Any]) -> None:
+                self.database.update_job(job.id, artifacts={"llm_checkpoints": checkpoints})
+
+            def model_progress(phase: str, completed: int, total: int) -> None:
+                current = self.database.get_job(job.id)
+                self.database.update_job(
+                    job.id,
+                    progress=max(current.progress, 0.70 + 0.1 * completed / max(total, 1)),
+                    artifacts={"analysis_progress": {
+                        "phase": phase,
+                        "completed_chunks": completed,
+                        "total_chunks": total,
+                        "waiting_for_resource": False,
+                    }},
+                )
+
             async with self.analysis_semaphore:
+                kwargs = (
+                    {"checkpoints": checkpoints, "on_checkpoint": save_checkpoint,
+                     "on_progress": model_progress}
+                    if isinstance(self.analysis, OpenAICompatibleProvider) else {}
+                )
                 analysis = await self.analysis.analyze(
-                    [], ocr_models, effective_inspirations, analysis_metadata
+                    [], ocr_models, effective_inspirations, analysis_metadata, **kwargs
                 )
             self.validate_analysis_evidence(
                 analysis,
@@ -1069,6 +1095,7 @@ class CaptureMixin:
             "inspirations": [item.model_dump(mode="json") for item in effective_inspirations],
             "metadata": stored_metadata.model_dump(mode="json"),
             "ocr": [item.model_dump(mode="json") for item in ocr_models],
+            "ocr_quality_notes": artifacts.get("ocr_quality_notes", []),
             "review_issues": [item.model_dump(mode="json") for item in review_issues]
             or artifacts.get("review_issues", []),
             "analysis": analysis_data,
@@ -1124,6 +1151,7 @@ class CaptureMixin:
             job.id,
             status=status,
             progress=1,
+            artifacts={"llm_checkpoints": {}},
             result={
                 "entry_id": entry.id,
                 "source_kind": SourceKind.IMAGE_NOTE.value,

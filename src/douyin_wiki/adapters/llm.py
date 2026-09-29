@@ -30,7 +30,7 @@ from ..models import (
 )
 from ..secrets import get_secret
 
-PROMPT_VERSION = "v2.2-timeline-chapters"
+PROMPT_VERSION = "v2.3-context-correction"
 
 
 class ModelLimitError(ExternalToolError):
@@ -76,7 +76,9 @@ def _soft_merge_analysis_partials(
         chapters.extend(
             item for item in (partial.get("chapters") or []) if isinstance(item, dict)
         )
-        actions.extend(str(item).strip() for item in (partial.get("actions") or []) if str(item).strip())
+        actions.extend(
+            str(item).strip() for item in (partial.get("actions") or []) if str(item).strip()
+        )
         tags.extend(str(item).strip() for item in (partial.get("tags") or []) if str(item).strip())
         concepts.extend(
             str(item).strip() for item in (partial.get("concepts") or []) if str(item).strip()
@@ -114,6 +116,72 @@ def _soft_merge_analysis_partials(
         reminders=reminders,
         content_card={"kind": "other", "notes": list(dict.fromkeys(notes))},
     ).model_dump(mode="json")
+
+
+
+def _normalize_correction_segments(
+    chunk: list[TranscriptSegment], returned: Any
+) -> list[dict[str, Any]]:
+    """Map model correction rows onto local chunk indices ``0..n-1``.
+
+    Live models sometimes emit 1-based ids (``1..n``), unknown extras, or
+    duplicates. Prefer exact local ids, then 1-based remapping, then
+    positional fallback when the usable row count matches. Gaps keep the
+    original chunk text so a single bad id does not fail the whole job.
+    """
+    if not isinstance(returned, list):
+        raise ValueError("模型校正结果缺少 segments 数组")
+    size = len(chunk)
+    if size == 0:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for item in returned:
+        if not isinstance(item, dict) or type(item.get("id")) is not int:
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        rows.append({"id": item["id"], "text": text})
+
+    def filled(mapping: dict[int, str]) -> list[dict[str, Any]]:
+        return [
+            {"id": index, "text": mapping[index] if index in mapping else chunk[index].text}
+            for index in range(size)
+        ]
+
+    local: dict[int, str] = {}
+    for row in rows:
+        identifier = row["id"]
+        if 0 <= identifier < size and identifier not in local:
+            local[identifier] = row["text"]
+
+    one_based: dict[int, str] = {}
+    for row in rows:
+        identifier = row["id"] - 1
+        if 0 <= identifier < size and identifier not in one_based:
+            one_based[identifier] = row["text"]
+
+    returned_ids = [row["id"] for row in rows]
+    looks_one_based = (
+        bool(returned_ids)
+        and min(returned_ids) >= 1
+        and max(returned_ids) <= size
+        and 0 not in returned_ids
+    )
+
+    if looks_one_based and len(one_based) >= max(len(local), 1):
+        return filled(one_based)
+    if local:
+        # Prefer partial local coverage (fill gaps from originals) over positional
+        # guessing whenever any in-range id was returned.
+        return filled(local)
+    if len(rows) == size:
+        return [{"id": index, "text": rows[index]["text"]} for index in range(size)]
+    if one_based:
+        return filled(one_based)
+    # Nothing usable — keep originals rather than failing the whole correction.
+    return filled({})
 
 
 def _split_transcript_text(value: str, *, min_chars: int = 12) -> tuple[str, str] | None:
@@ -183,21 +251,8 @@ TRANSCRIPT_CORRECTION_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "review_issues": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "segment_id": {"type": "integer"},
-                    "reason": {"type": "string"},
-                    "suggestions": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["segment_id", "reason", "suggestions"],
-                "additionalProperties": False,
-            },
-        },
     },
-    "required": ["segments", "review_issues"],
+    "required": ["segments"],
     "additionalProperties": False,
 }
 
@@ -782,24 +837,42 @@ class OpenAICompatibleProvider(AnalysisProvider):
     ) -> tuple[list[TranscriptSegment], list[ReviewIssue]]:
         self._require_configured()
         corrected: list[TranscriptSegment] = []
-        issues: list[ReviewIssue] = []
-        system = """你是中文逐字稿校对器。只能修正明显的同音字、断句、数字、人名和专有名词错误；
-不得摘要、删句、补充视频没有说过的内容。OCR 只是辅助证据，冲突时保留不确定性。
-输出 JSON：{\"segments\":[{\"id\":整数,\"text\":字符串}],
-\"review_issues\":[{\"segment_id\":整数,\"reason\":字符串,\"suggestions\":[字符串]}]}。"""
+        system = """你是中文逐字稿校对器。结合原话上下文与对应时间附近的 OCR，
+直接给出最贴近原意的完整逐字稿。
+根据语义上下文修复同音词、断句等识别错误；不得摘要、删句、扩写或添加视频没有说过的信息。
+OCR 只是辅助证据，不出现对应文字不代表原话错误。数字、金额、人名等没有足够依据时保留原表述。
+context_before/context_after 只供理解，不得复制进当前段的 text；
+只返回 segments 中当前 text 对应的内容。
+对不确定的地方作出保守选择，不请求人工复核。每段 id 必须与输入 segments 的 id 完全一致（本次请求内从 0 起的本地序号），不要改用其它编号。
+输出 JSON：{\"segments\":[{\"id\":整数,\"text\":字符串}]}。"""
+        source_index = {segment.id: index for index, segment in enumerate(segments)}
+        source_by_id = {segment.id: segment for segment in segments}
+        bounds_by_id: dict[int, tuple[int, int]] = {}
 
         def payload_for(
             chunk: list[TranscriptSegment], nearby: list[OCRObservation]
         ) -> dict[str, Any]:
-            return {
+            payload = {
                 # Model-facing IDs are small and local to this request. Internal
                 # path IDs only identify pieces/checkpoints and never reach the model.
-                "segments": [
-                    _transcript_prompt_item(item.model_copy(update={"id": index}))
-                    for index, item in enumerate(chunk)
-                ],
+                "segments": [],
                 "ocr": [_ocr_prompt_item(item) for item in nearby],
             }
+            for index, item in enumerate(chunk):
+                source = source_by_id[item.id]
+                start, end = bounds_by_id[item.id]
+                position = source_index[source.id]
+                previous = source.text[:start] or (
+                    segments[position - 1].text if position else ""
+                )
+                following = source.text[end:] or (
+                    segments[position + 1].text if position + 1 < len(segments) else ""
+                )
+                prompt_item = _transcript_prompt_item(item.model_copy(update={"id": index}))
+                prompt_item["context_before"] = previous[-40:]
+                prompt_item["context_after"] = following[:40]
+                payload["segments"].append(prompt_item)
+            return payload
 
         if len({segment.id for segment in segments}) != len(segments):
             raise ExternalToolError("原始逐字稿片段 ID 重复，无法安全校正")
@@ -812,10 +885,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
         # their original IDs and time ranges. Source index and binary split path
         # keep IDs stable even when another branch succeeds on a later retry.
         id_floor = min(segment.id for segment in segments)
-        source_by_id = {segment.id: segment for segment in segments}
-        piece_by_id: dict[int, TranscriptSegment] = {}
         path_by_id: dict[int, int] = {}
-        source_index = {segment.id: index for index, segment in enumerate(segments)}
         pieces_by_source: dict[int, list[int]] = {segment.id: [] for segment in segments}
         pieces: list[TranscriptSegment] = []
         min_chars = 12
@@ -824,19 +894,21 @@ class OpenAICompatibleProvider(AnalysisProvider):
         def split_text(value: str) -> tuple[str, str] | None:
             return _split_transcript_text(value, min_chars=min_chars)
 
-        def add_piece(source: TranscriptSegment, value: str, path: int) -> TranscriptSegment:
+        def add_piece(
+            source: TranscriptSegment, value: str, path: int, start: int
+        ) -> TranscriptSegment:
             identifier = id_floor - ((source_index[source.id] + 1) * (1 << 32) + path)
             piece = source.model_copy(update={"id": identifier, "text": value})
             source_by_id[identifier] = source
-            piece_by_id[identifier] = piece
+            bounds_by_id[identifier] = (start, start + len(value))
             path_by_id[identifier] = path
             return piece
 
         for source in segments:
-            pending = [(source.text, 1)]
+            pending = [(source.text, 1, 0)]
             while pending:
-                value, path = pending.pop()
-                candidate = add_piece(source, value, path)
+                value, path, start = pending.pop()
+                candidate = add_piece(source, value, path, start)
                 nearby = self._fit_ocr(
                     [candidate], ocr, system, TRANSCRIPT_CORRECTION_SCHEMA, payload_for
                 )
@@ -849,7 +921,12 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 halves = split_text(value)
                 if halves is None:
                     raise ModelContextError(f"字幕段 {source.id} 单独超过模型输入预算")
-                pending.extend(((halves[1], path * 2 + 1), (halves[0], path * 2)))
+                pending.extend(
+                    (
+                        (halves[1], path * 2 + 1, start + len(halves[0])),
+                        (halves[0], path * 2, start),
+                    )
+                )
 
         chunks = self._budgeted_chunks(
             pieces,
@@ -865,33 +942,10 @@ class OpenAICompatibleProvider(AnalysisProvider):
             on_progress("correction", completed, total)
 
         def validate_result(chunk: list[TranscriptSegment], result: dict[str, Any]) -> None:
-            returned = result.get("segments")
-            if not isinstance(returned, list):
-                raise ValueError("模型校正结果缺少 segments 数组")
-            expected = set(range(len(chunk)))
-            found: set[int] = set()
-            for item in returned:
-                if not isinstance(item, dict) or type(item.get("id")) is not int:
-                    raise ValueError("模型校正结果包含无效片段 ID")
-                identifier = item["id"]
-                if identifier not in expected or identifier in found:
-                    raise ValueError(f"模型校正结果包含未知或重复片段 ID：{identifier}")
-                if not isinstance(item.get("text"), str) or not item["text"].strip():
-                    raise ValueError(f"模型校正结果的片段 {identifier} 文本为空")
-                found.add(identifier)
-            if found != expected:
-                raise ValueError(f"模型校正结果缺少片段 ID：{sorted(expected - found)}")
-            if not isinstance(result.get("review_issues"), list):
-                raise ValueError("模型校正结果缺少 review_issues 数组")
-            for item in result["review_issues"]:
-                if not isinstance(item, dict) or type(item.get("segment_id")) is not int:
-                    raise ValueError("模型校正疑点包含无效片段 ID")
-                if item["segment_id"] not in expected:
-                    raise ValueError(f"模型校正疑点引用未知片段 ID：{item['segment_id']}")
-
+            # Normalize unknown/duplicate/1-based ids onto local 0..n-1 indices.
+            # Mutates result so downstream indexing stays simple and safe.
+            result["segments"] = _normalize_correction_segments(chunk, result.get("segments"))
         results: dict[int, str] = {}
-        reviews: list[tuple[int, dict[str, Any]]] = []
-        limit_skips: dict[int, list[str]] = {}
         limit_splits = 0
         # Character-level hard-splits need headroom proportional to total chars.
         max_limit_splits = max(
@@ -938,23 +992,17 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 piece = chunk[0]
                 halves = split_text(piece.text)
                 if halves is None:
-                    # Irreducible min chunk: keep original text and continue.
                     source = source_by_id[piece.id]
-                    results[piece.id] = piece.text
-                    skip_reason = (
-                        f"模型输出超限且最小文本块不可再切（{len(piece.text)} 字），"
-                        "已跳过该块校正并保留原文"
-                    )
-                    limit_skips.setdefault(source.id, []).append(skip_reason)
-                    completed += len(chunk)
-                    if on_progress is not None:
-                        on_progress("correction", completed, total)
-                    return
+                    raise ModelOutputError(
+                        f"字幕段 {source.id} 的最小文本块输出超限，无法完成校正",
+                        details={"last_response": exc.details},
+                    ) from exc
                 source = source_by_id[piece.id]
                 path = path_by_id[piece.id]
+                start, _end = bounds_by_id[piece.id]
                 children = [
-                    add_piece(source, halves[0], path * 2),
-                    add_piece(source, halves[1], path * 2 + 1),
+                    add_piece(source, halves[0], path * 2, start),
+                    add_piece(source, halves[1], path * 2 + 1, start + len(halves[0])),
                 ]
                 position = pieces_by_source[source.id].index(piece.id)
                 pieces_by_source[source.id][position : position + 1] = [
@@ -966,13 +1014,6 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 return
             for item in result["segments"]:
                 results[chunk[item["id"]].id] = item["text"]
-            reviews.extend(
-                (
-                    index,
-                    {**item, "segment_id": chunk[item["segment_id"]].id},
-                )
-                for index, item in enumerate(result["review_issues"])
-            )
             completed += len(chunk)
             if on_progress is not None:
                 on_progress("correction", completed, total)
@@ -986,60 +1027,7 @@ class OpenAICompatibleProvider(AnalysisProvider):
                 raise ExternalToolError(f"字幕段 {segment.id} 的子块未全部完成，无法合并")
             text = "".join(results[identifier] for identifier in piece_ids)
             corrected.append(segment.model_copy(update={"text": text}))
-        reasons_by_source: dict[int, list[str]] = {}
-        for _index, item in reviews:
-            piece_id = item["segment_id"]
-            source = source_by_id[piece_id]
-            suggestions = list(
-                dict.fromkeys(
-                    str(value).strip()
-                    for value in item.get("suggestions", [])
-                    if str(value).strip()
-                )
-            )
-            reason = str(item.get("reason", "模型认为该片段需要人工确认"))
-            if _review_issue_skip_reason(
-                piece_by_id[piece_id].text, results[piece_id], reason, suggestions
-            ):
-                continue
-            detail = f"{reason}（局部建议：{' / '.join(suggestions)}）" if suggestions else reason
-            reasons_by_source.setdefault(source.id, []).append(detail)
-        for source in segments:
-            reasons = reasons_by_source.get(source.id)
-            if reasons:
-                full_text = next(item.text for item in corrected if item.id == source.id)
-                issues.append(
-                    ReviewIssue(
-                        id=f"llm-{source.id}",
-                        start_ms=source.start_ms,
-                        end_ms=source.end_ms,
-                        raw_text=source.text,
-                        reason="；".join(dict.fromkeys(reasons)),
-                        suggestions=[full_text],
-                    )
-                )
-        for source in segments:
-            skip_reasons = limit_skips.get(source.id)
-            if not skip_reasons:
-                continue
-            detail = "；".join(dict.fromkeys(skip_reasons))
-            existing = next((item for item in issues if item.id == f"llm-{source.id}"), None)
-            if existing is not None:
-                if detail not in existing.reason:
-                    existing.reason = f"{existing.reason}；{detail}"
-                continue
-            full_text = next(item.text for item in corrected if item.id == source.id)
-            issues.append(
-                ReviewIssue(
-                    id=f"llm-{source.id}",
-                    start_ms=source.start_ms,
-                    end_ms=source.end_ms,
-                    raw_text=source.text,
-                    reason=detail,
-                    suggestions=[full_text],
-                )
-            )
-        return corrected, issues
+        return corrected, []
 
     async def analyze(
         self,
@@ -1213,22 +1201,15 @@ class OpenAICompatibleProvider(AnalysisProvider):
                     piece = chunk[0]
                     halves = split_text(piece.text)
                     if halves is None:
-                        # Irreducible min chunk: degrade instead of failing the job.
                         source = source_by_id[piece.id]
-                        completed_chunks += 1
-                        report_progress()
-                        warning = (
-                            f"字幕段 {source.id}（{len(piece.text)} 字）模型输出超限且"
-                            "最小文本块不可再切，已跳过该块分析"
-                        )
-                        return [
-                            AnalysisResult(
-                                title=f"跳过字幕段 {source.id}",
-                                one_liner=warning[:120],
-                                open_questions=[warning],
-                                content_card={"kind": "other", "notes": [warning]},
-                            ).model_dump(mode="json")
-                        ]
+                        raise type(exc)(
+                            f"字幕段 {source.id} 的最小文本块仍超过模型预算，无法完成分析",
+                            details={
+                                "segment_id": source.id,
+                                "piece_chars": len(piece.text),
+                                "last_response": exc.details,
+                            },
+                        ) from exc
                     source = source_by_id[piece.id]
                     path = path_by_id[piece.id]
                     children = [
@@ -1438,7 +1419,9 @@ def _transcript_prompt_item(segment: TranscriptSegment) -> dict[str, Any]:
 
 
 def _ocr_prompt_item(item: OCRObservation) -> dict[str, Any]:
-    return item.model_dump(mode="json", include={"timestamp_ms", "image_index", "text"})
+    return item.model_dump(
+        mode="json", include={"timestamp_ms", "image_index", "text", "confidence"}
+    )
 
 
 def _citation_key(value: str | None) -> str:
@@ -1518,26 +1501,6 @@ def _sample_evenly(items: list[Any], limit: int) -> list[Any]:
     return [items[round(index * (len(items) - 1) / (limit - 1))] for index in range(limit)]
 
 
-def _review_issue_skip_reason(
-    source_text: str,
-    corrected_text: str,
-    reason: str,
-    suggestions: list[str],
-) -> str | None:
-    if not suggestions:
-        return "没有可操作的建议"
-    if all(value == source_text for value in suggestions):
-        return "建议与原文相同"
-    if corrected_text != source_text and any(value in corrected_text for value in suggestions):
-        return "建议已应用于校正稿"
-    if len(suggestions) == 1 and not re.search(
-        r"不确定|无法|可能|歧义|语义不明|专有|人名|地名|数字|日期|型号|品牌|名称",
-        reason,
-    ):
-        return "单一建议且未说明关键歧义"
-    return None
-
-
 def _nearby_ocr(
     chunk: list[TranscriptSegment],
     ocr: list[OCRObservation],
@@ -1615,7 +1578,9 @@ def _parse_json_content(content: str) -> dict[str, Any]:
 
 def _analysis_system_prompt() -> str:
     return """你是个人知识库的抖音作品分析器。作品可能是视频，也可能是静态图文。一次完成内容分类与
-结构化分析。严格区分视频原话、作品正文、OCR 画面信息、AI 推断和用户灵感。用户灵感必须逐字保留，
+结构化分析。OCR confidence 是识别质量提示而非事实正确率，缺失不表示内容错误。
+低置信数字或专名应结合上下文核对；依据不足时保留原表述并说明不确定性，不臆造，不要求人工校对。
+严格区分视频原话、作品正文、OCR 画面信息、AI 推断和用户灵感。用户灵感必须逐字保留，
 只能用于调整分析重点，禁止改写或补造。metadata.source_kind=image_note 时，正文位于 post_text，OCR
 按 image_index 对应原图；此时不要伪造 00:00 时间戳。
 选择唯一 content_type：tutorial、explanation、opinion、recommendation、news_event、story_case、
@@ -1632,7 +1597,10 @@ one_liner 不超过 120 个中文字符；takeaways 输出 3–5 条。视频必
 end_ms、title、summary、key_points，以及可选 comparison_table{headers,rows}；章节标题应概括主题，
 start_ms 应定位主题开始处而不是结论出现处。每章 evidence 输出 1–6 条可核验依据，每条包含
 timestamp_ms、quote 和 evidence_type(audio/ocr/audio+ocr)。只有画面存在清晰、结构化对比数据时才
-生成 comparison_table，不得根据推断补表。静态图文没有视频时间轴，chapters 必须为空数组。
+生成 comparison_table，不得根据推断补表。rows 必须是二维字符串数组，
+每一行的单元格数量必须等于 headers 的数量；不要把单元格拆成不同的行。
+无法保证完整矩形表格时省略 comparison_table，用 key_points 表述，禁止补造数据。
+静态图文没有视频时间轴，chapters 必须为空数组。
 knowledge_atoms 把可检索知识拆成原子，字段为 id、statement、atom_type、provenance、timestamp_ms、
 image_index、quote、context、confidence、valid_until、review_after、stale。事实、数字、日期、参数和
 方法必须尽可能带时间戳或图片编号和原文；AI 推断必须使用 provenance=ai_inference，且不得伪装成

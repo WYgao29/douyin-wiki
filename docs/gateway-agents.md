@@ -113,11 +113,12 @@ OpenClaw 的 STDIO MCP server 配置示例：
    `message_id` 和 `reply_target`。
 2. 立即把 `job_id` 告知用户，不在一个 MCP 调用里等待下载完成。
 3. 视频进入“待 AI 处理”且阶段为“逐字稿校正”后，调用
-   `get_analysis_context`。只修复明显的同音字、断句、数字、人名和专有名词；不得摘要、
-   删句或补写内容。调用 `submit_transcript_correction`，原始 ASR 会保留。
+   `get_analysis_context`。当前 Agent 根据原话上下文和对应 OCR 直接修复识别错误、同音字和断句；
+   无依据的金额等保留原表述，不得摘要、删句或补写内容。只调用一次
+   `submit_transcript_correction`，原始 ASR 和修改记录会保留。
    图文不会出现此阶段，而会直接进入“内容分析”。
-4. 若状态变为“需要人工复核”，把疑点、视频时间范围或图文图片编号、原文和建议展示给用户。只有用户修正或
-   明确接受不确定内容后，调用 `resolve_review`。
+4. 新任务校正后直接进入内容分析，不调用独立复核模型，也不要求用户逐条校对。若历史任务仍显示
+   “需要人工复核”，仅在用户明确要求继续该任务时调用 `retry_job`，不可自动重跑历史任务。
 5. 进入“内容分析”后，再次读取上下文，严格按 v2 `analysis_schema` 一次完成分类和
    分析，并调用 `submit_gateway_analysis`。视频原话、图文正文、OCR、AI 推断和用户灵感不得混写；
    事实、数字、日期、参数与方法尽可能写成带时间戳或 `image_index` 的 `knowledge_atoms`。
@@ -128,9 +129,9 @@ OpenClaw 的 STDIO MCP server 配置示例：
 
 `get_analysis_context.media_provenance.asr` 的 `confidence_status` 表示分数可用性：
 `unavailable` 为没有分数，`partial` 为部分字幕有分数，`available` 为每段都有分数；
-均不代表已验证的正确率。`confidence_note` 是非阻塞说明。不要仅因缺少分数、出现数字或 `AI`
-创建人工疑点；若校正发现具体识别歧义或与对应字幕画面冲突，应提交原文、原因与候选文本。
-OCR 未出现对应内容不等于冲突，两个来源相同也不保证正确。历史未解决疑点仍需用户处理。
+均不代表已验证的正确率。`confidence_note` 是非阻塞说明。不要因缺少分数、低分、数字或识别歧义
+创建人工复核疑点；当前 Agent 应根据上下文和对应 OCR 保守校正。OCR 未出现对应内容不等于冲突，
+两个来源相同也不保证正确。历史未解决疑点只在用户明确要求继续时重试。
 
 以下是 MCP 工具参数的最小示例。`job_id`、片段 `id` 和原会话路由须替换为刚读取的实际值；
 视频先读 `get_analysis_context.phase`，图文和重新分析若直接返回 `analysis` 就跳过校正。
@@ -141,9 +142,10 @@ OCR 未出现对应内容不等于冲突，两个来源相同也不保证正确�
 ```
 
 上面是 `capture_douyin`。视频的 `submit_transcript_correction` 使用原始逐字稿中的全部实际 ID，
-每项 `text` 必须保留完整内容。若有疑点，`review_issues` 每项使用 `id`、`start_ms`、
-`end_ms`、`raw_text`、`reason`、`suggestions`（字符串数组）；图文疑点还可用
-`image_index` 标明原图编号。例：
+每项 `text` 必须保留完整内容；未修改的片段也必须显式回传原文。缺段、重复 ID、未知 ID
+都会拒绝；仅当原稿为空时允许 `corrections=[]`。进入 `analysis` 后不可再次提交校对。
+并发提交遇到任务已更新时，重新读取上下文和阶段，不要盲目重放旧结果。旧客户端仍可传 `review_issues`，但仅作为校正说明保留，
+不会暂停新任务。不要为新任务填充该参数。旧格式例：
 
 ```json
 {"id":"agent-0","start_ms":0,"end_ms":41870,"raw_text":"待核实的完整原句","reason":"专有名词待核实","suggestions":["完整候选原句"]}
@@ -168,7 +170,7 @@ OCR 未出现对应内容不等于冲突，两个来源相同也不保证正确�
 Gateway 应先调用 `get_auth_status` 和 `get_job` 复核最新状态，不要反复打开浏览器或重复调用
 `retry_job`。
 
-**状态字段约定（程序判断用机读码）**：MCP/`get_job` 同时返回英文机读码 （`status` / 事件里的状态）和中文展示字段（`status_label`、`state_label`、`stage_label` 等）。Agent 轮询与分支判断必须用英文机读码（如 `awaiting_agent_analysis`、`needs_review`）；面向用户回复时只用中文 label，不要用中文 label 做相等判断。若用户选择稍后处理、引导超时或本机弹框不可用，再按任务中的 `auth_scope` 提供手工兜底：
+**状态字段约定（程序判断用机读码）**：MCP/`get_job` 同时返回英文机读码 （`status` / 事件里的状态）和中文展示字段（`status_label`、`state_label`、`stage_label` 等）。Agent 轮询与分支判断必须用英文机读码（如 `awaiting_agent_analysis`、历史 `needs_review`）；面向用户回复时只用中文 label，不要用中文 label 做相等判断。若用户选择稍后处理、引导超时或本机弹框不可用，再按任务中的 `auth_scope` 提供手工兜底：
 `video` 使用 `uv run douyin-wiki auth video`，`image_note` 或 `creator` 使用
 `uv run douyin-wiki auth douyin`；确认授权成功后再调用 `retry_job`。
 不得要求用户提供 Cookie；状态接口也不会返回 Cookie 值。
@@ -269,7 +271,7 @@ hermes cron runs --limit 10
 当消息包含抖音链接且用户给出灵感时，调用 douyin-wiki 的 capture_douyin。
 灵感必须逐字传递；capture 时保存当前 gateway/channel/conversation/message 路由。
 任务进入“待 AI 处理”后，视频先校正逐字稿，图文直接按返回的 schema 分析；
-不得改写灵感，不得把 AI 推断当作作品原话。“需要人工复核”和长视频必须询问用户；
+不得改写灵感，不得把 AI 推断当作作品原话。历史“需要人工复核”任务仅在用户明确要求继续时调用 retry_job；长视频必须询问用户；
 “需要登录授权”时先调用 get_auth_status 和 get_job，等待本机授权引导完成并复核最新状态；
 只有自动引导未完成时，才根据授权范围提示用户运行 auth video 或 auth douyin，授权成功后再重试。
 完成后把原作品链接、摘要、灵感关联、时间戳或图片编号证据和提醒候选发回原会话。

@@ -67,7 +67,7 @@
       await loadSettings();
       showMessage(
         result.configured
-          ? "配置已保存，右侧 AI 对话现在可以使用。"
+          ? "配置已保存，对话已切换。后台将在当前任务结束后加载新配置；手动启动的 Worker 请重新启动。"
           : "接口和模型已保存；还需要填写 API Key。",
         result.configured ? "success" : "warning",
       );

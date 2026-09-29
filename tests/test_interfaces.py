@@ -138,7 +138,10 @@ async def test_mcp_gateway_video_order_validation_and_reanalysis(service, monkey
             {"job_id": job.id, "analysis": {"title": "测试"}, "producer": "test-agent"},
         )
     for corrections in (
+        [],
+        [{"id": 0, "text": "仅提交第一段"}],
         [{"id": 0, "text": ""}],
+        [{"id": 0, "text": " \n "}, {"id": 1, "text": "完整第二段"}],
         [{"id": 999, "text": "未知片段"}],
         [{"id": 0, "text": "正文"}, {"id": 0, "text": "重复正文"}],
     ):
@@ -153,7 +156,10 @@ async def test_mcp_gateway_video_order_validation_and_reanalysis(service, monkey
         "submit_transcript_correction",
         {
             "job_id": job.id,
-            "corrections": [{"id": 0, "text": "离职以后，我取关了很多财经媒体。"}],
+            "corrections": [
+                {"id": item["id"], "text": item["text"]}
+                for item in service.database.get_job(job.id).artifacts["transcript_raw"]
+            ],
             "producer": "test-agent",
         },
     )
@@ -191,7 +197,7 @@ async def test_mcp_gateway_video_order_validation_and_reanalysis(service, monkey
 
 
 @pytest.mark.asyncio
-async def test_mcp_gateway_review_requires_resolution(service, monkeypatch) -> None:
+async def test_mcp_gateway_legacy_notes_do_not_require_resolution(service, monkeypatch) -> None:
     service.config.analysis_mode = AnalysisMode.GATEWAY
     monkeypatch.setattr(mcp_server, "_SERVICE", service)
     job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
@@ -201,7 +207,10 @@ async def test_mcp_gateway_review_requires_resolution(service, monkeypatch) -> N
         "submit_transcript_correction",
         {
             "job_id": job.id,
-            "corrections": [{"id": 0, "text": "离职以后，我取关了很多财经媒体。"}],
+            "corrections": [
+                {"id": item["id"], "text": item["text"]}
+                for item in service.database.get_job(job.id).artifacts["transcript_raw"]
+            ],
             "producer": "test-agent",
             "review_issues": [
                 {
@@ -215,22 +224,16 @@ async def test_mcp_gateway_review_requires_resolution(service, monkeypatch) -> N
             ],
         },
     )
-    assert service.database.get_job(job.id).status == JobStatus.NEEDS_REVIEW
-    with pytest.raises(ToolError):
-        await mcp.call_tool(
-            "submit_gateway_analysis",
-            {"job_id": job.id, "analysis": {"title": "测试"}, "producer": "test-agent"},
-        )
-    with pytest.raises(ToolError, match="必须解决全部疑点"):
-        await mcp.call_tool("resolve_review", {"job_id": job.id, "resolutions": {}})
-    assert service.database.get_job(job.id).status == JobStatus.NEEDS_REVIEW
+    assert service.database.get_job(job.id).status == JobStatus.AWAITING_AGENT_ANALYSIS
+    assert service.database.get_review_issues(job.id, open_only=True) == []
     await mcp.call_tool(
-        "resolve_review",
-        {"job_id": job.id, "resolutions": {"agent-0": "离职以后，我取关了很多财经媒体。"}},
+        "submit_gateway_analysis",
+        {"job_id": job.id, "analysis": {"title": "测试"}, "producer": "test-agent"},
     )
-    resumed = await Worker(service).run_once()
-    assert resumed.status == JobStatus.AWAITING_AGENT_ANALYSIS
-    assert service.get_analysis_context(job.id)["phase"] == "analysis"
+    completed = await Worker(service).run_once()
+    assert completed.status == JobStatus.COMPLETED
+    assert completed.result["warnings"] == []
+
 
 
 @pytest.mark.asyncio
@@ -260,7 +263,10 @@ async def test_gateway_monitor_replays_unacked_and_detects_same_status_phase(
         "submit_transcript_correction",
         {
             "job_id": job.id,
-            "corrections": [{"id": 0, "text": "离职以后，我取关了很多财经媒体。"}],
+            "corrections": [
+                {"id": item["id"], "text": item["text"]}
+                for item in service.database.get_job(job.id).artifacts["transcript_raw"]
+            ],
             "producer": "test-agent",
         },
     )

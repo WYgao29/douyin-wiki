@@ -42,7 +42,6 @@ from douyin_wiki.models import (
     TranscriptSegment,
 )
 from douyin_wiki.operation import present_job
-from douyin_wiki.review import apply_review_resolutions
 from douyin_wiki.service import DouyinWikiService
 from douyin_wiki.vault import VaultWriter
 from douyin_wiki.worker import Worker
@@ -194,7 +193,13 @@ async def test_gateway_agent_handoff_completes_and_emits_routed_events(service) 
 
     corrected = service.submit_transcript_correction(
         job.id,
-        [TranscriptCorrection(id=0, text="离职以后，我取关了很多财经媒体。")],
+        [
+            TranscriptCorrection(
+                id=item["id"],
+                text="离职以后，我取关了很多财经媒体。" if item["id"] == 0 else item["text"],
+            )
+            for item in paused.artifacts["transcript_raw"]
+        ],
         producer="hermes",
         model="gateway-model",
     )
@@ -771,18 +776,14 @@ async def test_remove_external_validation_migrates_legacy_storage(service) -> No
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_review_pauses_and_resumes(service) -> None:
+async def test_low_confidence_does_not_pause_model_correction(service) -> None:
     service.transcriber = FakeTranscriber(low_confidence=True)
     job = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
-    paused = await Worker(service).run_once()
-    assert paused.status == JobStatus.NEEDS_REVIEW
-    issues = service.get_job(job.id).result["review_issues"]
-    assert issues[0]["id"] == "asr-1"
-    service.resolve_review(job.id, {"asr-1": "10号会打五折。"})
     completed = await Worker(service).run_once()
     assert completed.status == JobStatus.COMPLETED
-    data = service.database.get_entry_data(completed.result["entry_id"])
-    assert data["transcript_corrected"][1]["text"] == "10号会打五折。"
+    assert completed.result["warnings"] == []
+    assert service.database.get_review_issues(job.id) == []
+    assert completed.artifacts["correction_notes"][0]["id"] == "asr-1"
 
 
 @pytest.mark.asyncio
@@ -1288,8 +1289,13 @@ async def test_long_transcript_uses_bounded_compact_model_requests(monkeypatch) 
 
     assert len(corrected) == 161
     assert [len(request["segments"]) for request in requests] == [80, 80, 1]
-    assert set(requests[0]["segments"][0]) == {"id", "start_ms", "end_ms", "text"}
-    assert set(requests[0]["ocr"][0]) == {"timestamp_ms", "image_index", "text"}
+    assert set(requests[0]["segments"][0]) == {
+        "id", "start_ms", "end_ms", "text", "context_before", "context_after"
+    }
+    assert requests[1]["segments"][0]["context_before"] == segments[79].text
+    assert requests[1]["segments"][0]["context_after"] == segments[81].text
+    assert set(requests[0]["ocr"][0]) == {"timestamp_ms", "image_index", "text", "confidence"}
+    assert requests[0]["ocr"][0]["confidence"] is None
 
 
 @pytest.mark.asyncio
@@ -1383,11 +1389,8 @@ async def test_single_segment_output_limit_splits_and_maps_review_to_whole_segme
     assert (corrected[0].start_ms, corrected[0].end_ms) == (1000, 9000)
     expected = raw.replace("校对", "校订", 1)
     assert corrected[0].text == expected
-    assert len(issues) == 1
-    assert (issues[0].start_ms, issues[0].end_ms) == (1000, 9000)
-    assert issues[0].suggestions == [expected]
-    resolved = issues[0].model_copy(update={"resolution": issues[0].suggestions[0]})
-    assert apply_review_resolutions(corrected, [resolved])[0].text == expected
+    assert issues == []
+
 
 
 @pytest.mark.asyncio
@@ -1527,7 +1530,7 @@ async def test_single_segment_dynamic_split_reuses_completed_child(monkeypatch) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["missing", "duplicate"])
-async def test_correction_rejects_incomplete_or_duplicate_piece_ids(monkeypatch, invalid) -> None:
+async def test_correction_recovers_incomplete_or_duplicate_piece_ids(monkeypatch, invalid) -> None:
     monkeypatch.setattr("douyin_wiki.adapters.llm.get_secret", lambda _: "")
     provider = OpenAICompatibleProvider(
         LLMSettings(base_url="http://127.0.0.1:8000/v1", model="test-model")
@@ -1536,8 +1539,8 @@ async def test_correction_rejects_incomplete_or_duplicate_piece_ids(monkeypatch,
     async def fake_json_call(system, user, *, response_schema, response_validator):
         item = json.loads(user)["segments"][0]
         returned = [] if invalid == "missing" else [
-            {"id": item["id"], "text": item["text"]},
-            {"id": item["id"], "text": item["text"]},
+            {"id": item["id"], "text": "已校对"},
+            {"id": item["id"], "text": "重复应忽略"},
         ]
         result = {"segments": returned, "review_issues": []}
         response_validator(result)
@@ -1545,8 +1548,12 @@ async def test_correction_rejects_incomplete_or_duplicate_piece_ids(monkeypatch,
 
     monkeypatch.setattr(provider, "_json_call", fake_json_call)
     segment = TranscriptSegment(id=1, start_ms=0, end_ms=1000, text="一段字幕")
-    with pytest.raises(ValueError, match="缺少片段 ID|重复片段 ID"):
-        await provider.correct_transcript([segment], [])
+    corrected, issues = await provider.correct_transcript([segment], [])
+    assert issues == []
+    if invalid == "missing":
+        assert corrected[0].text == "一段字幕"
+    else:
+        assert corrected[0].text == "已校对"
 
 
 @pytest.mark.asyncio
@@ -1564,21 +1571,16 @@ async def test_correction_empty_input_and_minimum_piece_limit(monkeypatch) -> No
         raise ModelLimitError("模型输出达到 token 上限")
 
     monkeypatch.setattr(provider, "_json_call", always_limited)
-    # Long enough to exercise punctuation/hard split, then irreducible skip.
     segment = TranscriptSegment(id=1, start_ms=0, end_ms=1000, text="abcdefghijklmnopqrstuvwx")
-    corrected, issues = await provider.correct_transcript([segment], [])
-    assert corrected[0].text == segment.text
-    assert calls >= 2  # tried splits before skip
-    assert any("跳过该块校正" in issue.reason for issue in issues)
-    assert any("不可再切" in issue.reason for issue in issues)
-
-    # Single irreducible character: skip without failing the job.
+    with pytest.raises(ModelOutputError, match="最小文本块"):
+        await provider.correct_transcript([segment], [])
+    assert calls >= 2
     calls = 0
     tiny = TranscriptSegment(id=2, start_ms=0, end_ms=100, text="字")
-    corrected, issues = await provider.correct_transcript([tiny], [])
-    assert corrected[0].text == "字"
+    with pytest.raises(ModelOutputError, match="最小文本块"):
+        await provider.correct_transcript([tiny], [])
     assert calls == 1
-    assert any("跳过该块校正" in issue.reason for issue in issues)
+
 
 
 @pytest.mark.asyncio
@@ -1861,18 +1863,15 @@ async def test_analysis_reports_unsplittable_output_limit(monkeypatch) -> None:
         raise ModelOutputError("模型输出达到 token 上限")
 
     monkeypatch.setattr(provider, "_json_call", always_limited)
-    result = await provider.analyze([source], [], [], {})
-    assert calls >= 2
-    joined = "；".join(result.open_questions)
-    assert "跳过该块分析" in joined or "降级拼接" in joined
-    assert "不可再切" in joined or "降级拼接" in joined
+    with pytest.raises(ModelOutputError, match="最小文本块"):
+        await provider.analyze([source], [], [], {})
+    assert 2 <= calls < 20
 
-    # Irreducible single character still degrades instead of failing.
     calls = 0
     tiny = TranscriptSegment(id=7, start_ms=0, end_ms=50, text="啊")
-    result = await provider.analyze([tiny], [], [], {})
+    with pytest.raises(ModelOutputError, match="最小文本块"):
+        await provider.analyze([tiny], [], [], {})
     assert calls == 1
-    assert any("跳过该块分析" in question for question in result.open_questions)
 
 
 @pytest.mark.asyncio
@@ -2164,8 +2163,7 @@ async def test_transcript_correction_omits_already_resolved_and_noop_review_issu
     corrected, issues = await provider.correct_transcript(segments, [])
 
     assert corrected[0].text == "请做一个落地页设计"
-    assert [issue.id for issue in issues] == ["llm-3"]
-    assert issues[0].suggestions == ["Cloud"]
+    assert issues == []
 
 
 @pytest.mark.asyncio

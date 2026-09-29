@@ -6,6 +6,7 @@ from typing import Any
 
 from .adapters.llm import (
     PROMPT_VERSION,
+    OpenAICompatibleProvider,
 )
 from .errors import (
     JobStateError,
@@ -70,13 +71,17 @@ class AnalysisMixin:
             "existing_knowledge": self.indexer.find_related_claims(context_text),
             "analysis_schema": AnalysisResult.model_json_schema(),
             "rules": [
-                "缺少转录置信度分数不等于识别质量低；仅数字或英文出现不构成人工复核理由。"
-                "有具体识别歧义或与对应画面证据冲突时，说明原文和疑点，不编造置信度。",
+                "根据原话上下文和对应 OCR 直接给出最贴近原意的校正版，不请求人工校对，"
+                "不增加独立复核调用；数字、金额、人名缺少依据时保留原表述。",
                 "灵感必须逐字保留，不得改写或补造。",
                 *(
                     []
                     if is_image_note
-                    else ["校正只能修复明显识别错误，不得摘要、删句或补充原视频没有的内容。"]
+                    else [
+                        "校正可根据前后文修复识别错误、同音字和断句，"
+                        "不得摘要、删句或补充原视频没有的内容。"
+                        "提交必须覆盖全部原稿 ID，未修改的片段也须回传原文。"
+                    ]
                 ),
                 "分析必须区分作品原话、作品正文、OCR、AI 推断和用户灵感。",
                 "事实、数字、日期、参数和方法应写入 knowledge_atoms，"
@@ -110,6 +115,10 @@ class AnalysisMixin:
         job = self.database.get_job(job_id)
         if job.status != JobStatus.AWAITING_AGENT_ANALYSIS:
             raise JobStateError("只有处于“待 AI 处理”状态的任务可提交逐字稿校正")
+        if "transcript_corrected" in job.artifacts or job.artifacts.get(
+            "metadata", {}
+        ).get("source_kind") == SourceKind.IMAGE_NOTE.value:
+            raise JobStateError("当前任务已进入分析阶段，不可再次提交逐字稿校正")
         raw = [
             TranscriptSegment.model_validate(item)
             for item in job.artifacts.get("transcript_raw", [])
@@ -121,33 +130,43 @@ class AnalysisMixin:
                 raise JobStateError(f"未知逐字稿片段 id: {correction.id}")
             if correction.id in by_id:
                 raise JobStateError(f"重复逐字稿片段 id: {correction.id}")
-            by_id[correction.id] = correction.text.strip()
+            text = correction.text.strip()
+            if not text:
+                raise JobStateError("校正文本不能仅包含空白")
+            by_id[correction.id] = text
+        if set(by_id) != known_ids:
+            missing_ids = sorted(known_ids - set(by_id))
+            raise JobStateError(f"校正结果必须覆盖全部片段，缺少 ID: {missing_ids}")
         corrected = [
-            segment.model_copy(update={"text": by_id.get(segment.id, segment.text)})
+            segment.model_copy(update={"text": by_id[segment.id]})
             for segment in raw
         ]
-        issues = deduplicate_review_issues([*detect_review_issues(raw), *(review_issues or [])])
+        notes = deduplicate_review_issues([*detect_review_issues(raw), *(review_issues or [])])
         artifact_update = {
             "transcript_corrected": [item.model_dump(mode="json") for item in corrected],
-            "review_issues": [item.model_dump(mode="json") for item in issues],
+            "transcript_edits": [
+                {
+                    "id": source.id,
+                    "start_ms": source.start_ms,
+                    "end_ms": source.end_ms,
+                    "raw_text": source.text,
+                    "corrected_text": item.text,
+                }
+                for source, item in zip(raw, corrected, strict=True)
+                if source.text != item.text
+            ],
+            "correction_notes": [item.model_dump(mode="json") for item in notes],
+            "review_issues": [],
             "correction_producer": producer,
             "correction_model": model,
         }
-        self.database.replace_review_issues(job_id, issues)
-        if issues:
-            return self.database.update_job(
-                job_id,
-                status=JobStatus.NEEDS_REVIEW,
-                progress=0.66,
-                artifacts=artifact_update,
-                result={"phase": "human_review", "review_issue_count": len(issues)},
-                unlock=True,
-            )
         updated = self.database.update_job(
             job_id,
             progress=0.68,
             artifacts=artifact_update,
             result={"phase": "analysis"},
+            expected_updated_at=job.updated_at,
+            expected_statuses={JobStatus.AWAITING_AGENT_ANALYSIS},
             unlock=True,
         )
         self.database.emit_job_event(job_id, JobStatus.AWAITING_AGENT_ANALYSIS, updated.result)
@@ -183,6 +202,7 @@ class AnalysisMixin:
         )
         return self.database.requeue_job(
             job_id,
+            expected_updated_at=job.updated_at,
             artifacts={
                 "analysis": normalized,
                 "analysis_producer": producer,
@@ -365,9 +385,32 @@ class AnalysisMixin:
                 ]
             )
             metadata["existing_knowledge"] = self.indexer.find_related_claims(context_text)
+            checkpoints = artifacts.setdefault("llm_checkpoints", {})
+
+            def save_checkpoint(_fingerprint: str, _value: dict[str, Any]) -> None:
+                self.database.update_job(job.id, artifacts={"llm_checkpoints": checkpoints})
+
+            def model_progress(phase: str, completed: int, total: int) -> None:
+                current = self.database.get_job(job.id)
+                self.database.update_job(
+                    job.id,
+                    progress=max(current.progress, 0.72 + 0.1 * completed / max(total, 1)),
+                    artifacts={"analysis_progress": {
+                        "phase": phase,
+                        "completed_chunks": completed,
+                        "total_chunks": total,
+                        "waiting_for_resource": False,
+                    }},
+                )
+
             async with self.analysis_semaphore:
+                kwargs = (
+                    {"checkpoints": checkpoints, "on_checkpoint": save_checkpoint,
+                     "on_progress": model_progress}
+                    if isinstance(self.analysis, OpenAICompatibleProvider) else {}
+                )
                 result = await self.analysis.analyze(
-                    segments, ocr_items, entry.inspirations, metadata
+                    segments, ocr_items, entry.inspirations, metadata, **kwargs
                 )
             self.validate_analysis_evidence(
                 result,
@@ -433,6 +476,7 @@ class AnalysisMixin:
             job.id,
             status=JobStatus.COMPLETED,
             progress=1,
+            artifacts={"llm_checkpoints": {}},
             result={
                 "entry_id": updated.id,
                 "source_path": updated.source_path,

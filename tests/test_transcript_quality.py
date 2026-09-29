@@ -14,7 +14,7 @@ from douyin_wiki.worker import Worker
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [AnalysisMode.PROVIDER, AnalysisMode.GATEWAY])
 @pytest.mark.parametrize("has_issue", [False, True])
-async def test_missing_scores_do_not_block_but_concrete_issues_do(
+async def test_model_correction_notes_do_not_block(
     service, monkeypatch, mode, has_issue
 ):
     source = TranscriptSegment(id=0, start_ms=0, end_ms=9000, text="AI课程售价2000元。")
@@ -55,28 +55,23 @@ async def test_missing_scores_do_not_block_but_concrete_issues_do(
             },
         )
         outcome = service.get_job(job.id)
-        if not has_issue:
-            await mcp.call_tool(
-                "submit_gateway_analysis",
-                {
-                    "job_id": job.id,
-                    "analysis": {"title": "课程介绍"},
-                    "producer": "test-agent",
-                },
-            )
-            outcome = await Worker(service).run_once()
+        await mcp.call_tool(
+            "submit_gateway_analysis",
+            {"job_id": job.id, "analysis": {"title": "课程介绍"}, "producer": "test-agent"},
+        )
+        outcome = await Worker(service).run_once()
 
-    assert outcome.status == (JobStatus.NEEDS_REVIEW if has_issue else JobStatus.COMPLETED)
-    assert [item.id for item in service.database.get_review_issues(job.id)] == (
+    assert outcome.status == JobStatus.COMPLETED
+    assert service.database.get_review_issues(job.id) == []
+    assert [item["id"] for item in outcome.artifacts["correction_notes"]] == (
         [issue.id] if has_issue else []
     )
     info = outcome.artifacts["media_provenance"]["asr"]
     assert info["confidence_status"] == "unavailable"
     assert "不代表识别质量低" in info["confidence_note"]
     assert outcome.artifacts["transcript_raw"][0]["confidence"] is None
-    if not has_issue:
-        assert outcome.result["warnings"] == []
-        assert service.database.get_entry(outcome.result["entry_id"])
+    assert outcome.result["warnings"] == []
+    assert service.database.get_entry(outcome.result["entry_id"])
     # The same availability message reaches the Web API and MCP payload.
     app = create_app(service.config, service=service, start_watcher=False)
     with TestClient(app, headers={"Origin": "http://testserver"}) as client:

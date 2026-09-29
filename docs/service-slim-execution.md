@@ -84,3 +84,38 @@ GPT-6-Sol / medium 子 Agent 因额度限制中断，本次由主 Agent 接手�
 - `doctor`：按配置的 asr/ocr provider 检查 funasr/rapidocr 与 Whisper/Swift。
 - 删除 `detect_review_issues(..., unknown_confidence=)` 死参。
 
+
+## 2026-09-28 单模型自动校对（取代前述新任务人工复核策略）
+
+用户明确要求只用现有模型校对，不增加独立审核模型，并根据上下文直接处理疑点。GPT-6-Sol / medium 子 Agent 完成主体改动后触及额度限制，主 Agent 接手补齐测试、文档与 review。本轮起点为 `b6c191a`；保留未跟踪的 N13 协作 API 整理简报，未执行该独立重构任务。
+
+- Provider 校对只返回完整 `segments`，不再生成待人工处理的疑点。根据上下文及对应 OCR 修复同音字、错字和断句；没有依据的金额、人名等保留原表述，禁止扩写或添加事实。分片携带最多前后各 40 字的只读上下文，包含在实际预算与 checkpoint 指纹中，不能复制到当前片段输出。`PROMPT_VERSION=v2.3-context-correction`。
+- 校正后直接分析、入库。ASR 低分、缺分、旧模型接口返回的文本疑点及图文 OCR 低分只作为说明保留，不再触发新任务 `needs_review` 或单独产生完成警告。Gateway 同样先提交最终校正版再提交分析，旧 `review_issues` 参数兼容为非阻塞说明。
+- 原稿、校正版、带时间范围的修改记录、校正说明均写入 entry 数据和 Vault 机器文件；原始记录页展示修改，Vault 重建可恢复这些字段。图文 OCR 质量说明也持久保存。
+- 历史待复核任务不自动修改。用户显式重试时归档旧疑点与旧校正版，清理旧校正/分析/checkpoint，并在同一数据库事务中清除活动疑点、重新排队；Web 主动作改为“按新模型校对策略重试”。旧 `resolve_review` API 保留兼容，不是新任务必经步骤。
+- 校对输出超限经有界切分仍无法处理时抛技术错误，不再把未校对原文当成功结果；下载、模型服务或结果格式故障仍会报错。没有增加第二 ASR 或独立审核模型。
+- 主 Agent 发现并补齐了 Vault 字段重建、历史重试事务一致性、Gateway 上下文规则、图文质量说明持久化和历史 retryable 标记。顺手修复当前基线 `config.py` 注释及两处收藏测试的超长行，仅排版不改变行为。
+
+### 真实视频验收
+
+在全新 `.test-auto-correction-20260928/` 中重新解析并下载用户指定作品 `7689429622975314067`，重新执行 SenseVoice、RapidOCR、本机 Qwen3.6-35B-A3B-4bit 校正与分析。模型仍使用 `max_output_tokens=8192`、`enable_thinking=false`。隔离任务为 `fecc53e9766d4f4e96ee11f2babdb8a4`，没有修改正式 Vault 或历史任务。
+
+模型校对一次成功（输入 787 / 输出 170 tokens），将“免费屏替”改为“免费平替”、“提示时”改为“提示词”，保留完整原稿及修改记录，无人工停顿。首轮内容分析因 `comparison_table` 每行列数与表头不一致而校验失败；保留失败记录，补充矩形表格约束和无法可靠成表时省略可选表格的提示后，通过正常 `retry_job` 复用校正版，仅重新分析，69.18 秒后完成入库。
+
+最终状态 **completed**，`warnings=[]`，活动疑点 0，entry 为 `dy-7689429622975314067`，标题“AI圈5大头部博主推荐与评价”。校正版在重试前后完全一致；主 Agent 只读核实 Vault 加载恢复的修改记录与数据库一致、原稿与校正版分别保留。没有人工确认、手工改字幕或独立模型复核。成功 checkpoint 累计 2 次调用的统计不包含首轮失败的分析请求，不能理解为整个验证仅发出 2 次 HTTP 请求。
+
+隔离目录保存 `prepare.py`、`run_sample.py`、`retry.py`、首轮 `result.json`、最终 `retry-result.json` 及运行日志，受现有 `.test-*/` 忽略规则保护；这些任务不会显示在正式 Web Vault。未提交、未推送，未主动重装或重启正式服务。
+
+最终验证：主 Agent 全套 `uv run pytest -m 'not live' -q` **388 passed、1 deselected**（39.78 秒）；`uv run ruff check .`、`git diff --check`、`node --check src/douyin_wiki/webapp/static/jobs.js` 通过。新增验证覆盖分片前后文准确性、无人工门的 provider/Gateway 流程、修改记录 Vault 往返、历史任务显式重试；既有技术失败和严格 schema 测试继续保留。
+
+
+## R5 审查修复（2026-09-29）
+
+- R5-1：分析块不可继续拆分而仍超限时抛出原类型的模型预算错误，附原始片段 ID 和块长度；已有成功 checkpoint 保留。Worker 回归验证为 failed，不产生条目或伪完成分析。
+- R5-2：Web 保存模型同步重建 provider 模式的分析适配器，并写入 Worker reload 请求。后台完成正在运行的任务后退出，由 LaunchAgent 拉起；手动 Worker 需重新启动。Web 提示已说明。
+- R5-3：重试在同一 SQLite 写事务内校验允许状态与原始 updated_at，再更新状态和锁。Gateway 校对、分析也携带原始版本；迟到请求拒绝，不能覆盖新结果。线程交错回归验证活动 Worker 锁和任务内容不变。
+- R5-4：Gateway 校对严格匹配全部原稿 ID；空、缺段、重复和未知 ID 均拒绝（原稿为空时允许空列表）。已进入分析阶段不能重交校对，文档及工具说明同步更新。
+
+验证：全量 `uv run pytest -m 'not live' -q` 为 **392 passed、1 deselected**（44.49 秒）；其后新增空原稿边界测试，与 R5 回归及 Gateway 完成链路一起 **6 passed**。共 393 项不同的非 live 测试通过。`uv run ruff check .`、`git diff --check`、模型设置 JavaScript 语法检查通过。
+
+本轮使用隔离数据库和模拟模型验证错误分支、并发及 Web 配置契约，未再次发起真实模型视频验收，未主动重启正式服务，未改正式 Vault，未提交或推送。上文真实视频验收属于上一轮记录。
