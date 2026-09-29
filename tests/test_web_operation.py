@@ -246,6 +246,8 @@ def test_job_center_lists_parents_with_names_and_can_dismiss_failures(tmp_path) 
     assert "等待你" in scripts["jobs.js"]
     assert "不再提醒" in scripts["jobs.js"]
     assert "display_title" in scripts["jobs.js"]
+    assert 'rest: "其他任务"' in scripts["jobs.js"]
+    assert "已忽略" in scripts["jobs.js"]
 
 
 def test_video_and_douyin_auth_channels_are_isolated(tmp_path) -> None:

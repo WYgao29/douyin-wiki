@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -150,6 +151,9 @@ def user_dismissed(job: JobRecord) -> bool:
 
 
 _GENERIC_SUBJECTS = {"抖音视频", "抖音作品", "抖音博主", "抖音图文", "未命名"}
+# Douyin captions append #话题 tokens. Drop them before the length cut so a tag
+# is not what the row title gets truncated into.
+_HASHTAG_RE = re.compile(r"#[^\s#]+#?")
 _KIND_PREFIX = {
     "capture": "单条采集",
     "creator_import": "博主批量",
@@ -162,7 +166,7 @@ _KIND_PREFIX = {
 def _clean_subject(value: Any, *, limit: int = 36) -> str:
     if not isinstance(value, str):
         return ""
-    text = " ".join(value.split())
+    text = " ".join(_HASHTAG_RE.sub(" ", value).split())
     if not text or text in _GENERIC_SUBJECTS:
         return ""
     if len(text) <= limit:
@@ -177,7 +181,9 @@ def _share_caption(share_text: str) -> str:
             continue
         if "douyin.com" in text and " " not in text:
             continue
-        return _clean_subject(text)
+        subject = _clean_subject(text)
+        if subject:
+            return subject
     return ""
 
 

@@ -139,6 +139,33 @@ def test_display_title_uses_work_title_summary_or_share_caption() -> None:
     assert job_display_title(bare, hints={"entry_title": "资料标题"}) == "单条采集 · 资料标题"
 
 
+def test_display_title_strips_hashtags_before_truncation() -> None:
+    tagged = _job(
+        JobStatus.COMPLETED,
+        artifacts={"metadata": {"title": "春季穿搭分享 #ai新星计划 #穿搭"}},
+    )
+    assert job_display_title(tagged) == "单条采集 · 春季穿搭分享"
+    raw = ("一二三四五六七八九十" * 2) + " #ai新星计划 " + ("二三四五六七八九" * 4)
+    summarized = _job(JobStatus.COMPLETED, result={"summary": raw})
+    subject = job_display_title(summarized).split(" · ", 1)[1]
+    assert "#" not in subject
+    assert "ai新星计划" not in subject
+    assert len(subject) == 36
+    assert subject.endswith("…")
+    assert subject.startswith("一二三四五六七八九十")
+    only_tags = _job(
+        JobStatus.COMPLETED,
+        artifacts={"metadata": {"title": "#ai新星计划 #穿搭"}},
+        result={"summary": "真正的作品摘要"},
+    )
+    assert job_display_title(only_tags) == "单条采集 · 真正的作品摘要"
+    caption = _job(
+        JobStatus.QUEUED,
+        request=CaptureRequest(share_text="#ai新星计划\n春季穿搭 #ootd\nhttps://v.douyin.com/abc/"),
+    )
+    assert job_display_title(caption) == "单条采集 · 春季穿搭"
+
+
 def test_dismissed_failure_is_not_waiting_on_the_user() -> None:
     dismissed = _job(JobStatus.FAILED, artifacts={"user_dismissed": True})
     failed = _job(JobStatus.FAILED)

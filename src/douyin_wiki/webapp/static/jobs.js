@@ -120,19 +120,26 @@
     return button;
   }
 
+  function statusCluster(job) {
+    const cluster = D.node("div", null, "job-status-cluster");
+    const status = D.node("span", job.state_label, "status-pill");
+    status.dataset.state = job.status;
+    cluster.append(status);
+    if (job.dismissed) cluster.append(D.node("span", "已忽略", "job-dismissed-mark"));
+    return cluster;
+  }
+
   function renderRow(job) {
     const row = D.node("article", null, "job-row");
     row.tabIndex = 0;
     row.setAttribute("role", "link");
     if (job.requires_user_action) row.dataset.attention = attentionGroup(job);
     const title = D.node("h2", jobTitle(job));
-    const status = D.node("span", job.state_label, "status-pill");
-    status.dataset.state = job.status;
     const message = D.node("p", listMessage(job));
     if (job.status === "completed" || job.status === "completed_with_warnings") message.classList.add("job-oneline");
     const updated = String(job.updated_display || "").replace(/（北京时间）/g, "").trim();
     const meta = D.node("small", `${job.stage_label} · ${progressLabel(job)}${updated ? ` · ${updated}` : ""}`);
-    row.append(title, status, message, meta);
+    row.append(title, statusCluster(job), message, meta);
     const actions = D.node("div", null, "job-row-actions");
     if (job.requires_user_action && job.next_action) {
       const action = actionButton(job.next_action);
@@ -165,7 +172,12 @@
       if (!current || current.key !== key) groups.push({key, items: [job]});
       else current.items.push(job);
     }
-    const titles = {select: "待选择作品", failed: "失败可重试", attention: "需要本人操作"};
+    const titles = {
+      select: "待选择作品",
+      attention: "需要本人操作",
+      failed: "失败可重试",
+      rest: "其他任务",
+    };
     const showHeads = groups.some((group) => group.key !== "rest");
     const nodes = [];
     for (const group of groups) {
@@ -208,9 +220,7 @@
     const header = D.node("header", null, "page-heading");
     const titleBox = document.createElement("div");
     titleBox.append(D.node("h1", jobTitle(job)), D.node("p", job.message_for_user));
-    const pill = D.node("span", job.state_label, "status-pill");
-    pill.dataset.state = job.status;
-    header.append(titleBox, pill);
+    header.append(titleBox, statusCluster(job));
     const progress = D.node(
       "p",
       job.status === "needs_selection"
