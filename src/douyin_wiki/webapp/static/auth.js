@@ -26,58 +26,51 @@
   function renderChannel(container, channel) {
     container.replaceChildren();
     const card = D.node("article", null, "status-card");
-    const unverified = channel.user_state === "unverified";
     card.append(
       D.node("h2", channel.channel_label),
       D.node("p", channel.purpose),
       D.node("p", channel.user_state_label, "status-pill"),
     );
     card.lastChild.dataset.state = channel.user_state;
-    if (channel.account_hint) card.append(D.node("p", `账号：${channel.account_hint}`));
-    card.append(
-      D.node("p", channel.cookie_source_label, "hint-copy"),
-      D.node("p", `上次检查：${channel.checked_display || "尚未检查"}`),
-      D.node("p", channel.affected_job_count ? `受影响任务 ${channel.affected_job_count} 个` : "当前没有因此暂停的任务"),
-      D.node("p", channel.message),
-    );
-    if (unverified && channel.channel === "video") {
-      card.append(D.node(
-        "p",
-        "提示：本通道只负责视频下载 Cookie；抖音账号授权就绪不代表这里已验证通过。",
-        "hint-copy",
-      ));
+    card.append(D.node("p", `上次检查：${channel.checked_display || "尚未检查"}`));
+    if (channel.user_state === "unconfirmed" && channel.message) {
+      card.append(D.node("p", channel.message));
+    }
+    const technical = [];
+    if (channel.user_state !== "unconfirmed" && channel.message) technical.push(channel.message);
+    if (channel.detail) technical.push(channel.detail);
+    if (channel.cookie_source_label) technical.push(channel.cookie_source_label);
+    if (channel.account_hint) technical.push(`账号：${channel.account_hint}`);
+    if (channel.affected_job_count) {
+      technical.push(`受影响任务 ${channel.affected_job_count} 个`);
+    }
+    if (technical.length) {
+      const folded = D.node("details", null, "auth-details");
+      folded.append(D.node("summary", "详情"));
+      technical.forEach((line) => folded.append(D.node("p", line, "hint-copy")));
+      card.append(folded);
     }
     const actions = D.node("div", null, "operation-actions");
-    const authorize = D.node(
-      "button",
-      channel.user_state === "authorized" ? "重新授权" : "授权",
-      unverified ? "secondary-button" : "primary-button",
-    );
-    authorize.type = "button";
-    authorize.addEventListener("click", () => start(channel.channel));
-    const check = D.node("button", unverified ? "联网检查状态" : "检查状态", unverified ? "primary-button" : "secondary-button");
+    const check = D.node("button", "检查", "primary-button");
     check.type = "button";
     check.addEventListener("click", async () => {
       check.disabled = true;
-      const original = check.textContent;
-      check.textContent = "正在联网检查…";
+      check.textContent = "正在检查…";
       try {
-        D.toast("正在联网确认视频下载授权…");
         const data = await load(true);
-        const video = data.channels?.video;
-        if (video?.user_state === "authorized" || video?.server_verified) {
-          D.toast(video.message || "视频下载授权已确认");
-        } else {
-          D.toast(video?.message || "检查完成，仍需处理授权");
-        }
+        const current = data.channels?.[channel.channel];
+        D.toast(current?.user_state_label || "检查完成");
       } catch (error) {
-        D.toast(error.message || "联网检查失败");
+        D.toast(error.message || "检查失败");
       } finally {
         check.disabled = false;
-        check.textContent = original;
+        if (check.isConnected) check.textContent = "检查";
       }
     });
-    actions.append(unverified ? check : authorize, unverified ? authorize : check);
+    const authorize = D.node("button", "重新授权", "secondary-button");
+    authorize.type = "button";
+    authorize.addEventListener("click", () => start(channel.channel));
+    actions.append(check, authorize);
     if (channel.affected_job_count) {
       const link = D.node("a", "查看受影响任务", "secondary-button");
       link.href = "/jobs?requires_user_action=1";
@@ -159,7 +152,7 @@
     try {
       const data = await load(false);
       const video = data.channels?.video;
-      const needsVerify = data.cached || video?.user_state === "unverified";
+      const needsVerify = data.cached || video?.user_state === "unconfirmed" || video?.user_state === "unverified";
       if (needsVerify) load(true).catch((error) => D.toast(error.message));
     } catch (error) {
       D.toast(error.message);

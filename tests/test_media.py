@@ -10,6 +10,7 @@ import pytest
 
 from douyin_wiki.adapters.media import (
     CapturedCdnMedia,
+    CdnCaptureOutcome,
     VisionOCR,
     YtDlpDownloader,
     _chromium_cookie_databases,
@@ -181,35 +182,112 @@ async def test_video_auth_probe_never_returns_cookie_values(
     downloader = YtDlpDownloader(
         MediaSettings(browser="chrome", browser_profile=str(profile)), tmp_path / "browser"
     )
-    async def no_cdn(_url: str):
-        return None
+    async def no_outcome(_url: str):
+        return CdnCaptureOutcome()
 
-    monkeypatch.setattr(downloader, "_capture_cdn_url", no_cdn)
+    monkeypatch.setattr(downloader, "_capture_cdn_outcome", no_outcome)
     result = await downloader.check_auth(
         video_url="https://www.douyin.com/video/7672717300746907078"
     )
     payload = result.model_dump(mode="json")
-    assert result.state == "ready" and result.server_verified is True
+    assert result.state == "unavailable" and result.ok is False
+    assert result.server_verified is False
+    assert "未作为判定依据" in result.detail
     assert "sessionid" not in str(payload).lower()
 
 
 @pytest.mark.asyncio
-async def test_video_auth_accepts_media_captured_by_browser(
+async def test_video_auth_primary_path_ready_ignores_yt_dlp(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    from douyin_wiki.operation import present_auth_check
+
     downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
 
     async def captured(_url: str):
-        return CapturedCdnMedia(
-            video_url="https://cdn.douyinvod.com/media-video.mp4",
-            page_title="测试作品",
+        return CdnCaptureOutcome(
+            media=CapturedCdnMedia(
+                video_url="https://cdn.douyinvod.com/media-video.mp4",
+                page_title="测试作品",
+            )
         )
 
-    monkeypatch.setattr(downloader, "_capture_cdn_url", captured)
+    async def ranged(_url: str):
+        return "已下载开头 4096 字节。"
+
+    async def supplement(_url: str):
+        return "yt-dlp 补充探测失败，未作为判定依据。Fresh cookies are needed"
+
+    monkeypatch.setattr(downloader, "_capture_cdn_outcome", captured)
+    monkeypatch.setattr(downloader, "_range_probe_note", ranged)
+    monkeypatch.setattr(downloader, "_yt_dlp_supplement_note", supplement)
     result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
-    assert result.state == "ready"
-    assert result.server_verified is True
+    assert result.state == "ready" and result.ok is True and result.server_verified is True
+    assert "4096" in result.detail
+    assert "未作为判定依据" in result.detail
     assert result.cookie_source == str(tmp_path / "browser")
+    shown = present_auth_check(result.model_dump(mode="json"), channel="video")
+    assert shown["user_state"] == "authorized"
+    assert shown["user_state_label"] == "可以下载"
+    assert "Playwright" not in shown["purpose"]
+    assert "yt-dlp" not in shown["purpose"]
+    assert "检查状态" not in shown["message"]
+
+
+@pytest.mark.asyncio
+async def test_video_auth_primary_path_login_failure_ignores_yt_dlp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from douyin_wiki.operation import present_auth_check
+
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CdnCaptureOutcome(login_required=True, error="页面要求登录")
+
+    async def supplement(_url: str):
+        return "yt-dlp 补充探测成功，未作为判定依据。"
+
+    monkeypatch.setattr(downloader, "_capture_cdn_outcome", captured)
+    monkeypatch.setattr(downloader, "_yt_dlp_supplement_note", supplement)
+    result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
+    assert result.state == "needs_login" and result.ok is False
+    assert result.server_verified is True
+    shown = present_auth_check(result.model_dump(mode="json"), channel="video")
+    assert shown["user_state"] == "needs_login"
+    assert shown["user_state_label"] == "需要重新登录"
+    assert "检查状态" not in shown["message"]
+    assert "未作为判定依据" in shown["detail"]
+
+
+@pytest.mark.asyncio
+async def test_video_auth_primary_path_network_error_is_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from douyin_wiki.operation import present_auth_check
+
+    downloader = YtDlpDownloader(MediaSettings(), tmp_path / "browser")
+
+    async def captured(_url: str):
+        return CdnCaptureOutcome(error="TimeoutError：Timeout 60000ms exceeded")
+
+    async def supplement(_url: str):
+        return "yt-dlp 补充探测成功，未作为判定依据。"
+
+    monkeypatch.setattr(downloader, "_capture_cdn_outcome", captured)
+    monkeypatch.setattr(downloader, "_yt_dlp_supplement_note", supplement)
+    result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
+    assert result.state == "unavailable" and result.ok is False
+    assert result.server_verified is False
+    assert result.state != "needs_login"
+    assert "TimeoutError" in result.message
+    assert "下一步" in result.message
+    shown = present_auth_check(result.model_dump(mode="json"), channel="video")
+    assert shown["user_state"] == "unconfirmed"
+    assert shown["user_state_label"] == "暂时无法确认"
+    assert "检查状态" not in shown["message"]
+    assert "原因" in shown["message"] and "下一步" in shown["message"]
+    assert "未作为判定依据" in shown["detail"]
 
 
 @pytest.mark.asyncio
@@ -436,7 +514,11 @@ async def test_fresh_cookies_error_with_local_login_is_not_reported_as_login_req
     async def no_cdn(_url: str):
         return None
 
+    async def no_outcome(_url: str):
+        return CdnCaptureOutcome()
+
     monkeypatch.setattr(downloader, "_capture_cdn_url", no_cdn)
+    monkeypatch.setattr(downloader, "_capture_cdn_outcome", no_outcome)
     monkeypatch.setattr(
         "douyin_wiki.adapters.media._run",
         lambda command, **kwargs: subprocess.CompletedProcess(
@@ -445,7 +527,8 @@ async def test_fresh_cookies_error_with_local_login_is_not_reported_as_login_req
     )
 
     result = await downloader.check_auth(video_url="https://www.douyin.com/video/123")
-    assert result.state == "unverified" and result.ok is False
+    assert result.state == "unavailable" and result.ok is False
+    assert result.state != "needs_login"
     with pytest.raises(ExternalToolError, match="不能判定为需要重新登录") as exc_info:
         await downloader.download("https://www.douyin.com/video/123", "123", tmp_path)
     assert not isinstance(exc_info.value, CookieRequiredError)
@@ -1303,16 +1386,17 @@ async def test_side_paths_prefer_playwright_profile_cookies(
 
     monkeypatch.setattr("douyin_wiki.adapters.media._run", fake_run)
 
-    async def no_cdn(_url: str):
-        return None
+    async def no_outcome(_url: str):
+        return CdnCaptureOutcome()
 
-    monkeypatch.setattr(downloader, "_capture_cdn_url", no_cdn)
+    monkeypatch.setattr(downloader, "_capture_cdn_outcome", no_outcome)
     result = await downloader.check_auth(
         video_url="https://www.douyin.com/video/123"
     )
-    assert result.ok is True
+    assert result.ok is False
+    assert result.state == "unavailable"
     assert result.cookie_source == str(profile_dir)
-    assert "专用 Playwright Profile" in result.message
+    assert "未作为判定依据" in result.detail
     assert "--cookies-from-browser" in seen[0]
     assert seen[0][seen[0].index("--cookies-from-browser") + 1] == spec
 

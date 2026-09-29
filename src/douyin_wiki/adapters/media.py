@@ -82,6 +82,19 @@ class CapturedCdnMedia:
     info: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class CdnCaptureOutcome:
+    """Primary-path capture used by download and by the auth probe.
+
+    ``login_required`` is set only when the work page itself shows a login or
+    verify wall. A missing media URL or a network error is not a login failure.
+    """
+
+    media: CapturedCdnMedia | None = None
+    login_required: bool = False
+    error: str | None = None
+
+
 def _cdn_media_ids(url: str) -> tuple[str, ...]:
     query = parse_qs(urlsplit(url).query)
     return tuple(
@@ -529,6 +542,14 @@ def _looks_like_auth_failure(message: str) -> bool:
     return any(token in lowered for token in AUTH_FAILURE_TERMS)
 
 
+def _short_probe_error(exc: BaseException) -> str:
+    name = type(exc).__name__
+    text = " ".join(str(exc).split())
+    if text and text != name:
+        return f"{name}：{text[:180]}"
+    return name
+
+
 def _chromium_cookie_databases(settings: MediaSettings) -> list[Path]:
     """Locate candidate cookie databases without reading or copying cookie values."""
     browser = settings.browser.lower()
@@ -715,18 +736,154 @@ class YtDlpDownloader:
         return preferred_yt_dlp_cookie_spec(self.profile_dir, self.settings)
 
     async def check_auth(self, *, video_url: str | None = None) -> AuthCheckResult:
-        if video_url:
-            probe_url = _validate_douyin_probe_url(video_url)
-            if await self._capture_cdn_url(probe_url):
-                return AuthCheckResult(
-                    scope="video",
-                    state="ready",
-                    ok=True,
-                    server_verified=True,
-                    cookie_source=str(self.profile_dir),
-                    message="专用浏览器已访问作品并获取视频媒体地址",
+        """Probe the Playwright CDN path. yt-dlp is a note, never the verdict.
+
+        Without a work URL this only reads the local cookie database for CLI.
+        A URL means the same primary download path: a media address or the first
+        few KB counts as ready. ``needs_login`` requires the page itself to
+        demand login. Anything else is an inconclusive probe.
+        """
+        if not video_url:
+            return await asyncio.to_thread(self._check_auth_sync, None)
+        probe_url = _validate_douyin_probe_url(video_url)
+        outcome = await self._capture_cdn_outcome(probe_url)
+        supplement = await self._yt_dlp_supplement_note(probe_url)
+        source = str(self.profile_dir)
+        media_url = outcome.media.video_url if outcome.media else ""
+        if media_url:
+            try:
+                range_note = await self._range_probe_note(media_url)
+            except Exception as exc:
+                range_note = (
+                    f"开头一段未能下载（{type(exc).__name__}）。"
+                    "结论仍按已拿到的媒体地址。"
                 )
-        return await asyncio.to_thread(self._check_auth_sync, video_url)
+            detail = " ".join(
+                part
+                for part in (
+                    "主路径：专用浏览器已解析到可下载媒体地址。",
+                    range_note,
+                    supplement,
+                )
+                if part
+            )
+            return AuthCheckResult(
+                scope="video",
+                state="ready",
+                ok=True,
+                server_verified=True,
+                cookie_source=source,
+                message="专用浏览器已解析到可下载媒体地址。",
+                detail=detail,
+            )
+        if outcome.login_required:
+            return AuthCheckResult(
+                scope="video",
+                state="needs_login",
+                ok=False,
+                server_verified=True,
+                cookie_source=source,
+                message="打开作品时确认需要登录。",
+                detail=" ".join(
+                    part
+                    for part in (
+                        "主路径确认是登录问题。",
+                        outcome.error or "",
+                        supplement,
+                    )
+                    if part
+                ),
+                action="douyin-wiki auth douyin",
+            )
+        reason = (
+            outcome.error or "专用浏览器没有拿到可下载地址，也不能确认是登录失效"
+        ).rstrip("。")
+        return AuthCheckResult(
+            scope="video",
+            state="unavailable",
+            ok=False,
+            server_verified=False,
+            cookie_source=source,
+            message=(
+                f"暂时无法确认。原因：{reason}。"
+                "下一步：检查网络后稍后重试；若页面要求登录，再重新授权。"
+            ),
+            detail=supplement,
+        )
+
+    async def _range_probe_note(self, media_url: str) -> str:
+        """Download the first few KB. Failure does not cancel a captured URL."""
+        headers = {
+            "Range": "bytes=0-4095",
+            "Referer": "https://www.douyin.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 Chrome/140.0 Safari/537.36"
+            ),
+        }
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=15, headers=headers
+            ) as client:
+                response = await client.get(media_url)
+        except httpx.HTTPError as exc:
+            return (
+                "开头一段未能下载"
+                f"（{type(exc).__name__}）。结论仍按已拿到的媒体地址。"
+            )
+        if response.status_code in {200, 206} and response.content:
+            return f"已下载开头 {len(response.content)} 字节。"
+        return (
+            f"开头一段返回 HTTP {response.status_code}。"
+            "结论仍按已拿到的媒体地址。"
+        )
+
+    async def _yt_dlp_supplement_note(self, video_url: str) -> str:
+        try:
+            return await asyncio.to_thread(self._yt_dlp_supplement_note_sync, video_url)
+        except Exception as exc:
+            return f"yt-dlp 补充信息不可用（{type(exc).__name__}），未作为判定依据。"
+
+    def _yt_dlp_supplement_note_sync(self, video_url: str) -> str:
+        cookie_spec, _, _ = self._preferred_yt_dlp_cookie_spec()
+        try:
+            result = _run(
+                [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--cookies-from-browser",
+                    cookie_spec,
+                    "--simulate",
+                    "--no-warnings",
+                    "--print",
+                    "%(id)s",
+                    video_url,
+                ],
+                timeout=15,
+            )
+        except ExternalToolError as exc:
+            return f"yt-dlp 补充探测未完成（{exc}），未作为判定依据。"
+        if result.returncode == 0:
+            return "yt-dlp 补充探测成功，未作为判定依据。"
+        tail = (result.stderr or result.stdout or "").strip().splitlines()
+        line = tail[-1][:180] if tail else "无输出"
+        return f"yt-dlp 补充探测失败，未作为判定依据。{line}"
+
+    async def _page_confirms_login(self, page: Any) -> bool:
+        """True only when this work page is a login or verification wall."""
+        from .image_note import _page_auth_blocked
+
+        url = ""
+        body = ""
+        try:
+            url = str(page.url or "")
+        except Exception:
+            url = ""
+        try:
+            body = (await page.locator("body").inner_text(timeout=8_000))[:20_000]
+        except Exception:
+            body = ""
+        return _page_auth_blocked(body, None, url)
 
     def _check_auth_sync(self, video_url: str | None) -> AuthCheckResult:
         cookie_spec, preferred_source, source_kind = self._preferred_yt_dlp_cookie_spec()
@@ -896,12 +1053,17 @@ class YtDlpDownloader:
         )
 
     async def _capture_cdn_url(self, url: str) -> CapturedCdnMedia | None:
-        """Capture video/audio CDN URLs and page metadata from the work page."""
+        """Capture CDN media for download. Auth uses :meth:`_capture_cdn_outcome`."""
+        outcome = await self._capture_cdn_outcome(url)
+        return outcome.media
+
+    async def _capture_cdn_outcome(self, url: str) -> CdnCaptureOutcome:
+        """Capture CDN media and separate login walls from probe failures."""
         try:
             from playwright.async_api import async_playwright
         except ImportError:
             logger.warning("Playwright 未安装，跳过 CDN 拦截下载")
-            return None
+            return CdnCaptureOutcome(error="未安装 Playwright，无法用专用浏览器探测下载")
 
         profile_dir = self.profile_dir
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -1194,19 +1356,28 @@ class YtDlpDownloader:
                     # Without both a target work ID and its media anchors, a
                     # page CDN response may belong to an ad or recommendation.
                     if not expected_work_id or not video_markers or not video_url:
-                        return None
-                    return CapturedCdnMedia(
-                        video_url=video_url,
-                        audio_url=audio_url,
-                        unbound_audio_seen=bool(audio_candidates and not audio_url),
-                        page_title=page_title or info.get("title"),
-                        info=info,
+                        return CdnCaptureOutcome(
+                            login_required=await self._page_confirms_login(page)
+                        )
+                    return CdnCaptureOutcome(
+                        media=CapturedCdnMedia(
+                            video_url=video_url,
+                            audio_url=audio_url,
+                            unbound_audio_seen=bool(audio_candidates and not audio_url),
+                            page_title=page_title or info.get("title"),
+                            info=info,
+                        )
                     )
                 finally:
                     await context.close()
-        except Exception:
+        except Exception as exc:
             logger.exception("Playwright CDN 拦截失败：%s", url)
-            return None
+            text = f"{type(exc).__name__}: {exc}"
+            if _looks_like_auth_failure(text):
+                return CdnCaptureOutcome(
+                    login_required=True, error=_short_probe_error(exc)
+                )
+            return CdnCaptureOutcome(error=_short_probe_error(exc))
 
     async def _fetch_info_json(self, url: str, target_dir: Path) -> dict[str, Any]:
         """Secondary metadata-only yt-dlp pass for CDN downloads that lack info.json."""

@@ -83,15 +83,18 @@ CHANNEL_LABELS = {
 }
 
 CHANNEL_PURPOSES = {
-    "video": (
-        "视频下载通道：专用 Playwright Profile 走 CDN 主路径；系统浏览器 Cookie 仅作 yt-dlp 最后回退。"
-        "与下方「抖音账号授权」相互独立；账号已登录不代表本通道可下载。"
-    ),
-    "douyin": (
-        "账号通道：收藏清点、博主主页清点和静态图文采集。"
-        "使用抖库专用浏览器配置；登录成功不代表视频下载已授权。"
-    ),
+    "video": "用来下载视频。和抖音账号授权不是同一件事。",
+    "douyin": "用来清点收藏、博主主页和图文。和视频下载不是同一件事。",
 }
+
+_CHECK_LOOP_MARKERS = (
+    "请点击「检查状态」完成验证；这与抖音账号授权无关。",
+    "请点「检查状态」联网确认；与抖音账号授权相互独立。",
+    "请点击「检查状态」",
+    "请点「检查状态」",
+    "点击「检查状态」",
+    "待联网确认",
+)
 
 ANALYSIS_MODE_WEB_COPY = {
     "provider": "后台模型接口自动整理",
@@ -441,6 +444,46 @@ def present_job(
     return sanitize_public_payload(payload)
 
 
+def _strip_check_loop(message: str) -> str:
+    text = message or ""
+    for marker in _CHECK_LOOP_MARKERS:
+        text = text.replace(marker, "")
+    return " ".join(text.split()).strip(" 。")
+
+
+def _video_conclusion(state: str) -> tuple[str, str]:
+    if state == "authorizing":
+        return "authorizing", "授权中"
+    if state == "ready":
+        return "authorized", "可以下载"
+    if state in {"needs_login", "expired", "missing"}:
+        return "needs_login", "需要重新登录"
+    return "unconfirmed", "暂时无法确认"
+
+
+def _account_conclusion(state: str) -> tuple[str, str]:
+    if state == "authorizing":
+        return "authorizing", "授权中"
+    if state == "ready":
+        return "authorized", "已授权"
+    if state in {"needs_login", "expired", "missing"}:
+        return "needs_login", "需要重新登录"
+    if state in {"available", "unverified", "unavailable", "error"}:
+        return "unconfirmed", "暂时无法确认"
+    return AUTH_USER_STATES.get(state, ("check_failed", "检查失败"))
+
+
+def _unconfirmed_copy(message: str) -> str:
+    text = _strip_check_loop(message)
+    if text.startswith("暂时无法确认"):
+        body = text
+    else:
+        body = f"暂时无法确认。原因：{text or '这次探测没有得出结论'}。"
+    if "下一步" not in body:
+        body = f"{body.rstrip('。')}。下一步：稍后重试；若页面要求登录，再重新授权。"
+    return body
+
+
 def cookie_source_label(channel: str, cookie_source: str | None = None) -> str:
     if channel == "video":
         source = (cookie_source or "").lower()
@@ -462,23 +505,15 @@ def present_auth_check(
     account_hint: str | None = None,
 ) -> dict[str, Any]:
     authorizing = session_stage in {"queued", "launching", "waiting_login", "verifying"}
-    machine_state = "authorizing" if authorizing else check.get("state") or "error"
-    user_code, user_label = AUTH_USER_STATES.get(str(machine_state), ("check_failed", "检查失败"))
+    machine_state = "authorizing" if authorizing else str(check.get("state") or "error")
+    if channel == "video":
+        user_code, user_label = _video_conclusion(machine_state)
+    else:
+        user_code, user_label = _account_conclusion(machine_state)
     timestamp = checked_at or datetime.now(UTC)
-    message = check.get("message") or ""
-    if user_code == "unverified" and channel == "video" and not message:
-        message = (
-            "本机已检测到视频下载用 Cookie，但尚未联网确认是否仍有效。"
-            "请点击「检查状态」完成验证；这与抖音账号授权无关。"
-        )
-    elif user_code == "unverified" and channel == "video":
-        message = (
-            f"{message}。"
-            if not str(message).endswith(("。", ".", "！", "!"))
-            else str(message)
-        )
-        if "检查状态" not in message:
-            message += "请点「检查状态」联网确认；与抖音账号授权相互独立。"
+    raw_message = _strip_check_loop(str(check.get("message") or ""))
+    message = _unconfirmed_copy(raw_message) if user_code == "unconfirmed" else raw_message
+    detail = _strip_check_loop(str(check.get("detail") or ""))
     payload = {
         "channel": channel,
         "channel_label": CHANNEL_LABELS[channel],
@@ -491,6 +526,7 @@ def present_auth_check(
         "cookie_source_label": cookie_source_label(channel, check.get("cookie_source")),
         "account_hint": account_hint or "",
         "message": message,
+        "detail": detail,
         "checked_at": beijing_iso(timestamp),
         "checked_display": format_beijing(timestamp),
         "affected_job_count": affected_job_count,

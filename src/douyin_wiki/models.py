@@ -80,6 +80,7 @@ class AuthCheckResult(BaseModel):
     cookie_source: str
     message: str
     action: str | None = None
+    detail: str = ""
     checked_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

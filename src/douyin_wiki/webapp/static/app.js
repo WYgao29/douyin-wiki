@@ -337,15 +337,15 @@ async function refreshAuthChannelBanners() {
       );
       const title = window.Douku.node(
         "strong",
-        alert?.message || (video?.user_state === "unverified"
-          ? "视频下载授权尚未联网确认；与抖音账号授权相互独立。"
+        alert?.message || (video?.user_state === "unconfirmed"
+          ? "视频下载暂时无法确认。"
           : "视频下载授权需要处理。"),
       );
       const detail = window.Douku.node(
         "p",
-        video?.user_state === "unverified"
-          ? "采集前请到「设置 › 授权状态」点击「检查状态」或重新授权。"
-          : (video?.message || "请到「设置 › 授权状态」处理后再导入。"),
+        video?.user_state === "needs_login"
+          ? "请到「设置 › 授权状态」重新授权。"
+          : "请到「设置 › 授权状态」查看原因和下一步。",
       );
       copy.append(title, detail);
       const actions = window.Douku.node("div", null, "operation-actions");

@@ -126,8 +126,10 @@ def test_overview_alerts_unverified_video_channel(tmp_path) -> None:
         overview = client.get("/api/overview").json()
         auth = client.get("/api/auth/status").json()
     video = auth["channels"]["video"]
-    assert video["user_state"] == "unverified"
-    assert "Cookie" in video["user_state_label"] or "联网" in video["user_state_label"]
+    assert video["user_state"] == "unconfirmed"
+    assert video["user_state_label"] == "暂时无法确认"
+    assert "检查状态" not in video["message"]
+    assert "原因" in video["message"] and "下一步" in video["message"]
     assert any(item["code"] == "video_auth_unverified" for item in overview["alerts"])
 
 
@@ -139,8 +141,12 @@ def test_auth_and_app_scripts_clarify_channels_and_404(tmp_path) -> None:
         app_js = client.get(f"/static/app.js?v={WEB_VERSION}").text
         shared = client.get(f"/static/shared.js?v={WEB_VERSION}").text
         dead = client.get("/static/favorites.js")
-    assert "联网检查状态" in auth_js
-    assert "不代表这里已验证通过" in auth_js
+    assert 'D.node("button", "检查", "primary-button")' in auth_js
+    assert 'D.node("button", "重新授权", "secondary-button")' in auth_js
+    assert "详情" in auth_js
+    assert "联网检查状态" not in auth_js
+    assert "检查状态" not in auth_js
+    assert "点击「检查状态」" not in app_js
     assert "refreshAuthChannelBanners" in app_js
     assert "isKnownAppPath" in shared
     assert "not-found-view" in shared

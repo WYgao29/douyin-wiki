@@ -289,17 +289,16 @@ class WebOperationService:
                     ],
                 }
             )
-        elif video["user_state"] == "unverified":
+        elif video["user_state"] in {"unverified", "unconfirmed"}:
+            reason = str(video.get("message") or "视频下载暂时无法确认。").strip()
+            if "设置 › 授权状态" not in reason:
+                reason = f"{reason} 请到「设置 › 授权状态」查看原因和下一步。"
             alerts.append(
                 {
                     "code": "video_auth_unverified",
-                    "message": (
-                        "视频下载授权已检测到 Cookie，但尚未联网确认。"
-                        "采集前请到「设置 › 授权状态」点击「检查状态」。"
-                        "这与抖音账号授权相互独立。"
-                    ),
+                    "message": reason,
                     "actions": [
-                        {"label": "检查授权状态", "href": "/settings/auth"},
+                        {"label": "打开授权状态", "href": "/settings/auth"},
                     ],
                 }
             )
@@ -397,15 +396,20 @@ class WebOperationService:
             refresh
             and probe_url is None
             and not bool(getattr(video, "server_verified", False))
-            and str(getattr(video, "state", "")) in {"available", "unverified"}
+            and str(getattr(video, "state", "")) in {"available", "unverified", "ready"}
         ):
-            suffix = (
-                "当前库内没有可用来联网探测的作品链接，"
-                "请先成功采集一条视频，或使用 CLI："
-                "douyin-wiki auth status --video-url <作品链接>。"
+            video = video.model_copy(
+                update={
+                    "state": "unavailable",
+                    "ok": False,
+                    "server_verified": False,
+                    "message": (
+                        "暂时无法确认。原因：库内没有可用来试下载的作品。"
+                        "下一步：先导入一条视频，然后再试。"
+                    ),
+                    "detail": "没有作品链接时，不会用本地 Cookie 或 yt-dlp 判定能否下载。",
+                }
             )
-            base = str(getattr(video, "message", "") or "已检测到 Cookie")
-            video = video.model_copy(update={"message": f"{base}。{suffix}" if not base.endswith("。") else f"{base}{suffix}"})
         raw_video = video.model_dump(mode="json")
         raw_douyin = image_note.model_dump(mode="json")
         account_hint = ""
