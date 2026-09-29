@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..config import MediaSettings
-from ..errors import BrowserAuthRequiredError, ExternalToolError, VideoUnavailableError
+from ..errors import BrowserAuthRequiredError, ExternalToolError, InvalidShareTextError, VideoUnavailableError
 from ..models import (
     AuthCheckResult,
     CreatorInventoryResult,
@@ -274,9 +274,21 @@ class DouyinCreatorAdapter:
         work_id: str | None = None
         work_url: str | None = None
         if sec_uid is None:
-            resolved = await self.resolver.resolve(source_text)
-            work_id = resolved.video_id
-            work_url = resolved.canonical_url
+            # Profile short links redirect to /share/user/<sec_uid> (or /user/<sec_uid>).
+            # Work short links still resolve to a video/note ID. Prefer sec_uid from the
+            # redirect chain when the share resolver finds no work identity.
+            try:
+                resolved = await self.resolver.resolve(source_text)
+            except InvalidShareTextError as exc:
+                for candidate in (exc.details or {}).get("redirect_chain") or []:
+                    sec_uid = extract_creator_sec_uid(str(candidate))
+                    if sec_uid:
+                        break
+                else:
+                    raise
+            else:
+                work_id = resolved.video_id
+                work_url = resolved.canonical_url
 
         try:
             from playwright.async_api import async_playwright
