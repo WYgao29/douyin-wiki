@@ -57,7 +57,26 @@
     authorize.addEventListener("click", () => start(channel.channel));
     const check = D.node("button", unverified ? "联网检查状态" : "检查状态", unverified ? "primary-button" : "secondary-button");
     check.type = "button";
-    check.addEventListener("click", () => load(true));
+    check.addEventListener("click", async () => {
+      check.disabled = true;
+      const original = check.textContent;
+      check.textContent = "正在联网检查…";
+      try {
+        D.toast("正在联网确认视频下载授权…");
+        const data = await load(true);
+        const video = data.channels?.video;
+        if (video?.user_state === "authorized" || video?.server_verified) {
+          D.toast(video.message || "视频下载授权已确认");
+        } else {
+          D.toast(video?.message || "检查完成，仍需处理授权");
+        }
+      } catch (error) {
+        D.toast(error.message || "联网检查失败");
+      } finally {
+        check.disabled = false;
+        check.textContent = original;
+      }
+    });
     actions.append(unverified ? check : authorize, unverified ? authorize : check);
     if (channel.affected_job_count) {
       const link = D.node("a", "查看受影响任务", "secondary-button");

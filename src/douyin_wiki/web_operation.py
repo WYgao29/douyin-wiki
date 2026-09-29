@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +275,25 @@ class WebOperationService:
         payload = {**payload, "channels": channels, "cached": cached}
         return sanitize_public_payload(payload)
 
+    def _video_probe_url(self) -> str | None:
+        """Pick a recent capture URL so refresh can run CDN/yt-dlp verification."""
+        url_re = re.compile(r"https?://[^\s]+(?:douyin|iesdouyin)\.com/[^\s]+")
+        for job in self.core.list_jobs(limit=80):
+            if getattr(job, "kind", None) not in {"capture", "creator_import", "favorites_import"}:
+                continue
+            artifacts = getattr(job, "artifacts", None) or {}
+            resolved = artifacts.get("resolved") or {}
+            for key in ("canonical_url", "url", "share_url"):
+                value = str(resolved.get(key) or "").strip()
+                if "douyin.com" in value or "iesdouyin.com" in value:
+                    return value
+            request = getattr(job, "request", None)
+            share = str(getattr(request, "share_text", "") or "")
+            match = url_re.search(share)
+            if match:
+                return match.group(0).rstrip("，。,.")
+        return None
+
     async def auth_status(self, *, refresh: bool = False) -> dict[str, Any]:
         if not refresh:
             cached = self._auth_cache()
@@ -281,10 +301,24 @@ class WebOperationService:
                 return self._decorate_auth_status(cached, cached=True)
         import asyncio
 
+        probe_url = self._video_probe_url() if refresh else None
         video, image_note = await asyncio.gather(
-            self.core.check_auth_scope("video"),
+            self.core.check_auth_scope("video", video_url=probe_url),
             self.core.check_auth_scope("image_note"),
         )
+        if (
+            refresh
+            and probe_url is None
+            and not bool(getattr(video, "server_verified", False))
+            and str(getattr(video, "state", "")) in {"available", "unverified"}
+        ):
+            suffix = (
+                "当前库内没有可用来联网探测的作品链接，"
+                "请先成功采集一条视频，或使用 CLI："
+                "douyin-wiki auth status --video-url <作品链接>。"
+            )
+            base = str(getattr(video, "message", "") or "已检测到 Cookie")
+            video = video.model_copy(update={"message": f"{base}。{suffix}" if not base.endswith("。") else f"{base}{suffix}"})
         raw_video = video.model_dump(mode="json")
         raw_douyin = image_note.model_dump(mode="json")
         account_hint = ""
