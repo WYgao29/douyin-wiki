@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -30,6 +32,22 @@ from .secrets import get_secret
 from .setup import doctor
 from .time_utils import beijing_iso, format_beijing, parse_datetime
 from .web_auth import WebAuthManager
+
+_DOUYIN_URL_RE = re.compile(r"https?://[^\s]+(?:douyin|iesdouyin)\.com/[^\s]+", re.I)
+_USER_PROBE_PATH = re.compile(r"/(?:share/)?user(?:/|$)", re.I)
+_WORK_PROBE_PATH = re.compile(r"/(?:video|note|article)/\d+", re.I)
+
+
+def _probe_work_url(value: str) -> str | None:
+    """Return a Douyin work URL. Profile and user-share links are skipped."""
+    match = _DOUYIN_URL_RE.search(value or "")
+    if match is None:
+        return None
+    url = match.group(0).rstrip("，。,.")
+    path = urlsplit(url).path
+    if _USER_PROBE_PATH.search(path) or not _WORK_PROBE_PATH.search(path):
+        return None
+    return url
 
 
 class WebOperationService:
@@ -362,22 +380,47 @@ class WebOperationService:
         return sanitize_public_payload(payload)
 
     def _video_probe_url(self) -> str | None:
-        """Pick a recent capture URL so refresh can run CDN/yt-dlp verification."""
-        url_re = re.compile(r"https?://[^\s]+(?:douyin|iesdouyin)\.com/[^\s]+")
+        """Pick a recent library work. Creator profile links are not works."""
+        try:
+            with self.core.database.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT canonical_url FROM entries
+                    WHERE canonical_url LIKE '%/video/%'
+                       OR canonical_url LIKE '%/note/%'
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        video_urls = []
+        other_works = []
+        for row in rows:
+            url = _probe_work_url(str(row["canonical_url"] or ""))
+            if not url:
+                continue
+            if "/video/" in urlsplit(url).path:
+                video_urls.append(url)
+            else:
+                other_works.append(url)
+        if video_urls:
+            return video_urls[0]
+        if other_works:
+            return other_works[0]
         for job in self.core.list_jobs(limit=80):
             if getattr(job, "kind", None) not in {"capture", "creator_import", "favorites_import"}:
                 continue
             artifacts = getattr(job, "artifacts", None) or {}
             resolved = artifacts.get("resolved") or {}
             for key in ("canonical_url", "url", "share_url"):
-                value = str(resolved.get(key) or "").strip()
-                if "douyin.com" in value or "iesdouyin.com" in value:
-                    return value
+                found = _probe_work_url(str(resolved.get(key) or ""))
+                if found:
+                    return found
             request = getattr(job, "request", None)
-            share = str(getattr(request, "share_text", "") or "")
-            match = url_re.search(share)
-            if match:
-                return match.group(0).rstrip("，。,.")
+            found = _probe_work_url(str(getattr(request, "share_text", "") or ""))
+            if found:
+                return found
         return None
 
     async def auth_status(self, *, refresh: bool = False) -> dict[str, Any]:

@@ -250,6 +250,22 @@ def test_job_center_lists_parents_with_names_and_can_dismiss_failures(tmp_path) 
     assert "已忽略" in scripts["jobs.js"]
 
 
+def test_video_probe_url_uses_library_work_not_creator_profile(tmp_path) -> None:
+    from douyin_wiki.web_operation import WebOperationService, _probe_work_url
+
+    assert _probe_work_url("https://www.iesdouyin.com/share/user/MS4wLjABAAAAexample") is None
+    assert (
+        _probe_work_url("打开 https://www.douyin.com/video/7672717300746907078 。")
+        == "https://www.douyin.com/video/7672717300746907078"
+    )
+    config, service = _web_fixture(tmp_path)
+    service.database.create_job(
+        CaptureRequest(share_text="https://www.iesdouyin.com/share/user/MS4wLjABAAAAexample"),
+        kind="creator_import",
+    )
+    assert WebOperationService(service)._video_probe_url() == "https://www.douyin.com/video/123"
+
+
 def test_video_and_douyin_auth_channels_are_isolated(tmp_path) -> None:
     config, service = _web_fixture(tmp_path)
     video = FakeAuthDownloader(state="needs_login")
