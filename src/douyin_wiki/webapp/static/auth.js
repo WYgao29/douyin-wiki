@@ -26,6 +26,7 @@
   function renderChannel(container, channel) {
     container.replaceChildren();
     const card = D.node("article", null, "status-card");
+    const unverified = channel.user_state === "unverified";
     card.append(
       D.node("h2", channel.channel_label),
       D.node("p", channel.purpose),
@@ -39,14 +40,25 @@
       D.node("p", channel.affected_job_count ? `受影响任务 ${channel.affected_job_count} 个` : "当前没有因此暂停的任务"),
       D.node("p", channel.message),
     );
+    if (unverified && channel.channel === "video") {
+      card.append(D.node(
+        "p",
+        "提示：本通道只负责视频下载 Cookie；抖音账号授权就绪不代表这里已验证通过。",
+        "hint-copy",
+      ));
+    }
     const actions = D.node("div", null, "operation-actions");
-    const authorize = D.node("button", channel.user_state === "authorized" ? "重新授权" : "授权", "primary-button");
+    const authorize = D.node(
+      "button",
+      channel.user_state === "authorized" ? "重新授权" : "授权",
+      unverified ? "secondary-button" : "primary-button",
+    );
     authorize.type = "button";
     authorize.addEventListener("click", () => start(channel.channel));
-    const check = D.node("button", "检查状态", "secondary-button");
+    const check = D.node("button", unverified ? "联网检查状态" : "检查状态", unverified ? "primary-button" : "secondary-button");
     check.type = "button";
     check.addEventListener("click", () => load(true));
-    actions.append(authorize, check);
+    actions.append(unverified ? check : authorize, unverified ? authorize : check);
     if (channel.affected_job_count) {
       const link = D.node("a", "查看受影响任务", "secondary-button");
       link.href = "/jobs?requires_user_action=1";
@@ -127,7 +139,9 @@
     renderSkeleton();
     try {
       const data = await load(false);
-      if (data.cached) load(true).catch((error) => D.toast(error.message));
+      const video = data.channels?.video;
+      const needsVerify = data.cached || video?.user_state === "unverified";
+      if (needsVerify) load(true).catch((error) => D.toast(error.message));
     } catch (error) {
       D.toast(error.message);
     }

@@ -4,7 +4,7 @@
     "library-view", "article-view", "topics-view", "topic-view", "trash-view",
     "imports-view", "imports-single-view", "imports-creators-view", "imports-favorites-view",
     "jobs-view", "job-detail-view", "auth-view", "system-view",
-    "analysis-view", "model-view",
+    "analysis-view", "model-view", "not-found-view",
   ];
   const Douku = window.Douku || {};
   Douku.$ = (id) => document.getElementById(id);
@@ -91,6 +91,11 @@
     || path === "/jobs" || path.startsWith("/jobs/")
     || path === "/settings/auth" || path === "/settings/system"
     || path === "/settings/analysis" || path === "/settings/model"
+  );
+  Douku.isKnownAppPath = (path) => (
+    path === "/" || path === "/topics" || path === "/trash"
+    || path.startsWith("/articles/") || path.startsWith("/topics/")
+    || Douku.isOperationPath(path)
   );
   Douku.navigate = (path, push = true) => {
     if (push) history.pushState({}, "", path);

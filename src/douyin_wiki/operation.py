@@ -66,8 +66,8 @@ TERMINAL_STATUSES = {
 
 AUTH_USER_STATES: dict[str, tuple[str, str]] = {
     "missing": ("unauthorized", "未授权"),
-    "available": ("unverified", "可能有效但未完成服务器验证"),
-    "unverified": ("unverified", "可能有效但未完成服务器验证"),
+    "available": ("unverified", "已检测到 Cookie，待联网确认"),
+    "unverified": ("unverified", "已检测到 Cookie，待联网确认"),
     "ready": ("authorized", "已授权"),
     "expired": ("expired", "授权已过期"),
     "needs_login": ("needs_login", "需要重新登录"),
@@ -82,10 +82,13 @@ CHANNEL_LABELS = {
 }
 
 CHANNEL_PURPOSES = {
-    "video": "访问抖音视频并由 yt-dlp 下载原片。使用本机浏览器的登录状态，与专用浏览器无关。",
+    "video": (
+        "视频下载通道：用本机日常浏览器的登录 Cookie 下载原片（yt-dlp）。"
+        "与下方「抖音账号授权」相互独立；账号已登录不代表本通道可下载。"
+    ),
     "douyin": (
-        "收藏清点、博主主页清点和静态图文采集。"
-        "使用抖库专用浏览器配置，登录成功不代表视频下载已授权。"
+        "账号通道：收藏清点、博主主页清点和静态图文采集。"
+        "使用抖库专用浏览器配置；登录成功不代表视频下载已授权。"
     ),
 }
 
@@ -357,6 +360,20 @@ def present_auth_check(
     machine_state = "authorizing" if authorizing else check.get("state") or "error"
     user_code, user_label = AUTH_USER_STATES.get(str(machine_state), ("check_failed", "检查失败"))
     timestamp = checked_at or datetime.now(UTC)
+    message = check.get("message") or ""
+    if user_code == "unverified" and channel == "video" and not message:
+        message = (
+            "本机已检测到视频下载用 Cookie，但尚未联网确认是否仍有效。"
+            "请点击「检查状态」完成验证；这与抖音账号授权无关。"
+        )
+    elif user_code == "unverified" and channel == "video":
+        message = (
+            f"{message}。"
+            if not str(message).endswith(("。", ".", "！", "!"))
+            else str(message)
+        )
+        if "检查状态" not in message:
+            message += "请点「检查状态」联网确认；与抖音账号授权相互独立。"
     payload = {
         "channel": channel,
         "channel_label": CHANNEL_LABELS[channel],
@@ -368,7 +385,7 @@ def present_auth_check(
         "server_verified": bool(check.get("server_verified")),
         "cookie_source_label": cookie_source_label(channel, check.get("cookie_source")),
         "account_hint": account_hint or "",
-        "message": check.get("message") or "",
+        "message": message,
         "checked_at": beijing_iso(timestamp),
         "checked_display": format_beijing(timestamp),
         "affected_job_count": affected_job_count,

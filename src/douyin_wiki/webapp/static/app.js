@@ -287,6 +287,59 @@ function setLibraryError(error) {
   $("#result-count").textContent = "载入失败";
 }
 
+async function refreshAuthChannelBanners() {
+  const targets = ["library-auth-banner", "imports-auth-banner"]
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+  if (!targets.length) return;
+  try {
+    const data = await window.Douku.api("/api/overview");
+    const video = data.auth?.channels?.video;
+    const alert = (data.alerts || []).find((item) =>
+      item.code === "video_auth_unverified" || item.code === "video_auth"
+    );
+    const show = Boolean(
+      alert || (video && !["authorized", "authorizing"].includes(video.user_state))
+    );
+    for (const node of targets) {
+      if (!show) {
+        node.classList.add("hidden");
+        node.replaceChildren();
+        continue;
+      }
+      node.classList.remove("hidden");
+      const copy = window.Douku.node(
+        "div",
+        null,
+      );
+      const title = window.Douku.node(
+        "strong",
+        alert?.message || (video?.user_state === "unverified"
+          ? "视频下载授权尚未联网确认；与抖音账号授权相互独立。"
+          : "视频下载授权需要处理。"),
+      );
+      const detail = window.Douku.node(
+        "p",
+        video?.user_state === "unverified"
+          ? "采集前请到授权状态页点击「检查状态」或重新授权。"
+          : (video?.message || "请到授权状态页处理后再导入。"),
+      );
+      copy.append(title, detail);
+      const actions = window.Douku.node("div", null, "operation-actions");
+      const go = window.Douku.node("button", "打开授权状态", "secondary-button");
+      go.type = "button";
+      go.addEventListener("click", () => window.Douku.navigate("/settings/auth"));
+      actions.append(go);
+      node.replaceChildren(copy, actions);
+    }
+  } catch (_) {
+    for (const node of targets) {
+      node.classList.add("hidden");
+      node.replaceChildren();
+    }
+  }
+}
+
 async function loadLibrary({showLoading = !state.libraryLoaded} = {}) {
   if (showLoading) setLibraryLoading();
   const params = new URLSearchParams();
@@ -303,6 +356,7 @@ async function loadLibrary({showLoading = !state.libraryLoaded} = {}) {
       || data.facets.tags?.length,
     );
     state.libraryLoaded = true;
+    refreshAuthChannelBanners();
     renderFilters();
     renderLibrary();
     fillInspirationTargets();
@@ -727,7 +781,7 @@ function updateTopicSelectionButton() {
   const label = $("span", button);
   label.textContent = state.topicSelectionMode
     ? (state.selectedEntryIds.size ? `已选 ${state.selectedEntryIds.size} 篇 · 下一步` : "选择专题来源")
-    : "创建专题";
+    : "从资料库选择来源";
   button.classList.toggle("active", state.topicSelectionMode);
 }
 
@@ -2130,7 +2184,7 @@ function bindEvents() {
     state.topicSelectionMode = true;
     state.selectedEntryIds.clear();
     showLibrary();
-    toast("请选择要加入专题的文章");
+    toast("已进入资料库多选：请勾选来源文章后点「下一步」创建专题");
   });
   $("#confirm-topic").addEventListener("click", (event) => {
     event.preventDefault();
@@ -2245,12 +2299,23 @@ function bindEvents() {
     if (event.key === "Enter" && length) { event.preventDefault(); $("#command-results .command-result.active")?.click(); }
   });
   window.addEventListener("douku:route", (event) => {
-    if (event.detail.path !== "/imports") return;
-    hideLegacyViews();
-    window.Douku?.setPage("imports");
-    window.Douku?.setNav("imports-nav");
-    $("#imports-view").classList.remove("hidden");
-    document.title = "导入内容 · 抖库";
+    const path = event.detail.path.split("?")[0];
+    if (path === "/imports") {
+      hideLegacyViews();
+      window.Douku?.setPage("imports");
+      window.Douku?.setNav("imports-nav");
+      $("#imports-view").classList.remove("hidden");
+      document.title = "导入内容 · 抖库";
+      refreshAuthChannelBanners();
+      return;
+    }
+    if (!window.Douku?.isKnownAppPath(path) && !path.startsWith("/api/") && !path.startsWith("/static/") && !path.startsWith("/media/")) {
+      hideLegacyViews();
+      window.Douku?.hideAllViews?.();
+      window.Douku?.setPage("not-found");
+      $("#not-found-view")?.classList.remove("hidden");
+      document.title = "页面不存在 · 抖库";
+    }
   });
   $$('[data-theme-select]').forEach((select) => select.addEventListener("change", (event) => window.DoukuTheme?.set(event.target.value)));
   document.addEventListener("keydown", handleGlobalKeydown);
@@ -2268,6 +2333,12 @@ function bindEvents() {
     else if (path === "/topics") showTopics(false);
     else if (path === "/trash") showTrash(false);
     else if (window.Douku?.isOperationPath(path)) window.Douku.navigate(path + window.location.search, false);
+    else if (window.Douku && !window.Douku.isKnownAppPath(path)) {
+      window.Douku.hideAllViews();
+      window.Douku.setPage("not-found");
+      $("#not-found-view")?.classList.remove("hidden");
+      document.title = "页面不存在 · 抖库";
+    }
     else {
       readStateFromURL();
       $("#search-input").value = state.query;
@@ -2299,7 +2370,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   else if (window.location.pathname === "/trash") await showTrash(false);
   else if (window.Douku?.isOperationPath(window.location.pathname)) {
     window.Douku.navigate(window.location.pathname + window.location.search, false);
+  } else if (window.Douku && !window.Douku.isKnownAppPath(window.location.pathname)) {
+    window.Douku.hideAllViews();
+    window.Douku.setPage("not-found");
+    $("#not-found-view")?.classList.remove("hidden");
+    document.title = "页面不存在 · 抖库";
   }
+  refreshAuthChannelBanners();
   await loadSessions();
   const events = new EventSource("/api/library/events");
   events.addEventListener("library", async () => {

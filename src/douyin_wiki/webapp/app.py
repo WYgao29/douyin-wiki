@@ -50,7 +50,7 @@ from .catalog import CONTENT_TYPE_LABELS, LibraryCatalog
 from .chat import ChatContextBuilder, ChatProvider, OpenAICompatibleChatProvider
 from .rendering import render_article, render_chat
 
-WEB_VERSION = "0.2.19"
+WEB_VERSION = "0.2.20"
 
 ANALYSIS_MODE_INFO = {
     "gateway": {
@@ -541,6 +541,7 @@ def create_app(
         tag: str = "",
         inspiration_only: bool = False,
         recent: bool = False,
+        limit: int | None = Query(None, ge=1, le=500),
     ):
         items = catalog.filter(
             query=q,
@@ -551,6 +552,8 @@ def create_app(
         )
         if recent:
             items = items[:20]
+        if limit is not None:
+            items = items[:limit]
         all_items = catalog.list_items()
         return {
             "items": [_item_payload(item) for item in items],
@@ -564,6 +567,7 @@ def create_app(
                 "tags": sorted({tag for item in all_items for tag in item.tags}),
             },
             "total": len(items),
+            "limit": limit,
             "version": catalog.version,
         }
 
@@ -1242,6 +1246,27 @@ def create_app(
         notifier=notifier,
         web_version=WEB_VERSION,
     )
+
+    @app.get("/{full_path:path}", response_class=HTMLResponse)
+    async def spa_fallback(request: Request, full_path: str):
+        """Serve the SPA shell for unknown browser paths instead of bare JSON 404."""
+        if full_path.startswith(("api/", "static/", "media/")):
+            raise HTTPException(status_code=404, detail="Not Found")
+        accept = request.headers.get("accept", "")
+        if "text/html" not in accept and "*/*" not in accept and accept != "":
+            raise HTTPException(status_code=404, detail="Not Found")
+        return templates.TemplateResponse(
+            request,
+            "app.html",
+            {
+                "page_title": "页面不存在",
+                "initial_entry_id": "",
+                "initial_topic_id": "",
+                "web_version": WEB_VERSION,
+            },
+            status_code=404,
+        )
+
     return app
 
 

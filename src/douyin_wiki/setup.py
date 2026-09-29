@@ -415,9 +415,9 @@ def doctor(config: AppConfig) -> dict[str, Any]:
         "required": False,
         "path": str(profile),
         "message": (
-            "图文与博主清点专用浏览器目录存在；这不代表登录仍有效，请运行 douyin-wiki auth status"
+            "图文与博主清点专用浏览器目录存在；这不代表登录仍有效，请到网页「授权状态」检查，或运行 douyin-wiki auth status"
             if profile.exists()
-            else "首次保存图文或清点博主前可运行 douyin-wiki auth douyin"
+            else "首次保存图文或清点博主前，请到网页「授权状态」授权，或运行 douyin-wiki auth douyin"
         ),
     }
     checks["vault"] = {"ok": config.vault_path.exists(), "path": str(config.vault_path)}

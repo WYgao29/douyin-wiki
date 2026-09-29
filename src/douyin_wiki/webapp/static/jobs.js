@@ -122,7 +122,8 @@
     const actions = D.node("div", null, "operation-actions");
     const action = actionButton(job.next_action, job.id);
     if (action) actions.append(action);
-    if (job.entry_id) {
+    const openEntryViaAction = job.next_action?.code === "open_entry";
+    if (job.entry_id && !openEntryViaAction) {
       const link = D.node("a", "打开知识资料", "secondary-button");
       link.href = `/articles/${encodeURIComponent(job.entry_id)}`;
       actions.append(link);
@@ -145,15 +146,33 @@
       timeline.append(item);
     }
     const children = D.node("section", null, "job-children");
-    if (job.child_stats) {
+    const childList = job.children || [];
+    const stats = job.child_stats || {};
+    const hasChildWork = childList.length > 0 || Number(stats.total || 0) > 0
+      || Number(stats.completed || 0) > 0 || Number(stats.running || 0) > 0
+      || Number(stats.waiting_user || 0) > 0 || Number(stats.failed || 0) > 0;
+    if (hasChildWork) {
       children.append(D.node("h2", "子任务"));
-      children.append(D.node("p", `成功 ${job.child_stats.completed} · 处理中 ${job.child_stats.running} · 等待本人 ${job.child_stats.waiting_user} · 失败 ${job.child_stats.failed}`));
+      if (job.child_stats) {
+        children.append(D.node("p", `成功 ${stats.completed || 0} · 处理中 ${stats.running || 0} · 等待本人 ${stats.waiting_user || 0} · 失败 ${stats.failed || 0}`));
+      }
+      for (const child of childList) {
+        const row = D.node("button", `${child.kind_label} · ${child.state_label} · ${child.message_for_user}`, "job-child");
+        row.type = "button";
+        row.addEventListener("click", () => D.navigate(`/jobs/${child.id}`));
+        children.append(row);
+      }
     }
-    for (const child of job.children || []) {
-      const row = D.node("button", `${child.kind_label} · ${child.state_label} · ${child.message_for_user}`, "job-child");
-      row.type = "button";
-      row.addEventListener("click", () => D.navigate(`/jobs/${child.id}`));
-      children.append(row);
+    const warningsPanel = D.node("section", null, "review-panel job-warnings");
+    const warnings = Array.isArray(job.result?.warnings) ? job.result.warnings.filter(Boolean) : [];
+    if (warnings.length) {
+      warningsPanel.append(D.node("h2", "提示"));
+      warningsPanel.append(D.node("p", "任务已结束，但仍有需要留意的提示：", "hint-copy"));
+      const list = D.node("ul", null, "job-warning-list");
+      for (const warning of warnings) {
+        list.append(D.node("li", String(warning)));
+      }
+      warningsPanel.append(list);
     }
     const review = D.node("section", null, "review-panel");
     if (job.review_issues?.length) {
@@ -170,7 +189,7 @@
         evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${item.timestamp_ms == null ? "" : ` · ${item.timestamp_ms}ms`}：${item.reason}`));
       }
     }
-    root.replaceChildren(header, progress, modelProgress, modelHealth, actions, analysis, media, timeline, children, review, evidenceAudit);
+    root.replaceChildren(header, progress, modelProgress, modelHealth, actions, analysis, media, timeline, children, warningsPanel, review, evidenceAudit);
     if (job.analysis_mode === "provider") {
       try {
         const health = await D.api("/api/system/model-health");

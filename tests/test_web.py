@@ -978,7 +978,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="analysis-view"' in page.text
         assert 'aria-label="显示 API Key"' in page.text
         assert "/static/icons.svg#eye" in page.text
-        assert "/static/model-settings.js?v=0.2.19" in page.text
+        assert "/static/model-settings.js?v=0.2.20" in page.text
         assert "对话模型" in page.text
         assert 'name="analysis-mode"' in page.text
         assert "保存分析方式" in page.text
@@ -992,7 +992,7 @@ def test_model_settings_page_shares_theme_and_accessible_controls(tmp_path: Path
         assert 'id="app-shell"' in analysis.text
         assert "导入后的分析方式" in analysis.text
         assert 'value="provider"' in analysis.text
-        assert "/static/analysis-settings.js?v=0.2.19" in analysis.text
+        assert "/static/analysis-settings.js?v=0.2.20" in analysis.text
         assert 'href="/settings/model"' in analysis.text
         assert 'data-route="/settings/analysis"' in analysis.text
 

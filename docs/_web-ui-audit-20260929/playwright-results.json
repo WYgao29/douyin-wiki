@@ -1,0 +1,415 @@
+{
+  "generated_at": "2026-09-29T09:38:57+0800",
+  "base": "http://127.0.0.1:8765",
+  "pages": [
+    {
+      "page": "01-home",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | K | 导入内容 | 筛选 | 排序方式 | 最近加入 | 发布时间：从新到旧 | 发布时间：从旧到新 | 标题 | 博主 | 创建专题 | AI | 资料库 |  | 整理并检索已经入库的抖音知识 | ",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/01-home.png",
+      "errors": []
+    },
+    {
+      "page": "section-recent",
+      "ok": true,
+      "notes": "active=True",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/02-section-recent.png",
+      "errors": []
+    },
+    {
+      "page": "section-favorite",
+      "ok": true,
+      "notes": "active=True",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/02-section-favorite.png",
+      "errors": []
+    },
+    {
+      "page": "section-inspiration",
+      "ok": true,
+      "notes": "active=True",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/02-section-inspiration.png",
+      "errors": []
+    },
+    {
+      "page": "03-article",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 教程 · 视频 | 正常 | 如何使用 AI 做出顶级的 UI 设计 |  | oil欧呦 | 2026-09-18 15:05:57 | 采集 2026-0",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/03-article.png",
+      "errors": []
+    },
+    {
+      "page": "04-imports",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 导入内容 |  | 从单条链接、博主主页或我的收藏写入知识库。清点不会下载媒体或调用 AI。 |  | 导入单条 |  | 粘贴链接或分享文案，补充灵感后提交",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/04-imports.png",
+      "errors": []
+    },
+    {
+      "page": "imports-popover",
+      "ok": false,
+      "notes": "hidden=True choices=3",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/04b-imports-popover.png",
+      "errors": [
+        "popover not shown"
+      ]
+    },
+    {
+      "page": "05-imports-single",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 导入内容 | 导入单条 |  | 提交前只检查链接，不会下载媒体或调用 AI。 |  | 链接 |  | 粘贴抖音链接，或从抖音复制的整段分享文案。 |  | 链接或分享文案 | 灵",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/05-imports-single.png",
+      "errors": []
+    },
+    {
+      "page": "06-imports-creators",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 导入内容 | 导入博主 |  | 输入主页或该博主任意作品。清点后才能选择和确认。 |  | 博主主页 |  | 清点公开作品，不会下载媒体或自动订阅。 |  | 主页或作品链接",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/06-imports-creators.png",
+      "errors": []
+    },
+    {
+      "page": "07-imports-favorites",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 导入内容 | 导入收藏 |  | 先更新清单，再选择作品并确认导入。只看历史不会访问抖音。 |  | 更新收藏 |  | 读取抖音清单，不会下载视频或写入知识库。 |  | 范围",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/07-imports-favorites.png",
+      "errors": []
+    },
+    {
+      "page": "08-jobs",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 任务中心 |  | 单条采集、博主批次、收藏批次和等待本人操作都在这里。 |  | 1 个任务 | 来源 | 全部来源 | 单条采集 | 博主 | 收藏 | 重分析 | 媒体恢复",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/08-jobs.png",
+      "errors": []
+    },
+    {
+      "page": "09-job-detail",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 任务中心 | 单条采集 |  | 已结束，但有需要留意的提示。 |  | 已完成（有提示） |  | 阶段 完成 · 进度 100% |  | 模型服务：模型服务可连接 |  | 打开知",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/09-job-detail.png",
+      "errors": []
+    },
+    {
+      "page": "10-topics",
+      "ok": false,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | K | 导入内容 | 筛选 | 排序方式 | 最近加入 | 发布时间：从新到旧 | 发布时间：从旧到新 | 标题 | 博主 | 选择专题来源 | AI | 资料库 |  | 整理并检索已经入库的抖音知",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/10-topics.png",
+      "errors": [
+        "extra: topic dialog not open"
+      ]
+    },
+    {
+      "page": "11-trash",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 废纸篓 |  | 删除的资料、原始记录和媒体保存在本机，可恢复或彻底删除 |  | 0 条资料 | 废纸篓是空的 |  | 从文章页面删除的资料会暂存在这里。",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/11-trash.png",
+      "errors": []
+    },
+    {
+      "page": "12-settings-auth",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 授权状态 |  | 查看并管理两条相互独立的授权通道。专用浏览器已登录，不代表视频下载授权已就绪。 |  | 视频下载授权 |  | 访问抖音视频并由 yt-",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/12-settings-auth.png",
+      "errors": []
+    },
+    {
+      "page": "13-settings-analysis",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 导入分析 |  | 选择采集完成后由谁整理。只有「后台模型接口」才需要配置对话模型。 |  | 后台模型接口 |  | 后台模型接口自动整理 |  | 导入后的分析方",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/13-settings-analysis.png",
+      "errors": []
+    },
+    {
+      "page": "14-settings-model",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 对话模型 |  | 配置知识库右侧 AI 对话使用的模型。导入分析若选择「后台模型接口」，也会使用同一套接口。 |  | 模型已配置 |  | Qwen3.6",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/14-settings-model.png",
+      "errors": []
+    },
+    {
+      "page": "15-settings-system",
+      "ok": true,
+      "notes": "跳到主要内容 | 抖库 | 个人知识工作台 |  | 资料 |  | 资料库 | 最近加入 | 收藏 | 灵感 | 常用标签 | 查看全部 | #AI 代理 | #AI 设计 | #UI 设计 | #双钻石流程 | #情感共鸣 | #用户体验 | #设计流程 | 操作 | 导入内容 | 任务中心 | 专题 | 废纸篓 | 外观 | 跟随系统 | 亮色 | 暗色 | 授权状态 | 导入分析 | 对话模型 | 系统设置 | Web v0.2.19 · 仅本机 | AI | 资料库 | 系统设置 |  | 查看本机运行状态和存储。维护会先预览，确认后才执行。 |  | Worker | 运行中 |  | 队列 0 |  | 分析方式 | 模型接口 |  | 后台模型",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/15-settings-system.png",
+      "errors": []
+    },
+    {
+      "page": "command-palette",
+      "ok": true,
+      "notes": "results=1",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/16-command-palette.png",
+      "errors": []
+    },
+    {
+      "page": "chat",
+      "ok": true,
+      "notes": "visible=True class=chat-panel",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/17-chat.png",
+      "errors": []
+    },
+    {
+      "page": "mobile-nav",
+      "ok": true,
+      "notes": "toggle_visible=True",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/18-mobile-nav.png",
+      "errors": []
+    },
+    {
+      "page": "unknown-route",
+      "ok": true,
+      "notes": "status=404",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/19-unknown-route.png",
+      "errors": []
+    },
+    {
+      "page": "article-from-home",
+      "ok": true,
+      "notes": "http://127.0.0.1:8765/articles/dy-7686768044248452390",
+      "shot": "/Users/weisengao/Documents/ChatGPT/douyin-wiki/docs/_web-ui-audit-20260929/20-article-from-home.png",
+      "errors": []
+    }
+  ],
+  "findings": [
+    {
+      "sev": "nit",
+      "area": "home",
+      "msg": "library cards=1 empty_vis=False",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "article",
+      "msg": "chat_panel present=True hidden=False",
+      "detail": ""
+    },
+    {
+      "sev": "major",
+      "area": "imports-nav",
+      "msg": "导入弹出层未正确显示",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "imports-single",
+      "msg": "已填入 dry-run 文案，未提交",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "imports-single",
+      "msg": "analysis hint: 后台模型接口自动整理。可能调用外部模型并消耗 Token。",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "creators",
+      "msg": "form visible; list items=0",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "favorites",
+      "msg": "危险按钮可见 count=2（未点）",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "jobs",
+      "msg": "job rows=1 count_label=1 个任务",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "job-detail",
+      "msg": "detail snippet: '单条采集\\n\\n已结束，但有需要留意的提示。\\n\\n已完成（有提示）\\n\\n阶段 完成 · 进度 100%\\n\\n模型服务：模型服务可连接\\n\\n打开知识资料\\n打开知识资料\\n\\n后台模型接口自动整理\\n\\n子任务\\n\\n成功 0 · 处理中 0 · 等待本人 0 · 失'",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "job-review",
+      "msg": "status=200 issues=0 sample=[]",
+      "detail": ""
+    },
+    {
+      "sev": "major",
+      "area": "10-topics",
+      "msg": "页面关键视图未就绪",
+      "detail": "extra: topic dialog not open"
+    },
+    {
+      "sev": "nit",
+      "area": "trash",
+      "msg": "purge btn disabled? None; text='资料库\\n废纸篓\\n\\n删除的资料、原始记录和媒体保存在本机，可恢复或彻底删除\\n\\n0 条资料\\n废纸篓是空的\\n\\n从文章页面删除的资料会暂存在这里。'",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "auth",
+      "msg": "video='视频下载授权\\n\\n访问抖音视频并由 yt-dlp 下载原片。使用本机浏览器的登录状态，与专用浏览器无关。\\n\\n可能有效但未完成服务器验证\\n\\n本机日常浏览器的登录 C' douyin='抖音账号授权\\n\\n收藏清点、博主主页清点和静态图文采集。使用抖库专用浏览器配置，登录成功不代表视频下载已授权。\\n\\n已授权\\n\\n抖库专用浏览器配置（与视频下载通道相互'",
+      "detail": ""
+    },
+    {
+      "sev": "major",
+      "area": "auth",
+      "msg": "视频下载授权处于未完成服务器验证/可能有效状态（正式环境）",
+      "detail": "视频下载授权\n\n访问抖音视频并由 yt-dlp 下载原片。使用本机浏览器的登录状态，与专用浏览器无关。\n\n可能有效但未完成服务器验证\n\n本机日常浏览器的登录 Cookie（抖库不会读取或显示 Cookie 内容）\n\n上次检查：2026-09-29 09:37:11（北京时间）\n\n当前没有因此暂停的任务\n\n检测到 3 个"
+    },
+    {
+      "sev": "nit",
+      "area": "analysis",
+      "msg": "status title='后台模型接口' copy='后台模型接口自动整理'",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "model",
+      "msg": "after test: '正在调用模型测试连接，这会产生少量 token…' status='模型已配置'",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "system",
+      "msg": "health='Worker\\n运行中\\n最后心跳\\n2026-09-29 09:38:43\\n队列\\n0\\n正在执行\\n空闲\\n分析方式\\n模型接口\\n最近维护\\n2026-09-27 03:00:19' storage='知识资料\\n1 篇\\n永久保留媒体\\n0 份\\n临时媒体\\n临时媒体保留 30 天\\nVault\\n194.1 MB\\n数据库\\n4.8 MB'",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "system-doctor",
+      "msg": "doctor result: '检查通过\\n\\n分析方式\\n正常\\n校正与分析由后台 OpenAI-compatible provider 完成\\nyt-dlp\\n正常\\nFFmpeg\\n正常\\nFFprobe\\n正常\\nWhisper CLI\\n正常\\nSwift\\n正常\\n自动化脚本\\n正常\\nGit\\n正常\\nPlaywright\\n正常\\nWeb 依赖\\n正常\\nWeb 服务\\n正常\\nWeb 服务正在运行\\n本机浏览器\\n正常\\n抖音浏览器配置\\n正常\\n图文与博主清点专用浏览'",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "system",
+      "msg": "system-maintenance-apply present=1（未点击）",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "system",
+      "msg": "system-rebuild-apply present=1（未点击）",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "command",
+      "msg": "results=1",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "chat",
+      "msg": "class='chat-panel' visible=True",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "routing",
+      "msg": "unknown route status=404 title=''",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/app.css 200 88562B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/app.js 200 91493B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/shared.js 200 5157B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/jobs.js 200 10762B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/icons.svg 200 5448B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/brand-mark.png 200 50679B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/imports-single.js 200 1891B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/imports-creators.js 200 6009B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/imports-favorites.js 200 12271B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/auth.js 200 5009B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/system-settings.js 200 10024B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/analysis-settings.js 200 3561B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/model-settings.js 200 4685B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/favorites.js 200 10678B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "static",
+      "msg": "/static/theme.js 200 1541B",
+      "detail": ""
+    },
+    {
+      "sev": "nit",
+      "area": "csrf",
+      "msg": "browser Origin POST doctor OK",
+      "detail": ""
+    }
+  ],
+  "console": [
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 404 (Not Found)",
+      "url": "http://127.0.0.1:8765/no-such-page-audit"
+    }
+  ],
+  "network_fails": []
+}

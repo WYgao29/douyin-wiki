@@ -172,9 +172,12 @@ def register_operation_routes(
             job = operations.get_job(job_id)
         except JobStateError as exc:
             raise _http_error(exc) from exc
+        result = job.get("result") or {}
+        warnings = list(result.get("warnings") or [])
         return {
             "job_id": job_id,
             "issues": job.get("review_issues") or [],
+            "warnings": warnings,
             "status": job["status"],
         }
 

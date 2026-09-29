@@ -201,6 +201,20 @@ class WebOperationService:
                     ],
                 }
             )
+        elif video["user_state"] == "unverified":
+            alerts.append(
+                {
+                    "code": "video_auth_unverified",
+                    "message": (
+                        "视频下载授权已检测到 Cookie，但尚未联网确认。"
+                        "采集前请到授权状态页点击「检查状态」。"
+                        "这与抖音账号授权相互独立。"
+                    ),
+                    "actions": [
+                        {"label": "检查授权状态", "href": "/settings/auth"},
+                    ],
+                }
+            )
         douyin_blocked = douyin["user_state"] not in {"authorized", "authorizing"}
         if douyin["affected_job_count"] and douyin_blocked:
             alerts.append(
