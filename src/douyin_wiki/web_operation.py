@@ -295,7 +295,7 @@ class WebOperationService:
                     "code": "video_auth_unverified",
                     "message": (
                         "视频下载授权已检测到 Cookie，但尚未联网确认。"
-                        "采集前请到授权状态页点击「检查状态」。"
+                        "采集前请到「设置 › 授权状态」点击「检查状态」。"
                         "这与抖音账号授权相互独立。"
                     ),
                     "actions": [

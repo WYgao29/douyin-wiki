@@ -152,7 +152,7 @@
     }
     D.hideAllViews();
     D.setPage("auth");
-    D.setNav("auth-nav");
+    D.setNav("settings-nav");
     D.$("auth-view").classList.remove("hidden");
     document.title = "授权状态 · 抖库";
     renderSkeleton();

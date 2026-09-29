@@ -441,7 +441,8 @@ def test_web_ui_uses_local_accessible_redesign_assets(tmp_path: Path) -> None:
         assert 'id="trash-purge-selected"' in page.text
         assert 'id="destructive-dialog"' in page.text
         assert 'id="imports-toggle"' in page.text
-        assert 'id="auth-nav"' in page.text
+        assert 'id="settings-nav"' in page.text
+        assert 'id="auth-nav"' not in page.text
         assert "已保存视图" not in page.text
         assert "全部视频" not in page.text
         assert "全部图文" not in page.text

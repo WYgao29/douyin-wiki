@@ -13,7 +13,7 @@ from douyin_wiki.models import (
     ReviewIssue,
 )
 from douyin_wiki.webapp.app import WEB_VERSION, create_app
-from tests.test_web import _web_fixture
+from tests.test_web import ConfigurableFakeProvider, _web_fixture
 
 
 def local_client(app, **kwargs):
@@ -510,3 +510,78 @@ def test_web_028_settings_health_and_favorite_copy(tmp_path) -> None:
     assert 'favoriteFailure("库内收藏", error)' in app_js
     assert '`${kind}操作失败`' in app_js
     assert 'setNav("settings-nav")' in app_js
+
+
+def test_web_029_sidebar_keeps_settings_hub_and_paths(tmp_path) -> None:
+    config, service = _web_fixture(tmp_path)
+    service.downloader = FakeAuthDownloader(state="available", ok=True, verified=False)
+    service.image_note_downloader = FakeDouyinAuth(ok=True)
+    service.creator_adapter = service.image_note_downloader
+    service.favorites.adapter = service.image_note_downloader
+    app = create_app(
+        config,
+        config_path=tmp_path / "config.toml",
+        service=service,
+        chat_provider=ConfigurableFakeProvider("unset", False),
+        start_watcher=False,
+    )
+    with local_client(app) as client:
+        page = client.get("/")
+        footer_start = page.text.index('class="sidebar-footer"')
+        footer = page.text[footer_start:page.text.index("</aside>", footer_start)]
+        assert footer.count("settings-nav-link") == 1
+        assert 'id="settings-nav"' in footer
+        assert ">设置</span>" in footer
+        for removed in (
+            "auth-nav",
+            "analysis-nav",
+            "model-nav",
+            "system-nav",
+            "授权状态",
+            "导入分析",
+            "共用模型",
+            "系统设置",
+        ):
+            assert removed not in footer
+        assert "侧栏「授权状态」" not in page.text
+        assert "设置 › 授权状态" in page.text
+        assert "设置 › 导入分析" in page.text
+        assert "设置 › 共用模型" in page.text
+        for path in (
+            "/settings",
+            "/settings/auth",
+            "/settings/analysis",
+            "/settings/model",
+            "/settings/system",
+        ):
+            assert client.get(path).status_code == 200
+        scripts = {
+            name: client.get(f"/static/{name}?v={WEB_VERSION}").text
+            for name in (
+                "auth.js",
+                "analysis-settings.js",
+                "model-settings.js",
+                "system-settings.js",
+                "app.js",
+            )
+        }
+        for name in ("auth.js", "analysis-settings.js", "model-settings.js", "system-settings.js"):
+            assert 'setNav("settings-nav")' in scripts[name]
+            for stale in ("auth-nav", "analysis-nav", "model-nav", "system-nav"):
+                assert f'setNav("{stale}")' not in scripts[name]
+        assert "设置 › 授权状态" in scripts["app.js"]
+        assert "设置 › 共用模型" in scripts["app.js"]
+        assert "授权状态页" not in scripts["app.js"]
+        assert "请到「共用模型」" not in scripts["app.js"]
+        assert "设置 › 共用模型" in scripts["analysis-settings.js"]
+        overview = client.get("/api/overview").json()
+        unverified = next(
+            item for item in overview["alerts"] if item["code"] == "video_auth_unverified"
+        )
+        assert "设置 › 授权状态" in unverified["message"]
+        assert unverified["actions"][0]["href"] == "/settings/auth"
+        switched = client.post("/api/settings/analysis-mode", json={"mode": "provider"})
+        assert switched.status_code == 200
+        warning = switched.json()["warning"]
+        assert "设置 › 共用模型" in warning
+        assert "对话模型页" not in warning

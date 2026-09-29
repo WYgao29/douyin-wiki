@@ -53,7 +53,8 @@ def test_system_nav_has_data_route_and_sidebar_body_keeps_footer_visible(tmp_pat
     with local_client(app) as client:
         page = client.get("/")
         css = client.get(f"/static/app.css?v={WEB_VERSION}")
-    assert 'id="system-nav"' in page.text
+    assert 'id="settings-nav"' in page.text
+    assert 'id="system-nav"' not in page.text
     assert 'data-route="/settings/system"' in page.text
     assert 'class="sidebar-body"' in page.text
     assert "从资料库选择来源" in page.text
@@ -153,4 +154,9 @@ def test_doctor_points_web_users_to_auth_page(tmp_path) -> None:
     with local_client(app) as client:
         doctor = client.post("/api/system/doctor", json={}).json()
     message = doctor["douyin_browser_profile"]["message"]
-    assert "授权状态" in message
+    assert "设置 › 授权状态" in message
+    assert "网页「授权状态」" not in message
+    web_llm = doctor["web_llm"]["message"] or ""
+    if web_llm:
+        assert "设置 › 共用模型" in web_llm
+        assert "模型设置" not in web_llm

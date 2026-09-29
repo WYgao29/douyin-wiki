@@ -28,7 +28,7 @@
       D.$("provider-model-copy").textContent = `${currentSettings.model} · ${currentSettings.base_url}。对话和后台整理是这一套接口。`;
     } else {
       D.$("provider-model-title").textContent = "需要先配置共用模型";
-      D.$("provider-model-copy").textContent = "后台整理会调用共用模型页的同一套接口，没有第二套地址。网关 Agent 和本地模式不需要这一步。";
+      D.$("provider-model-copy").textContent = "后台整理会调用「设置 › 共用模型」的同一套接口，没有第二套地址。网关 Agent 和本地模式不需要这一步。";
     }
   }
 
@@ -94,7 +94,7 @@
     if (event.detail.path !== "/settings/analysis") return;
     D.hideAllViews();
     D.setPage("analysis");
-    D.setNav("analysis-nav");
+    D.setNav("settings-nav");
     D.$("analysis-view").classList.remove("hidden");
     document.title = "导入分析 · 抖库";
     bind();

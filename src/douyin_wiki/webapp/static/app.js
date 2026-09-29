@@ -344,8 +344,8 @@ async function refreshAuthChannelBanners() {
       const detail = window.Douku.node(
         "p",
         video?.user_state === "unverified"
-          ? "采集前请到授权状态页点击「检查状态」或重新授权。"
-          : (video?.message || "请到授权状态页处理后再导入。"),
+          ? "采集前请到「设置 › 授权状态」点击「检查状态」或重新授权。"
+          : (video?.message || "请到「设置 › 授权状态」处理后再导入。"),
       );
       copy.append(title, detail);
       const actions = window.Douku.node("div", null, "operation-actions");
@@ -1759,7 +1759,7 @@ async function loadSessions(preferNew = false) {
     state.sessions = data.sessions;
     $("#model-label").textContent = `模型：${data.configured ? data.model : "未配置"}`;
     $("#chat-persistent-error").classList.toggle("hidden", data.configured);
-    $("#chat-persistent-error").textContent = data.configured ? "" : "尚未配置共用模型。资料浏览不受影响，请到「共用模型」完成配置。对话和后台整理用的是同一套接口。";
+    $("#chat-persistent-error").textContent = data.configured ? "" : "尚未配置共用模型。资料浏览不受影响，请到「设置 › 共用模型」完成配置。对话和后台整理用的是同一套接口。";
     if (preferNew) {
       await createSession();
     } else {
