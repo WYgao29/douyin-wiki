@@ -448,3 +448,102 @@ def test_stale_worker_cannot_update_or_unlock_new_owner(tmp_path: Path) -> None:
     with database.connect() as connection:
         owner = connection.execute("SELECT lock_owner FROM jobs WHERE id=?", (job.id,)).fetchone()
     assert owner["lock_owner"] == "worker-b"
+
+
+def test_not_imported_means_no_library_entry(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    now = datetime.now(UTC)
+
+    def entry(entry_id: str, video_id: str) -> EntryRecord:
+        return EntryRecord(
+            id=entry_id,
+            video_id=video_id,
+            title=video_id,
+            original_url=f"https://www.douyin.com/video/{video_id}",
+            canonical_url=f"https://www.douyin.com/video/{video_id}",
+            raw_path=f"raw/{video_id}.md",
+            source_path=f"wiki/sources/{video_id}.md",
+            status="active",
+            media_status="present",
+            retention=RetentionPolicy.KEEP,
+            created_at=now,
+            updated_at=now,
+        )
+
+    kept = entry("dy-kept", "1001")
+    selected_with_entry = entry("dy-selected", "1002")
+    database.upsert_entry(kept, {})
+    database.upsert_entry(selected_with_entry, {})
+    creator = CreatorRecord(
+        id="dyc-filter",
+        sec_uid="sec-filter",
+        canonical_url="https://www.douyin.com/user/sec-filter",
+        original_url="https://v.douyin.com/filter/",
+        nickname="筛选博主",
+        folder_path="creators/筛选博主",
+        created_at=now,
+        updated_at=now,
+    )
+
+    def work(
+        work_id: str, decision: CreatorWorkDecision, entry_id: str | None
+    ) -> CreatorWorkRecord:
+        return CreatorWorkRecord(
+            creator_id=creator.id,
+            work_id=work_id,
+            source_kind=SourceKind.VIDEO,
+            canonical_url=f"https://www.douyin.com/video/{work_id}",
+            original_url=f"https://www.douyin.com/video/{work_id}",
+            title=work_id,
+            decision=decision,
+            availability=CreatorWorkAvailability.AVAILABLE,
+            entry_id=entry_id,
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+
+    database.restore_creator_bundle(
+        creator,
+        [
+            work("1001", CreatorWorkDecision.IMPORTED, kept.id),
+            work("1002", CreatorWorkDecision.SELECTED, selected_with_entry.id),
+            work("1003", CreatorWorkDecision.SKIPPED, None),
+            work("1004", CreatorWorkDecision.SELECTED, None),
+            work("1005", CreatorWorkDecision.PENDING, None),
+            work("1006", CreatorWorkDecision.IMPORTED, "dy-missing"),
+        ],
+    )
+    job = database.create_job(
+        CaptureRequest(share_text="https://www.douyin.com/user/sec-filter"),
+        kind="creator_import",
+    )
+    database.create_creator_run_items(
+        job.id, creator.id, ["1001", "1002", "1003", "1004", "1005", "1006"]
+    )
+    with database.connect() as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            """UPDATE creator_works SET entry_id=?
+               WHERE creator_id=? AND work_id=?""",
+            ("dy-dangling", creator.id, "1005"),
+        )
+
+    hidden, _ = database.list_creator_inventory(job.id, limit=20, not_imported=False)
+    assert [item.work.work_id for item in hidden] == [
+        "1001",
+        "1002",
+        "1003",
+        "1004",
+        "1005",
+        "1006",
+    ]
+    items, total = database.list_creator_inventory(job.id, limit=20, not_imported=True)
+    assert total == 4
+    assert [item.work.work_id for item in items] == ["1003", "1004", "1005", "1006"]
+    by_id = {item.work.work_id: item.work for item in items}
+    assert by_id["1003"].decision == CreatorWorkDecision.SKIPPED
+    assert by_id["1004"].decision == CreatorWorkDecision.SELECTED
+    assert by_id["1005"].entry_id == "dy-dangling"
+    assert by_id["1006"].decision == CreatorWorkDecision.IMPORTED
+    assert by_id["1006"].entry_id is None

@@ -1614,8 +1614,9 @@ class Database:
             clauses.append("w.decision=?")
             params.append(decision.value)
         if not_imported:
-            clauses.append("w.decision!=?")
-            params.append(CreatorWorkDecision.IMPORTED.value)
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = w.entry_id)"
+            )
         if source_kind:
             clauses.append("w.source_kind=?")
             params.append(source_kind.value)

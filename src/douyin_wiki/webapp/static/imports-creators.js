@@ -73,7 +73,7 @@
   }
 
   function decisionText(work) {
-    if (work.decision === "imported" || work.entry_id) return "已入库";
+    if (work.entry_id) return "已入库";
     if (work.decision === "skipped") return "已跳过";
     if (work.decision === "selected") return "已勾选";
     return "尚未入库";
@@ -182,8 +182,9 @@
       const input = document.createElement("input");
       input.type = "checkbox";
       const work = item.work || item;
-      input.checked = work.decision === "selected";
-      input.disabled = !canSelect || work.decision === "imported";
+      const inLibrary = Boolean(work.entry_id);
+      input.checked = !inLibrary && work.decision === "selected";
+      input.disabled = !canSelect || inLibrary || work.decision === "imported";
       input.addEventListener("change", async () => {
         await D.api(`/api/creator-imports/${encodeURIComponent(jobId)}/selection`, {
           method: "POST",

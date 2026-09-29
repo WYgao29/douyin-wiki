@@ -481,3 +481,32 @@ def test_in_progress_filter_child_warnings_and_settings_aliases(tmp_path) -> Non
         assert "重新分析" in app_js
         assert "待办" in app_js
         assert "库内收藏" in app_js
+
+
+def test_web_028_settings_health_and_favorite_copy(tmp_path) -> None:
+    config, service = _web_fixture(tmp_path)
+    app = create_app(config, service=service, start_watcher=False)
+    with local_client(app) as client:
+        page = client.get("/")
+        health = client.get("/health", follow_redirects=False)
+        jobs_js = client.get(f"/static/jobs.js?v={WEB_VERSION}").text
+        creators = client.get(f"/static/imports-creators.js?v={WEB_VERSION}").text
+        favorites = client.get(f"/static/imports-favorites.js?v={WEB_VERSION}").text
+        app_js = client.get(f"/static/app.js?v={WEB_VERSION}").text
+    assert 'id="settings-nav"' in page.text
+    assert 'data-route="/settings"' in page.text
+    assert ">设置</span>" in page.text
+    assert 'aria-label="更新抖音收藏"' in page.text
+    assert 'aria-label="更新收藏"' not in page.text
+    assert health.status_code == 307
+    assert health.headers["location"].endswith("/api/system/health")
+    assert 'children.id = "job-children"' in jobs_js
+    assert "scrollIntoView" in jobs_js
+    assert "viewingChildren" in jobs_js
+    assert "timestamp_ms}ms" not in jobs_js
+    assert "clockFromMs" in jobs_js
+    assert 'if (work.entry_id) return "已入库"' in creators
+    assert "抖音收藏操作失败" in favorites
+    assert 'favoriteFailure("库内收藏", error)' in app_js
+    assert '`${kind}操作失败`' in app_js
+    assert 'setNav("settings-nav")' in app_js

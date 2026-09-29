@@ -34,6 +34,12 @@
     return String(value || "").split("?")[0];
   }
 
+  function clockFromMs(ms) {
+    const total = Math.max(0, Math.round(Number(ms) / 1000));
+    if (!Number.isFinite(total)) return "";
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+  }
+
   function jobTitle(job) {
     return job.display_title || job.kind_label || job.kind;
   }
@@ -275,7 +281,8 @@
       modelProgress.textContent = `${phaseLabel}${count} · 最近模型响应 ${responseAt}${usage}${totalCalls}${waiting}`;
     }
     const actions = D.node("div", null, "operation-actions");
-    const action = actionButton(job.next_action);
+    const viewingChildren = job.next_action?.code === "view_children";
+    const action = viewingChildren ? null : actionButton(job.next_action);
     if (action) actions.append(action);
     const importedIds = (job.imported_entry_ids || []).filter((entryId) => !(
       job.next_action?.code === "open_entry" && job.entry_id === entryId
@@ -312,12 +319,14 @@
       timeline.append(item);
     }
     const children = D.node("section", null, "job-children");
+    children.id = "job-children";
     const childList = job.children || [];
     const stats = job.child_stats || {};
     const hasChildWork = childList.length > 0 || Number(stats.total || 0) > 0
       || Number(stats.completed || 0) > 0 || Number(stats.running || 0) > 0
       || Number(stats.waiting_user || 0) > 0 || Number(stats.failed || 0) > 0;
     if (hasChildWork) {
+      children.tabIndex = -1;
       children.append(D.node("h2", "子任务"));
       if (job.child_stats) {
         children.append(D.node("p", `成功 ${stats.completed || 0} · 处理中 ${stats.running || 0} · 等待本人 ${stats.waiting_user || 0} · 失败 ${stats.failed || 0}`));
@@ -328,6 +337,15 @@
         row.addEventListener("click", () => D.navigate(`/jobs/${child.id}`));
         children.append(row);
       }
+    }
+    if (viewingChildren && hasChildWork) {
+      const jump = D.node("button", job.next_action.label, "primary-button");
+      jump.type = "button";
+      jump.addEventListener("click", () => {
+        children.scrollIntoView({behavior: "smooth", block: "start"});
+        children.focus({preventScroll: true});
+      });
+      actions.prepend(jump);
     }
     const warningsPanel = D.node("section", null, "review-panel job-warnings");
     const warnings = Array.isArray(job.result?.warnings) ? job.result.warnings.filter(Boolean) : [];
@@ -351,13 +369,8 @@
       review.append(D.node("h2", "历史校对疑点"));
       review.append(D.node("p", "此任务按旧策略暂停。点击“按新模型校对策略重试”会重新校正并继续分析。", "hint-copy"));
       job.review_issues.forEach((issue) => {
-        const clock = (ms) => {
-          const total = Math.max(0, Math.round(Number(ms) / 1000));
-          if (!Number.isFinite(total)) return "";
-          return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
-        };
         const span = Number.isFinite(Number(issue.start_ms))
-          ? `${clock(issue.start_ms)}–${clock(issue.end_ms)}`
+          ? `${clockFromMs(issue.start_ms)}–${clockFromMs(issue.end_ms)}`
           : "";
         review.append(D.node("p", `疑点 ${issue.id}${span ? `（${span}）` : ""}${issue.image_index ? ` · 图 ${issue.image_index}` : ""}：${issue.raw_text}；${issue.reason || ""}`));
       });
@@ -366,7 +379,8 @@
     if (job.analysis_evidence_audit?.length) {
       evidenceAudit.append(D.node("h2", `证据核验记录（${job.analysis_evidence_audit.length}）`));
       for (const item of job.analysis_evidence_audit) {
-        evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${item.timestamp_ms == null ? "" : ` · ${item.timestamp_ms}ms`}：${item.reason}`));
+        const stamp = item.timestamp_ms == null ? "" : clockFromMs(item.timestamp_ms);
+        evidenceAudit.append(D.node("p", `${item.kind}${item.id ? ` ${item.id}` : ""}${stamp ? ` · ${stamp}` : ""}：${item.reason}`));
       }
     }
     const selectionNote = D.node("p", "", "hint-copy");

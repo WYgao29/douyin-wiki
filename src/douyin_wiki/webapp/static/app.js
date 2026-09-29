@@ -142,6 +142,12 @@ function toast(message) {
   window.Douku.toast(message);
 }
 
+function favoriteFailure(kind, error) {
+  const detail = String(error?.message || "").trim();
+  const generic = !detail || detail === "请求失败" || detail === "操作失败" || detail === "收藏操作失败";
+  return generic ? `${kind}操作失败` : `${kind}操作失败：${detail}`;
+}
+
 function showRestoreRetry(jobId, message) {
   const node = $("#toast");
   const copy = document.createElement("span");
@@ -604,7 +610,7 @@ function makeFavoriteButton(item, className = "") {
         toast("已标为库内收藏；暂时无法读取视频恢复进度");
       });
     } catch (error) {
-      toast(error.message || "收藏操作失败");
+      toast(favoriteFailure("库内收藏", error));
     } finally {
       button.disabled = false;
     }
@@ -2364,6 +2370,7 @@ function bindEvents() {
     if (path === "/settings") {
       hideLegacyViews();
       window.Douku?.setPage("settings");
+      window.Douku?.setNav("settings-nav");
       $("#settings-view")?.classList.remove("hidden");
       document.title = "设置 · 抖库";
       return;

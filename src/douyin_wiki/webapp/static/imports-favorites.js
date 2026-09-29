@@ -35,7 +35,15 @@
     if (busy) return;
     busy = true; stopPolling(); generation++; if ($("error")) $("error").textContent = "";
     controls();
-    try { await action(); } catch (error) { if ($("error")) $("error").textContent = error.message; }
+    try {
+      await action();
+    } catch (error) {
+      const detail = String(error?.message || "").trim();
+      const generic = !detail || detail === "请求失败" || detail === "操作失败" || detail === "收藏操作失败";
+      const message = generic ? "抖音收藏操作失败" : `抖音收藏操作失败：${detail}`;
+      if ($("error")) $("error").textContent = message;
+      D.toast(message);
+    }
     finally { busy = false; controls(); schedule(); }
   }
   function schedule() {

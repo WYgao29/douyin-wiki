@@ -131,6 +131,10 @@ def register_operation_routes(
     async def auth_alias():
         return RedirectResponse(url="/settings/auth", status_code=307)
 
+    @app.get("/health")
+    async def health_alias():
+        return RedirectResponse(url="/api/system/health", status_code=307)
+
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_hub(request: Request):
         return spa(request, "设置")
