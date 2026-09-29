@@ -13,7 +13,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..config import MediaSettings
-from ..errors import BrowserAuthRequiredError, ExternalToolError, InvalidShareTextError, VideoUnavailableError
+from ..errors import (
+    BrowserAuthRequiredError,
+    ExternalToolError,
+    InvalidShareTextError,
+    VideoUnavailableError,
+)
 from ..models import (
     AuthCheckResult,
     CreatorInventoryResult,

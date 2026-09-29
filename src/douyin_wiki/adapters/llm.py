@@ -844,7 +844,8 @@ class OpenAICompatibleProvider(AnalysisProvider):
 OCR 只是辅助证据，不出现对应文字不代表原话错误。数字、金额、人名等没有足够依据时保留原表述。
 context_before/context_after 只供理解，不得复制进当前段的 text；
 只返回 segments 中当前 text 对应的内容。
-对不确定的地方作出保守选择，不请求人工复核。每段 id 必须与输入 segments 的 id 完全一致（本次请求内从 0 起的本地序号），不要改用其它编号。
+对不确定的地方作出保守选择，不请求人工复核。每段 id 必须与输入 segments 的 id 完全一致\
+（本次请求内从 0 起的本地序号），不要改用其它编号。
 输出 JSON：{\"segments\":[{\"id\":整数,\"text\":字符串}]}。"""
         source_index = {segment.id: index for index, segment in enumerate(segments)}
         source_by_id = {segment.id: segment for segment in segments}

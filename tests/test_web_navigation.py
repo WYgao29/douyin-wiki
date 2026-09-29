@@ -1,8 +1,6 @@
-"""Web UI audit 2026-09-29: Major 1–4 and Nit/UX fixes."""
+"""Web navigation, task warnings, and authorization presentation."""
 
 from __future__ import annotations
-
-from fastapi.testclient import TestClient
 
 from douyin_wiki.models import JobStatus
 from douyin_wiki.webapp.app import WEB_VERSION, create_app
@@ -41,7 +39,11 @@ def test_jobs_js_renders_warnings_dedupes_open_entry_hides_empty_children(tmp_pa
         script = client.get(f"/static/jobs.js?v={WEB_VERSION}")
     assert script.status_code == 200
     body = script.text
-    assert "job.result?.warnings" in body or "job.result.warnings" in body or "result?.warnings" in body
+    assert (
+        "job.result?.warnings" in body
+        or "job.result.warnings" in body
+        or "result?.warnings" in body
+    )
     assert "openEntryViaAction" in body
     assert "hasChildWork" in body
     assert "job-warnings" in body

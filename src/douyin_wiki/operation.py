@@ -366,7 +366,10 @@ def message_for_user(
         return "清点已完成，请选择要导入的作品并确认。"
     if job.status == JobStatus.AWAITING_AGENT_ANALYSIS:
         if analysis_mode == AnalysisMode.GATEWAY.value:
-            return "当前为 Gateway 模式。网页不会自动分析，需要外部 Agent 接续。后台不会自动完成 AI 整理。"
+            return (
+                "当前为 Gateway 模式。网页不会自动分析，需要外部 Agent 接续。"
+                "后台不会自动完成 AI 整理。"
+            )
         if analysis_mode == AnalysisMode.LOCAL.value:
             return "本地模式正在等待整理，不会调用外部模型。"
         return "等待后台模型接口继续整理。"

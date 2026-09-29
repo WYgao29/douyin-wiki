@@ -338,11 +338,14 @@ class DouyinWikiService(
             raise JobStateError("只有“失败”“需要登录授权”或历史“需要人工复核”的任务可以重试")
         # Sticky analysis_candidate would skip the next model call and replay a
         # previously failed candidate forever — clear it on ordinary retries.
-        return self.database.requeue_job(
+        updated = self.database.requeue_job(
             job_id,
             remove_artifacts={"analysis_candidate", "user_dismissed"},
             expected_updated_at=job.updated_at,
         )
+        creator_context = updated.artifacts.get("creator_context") or {}
+        self.refresh_creator_parent(str(creator_context.get("parent_job_id") or ""))
+        return updated
 
 
 

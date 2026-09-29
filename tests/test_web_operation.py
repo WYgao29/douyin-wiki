@@ -434,7 +434,9 @@ def test_in_progress_filter_child_warnings_and_settings_aliases(tmp_path) -> Non
     gateway = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
     service.database.update_job(gateway.id, status=JobStatus.AWAITING_AGENT_ANALYSIS, unlock=True)
     failed = service.capture_douyin("https://v.douyin.com/uvHsRpXIn8s/")
-    service.database.update_job(failed.id, status=JobStatus.FAILED, error_message="模拟失败", unlock=True)
+    service.database.update_job(
+        failed.id, status=JobStatus.FAILED, error_message="模拟失败", unlock=True
+    )
     child = service.database.create_job(
         CaptureRequest(share_text="https://www.douyin.com/video/1"),
         status=JobStatus.COMPLETED_WITH_WARNINGS,
@@ -468,7 +470,9 @@ def test_in_progress_filter_child_warnings_and_settings_aliases(tmp_path) -> Non
         assert parent.id not in active_ids
         chinese = client.get("/api/jobs", params={"status": "进行中"}).json()
         assert {item["id"] for item in chinese["items"]} == active_ids
-        listed = next(item for item in client.get("/api/jobs").json()["items"] if item["id"] == parent.id)
+        listed = next(
+            item for item in client.get("/api/jobs").json()["items"] if item["id"] == parent.id
+        )
         assert listed["next_action"]["code"] == "view_children"
         assert listed["requires_user_action"] is False
         detail = client.get(f"/api/jobs/{parent.id}").json()

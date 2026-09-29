@@ -65,7 +65,10 @@ ANALYSIS_MODE_INFO = {
     "provider": {
         "label": "后台模型接口",
         "web_copy": "后台模型接口自动整理",
-        "detail": "导入后由 Worker 使用「设置 › 共用模型」的同一套接口自动校正和分析，可能消耗 Token。没有第二套地址或密钥。",
+        "detail": (
+            "导入后由 Worker 使用「设置 › 共用模型」的同一套接口自动校正和分析，"
+            "可能消耗 Token。没有第二套地址或密钥。"
+        ),
         "web_can_complete": True,
     },
     "local": {
@@ -344,6 +347,7 @@ def create_app(
         try:
             yield
         finally:
+            await operations.auth.close()
             if task:
                 stop_event.set()
                 with suppress(asyncio.CancelledError, TimeoutError):
@@ -1104,7 +1108,10 @@ def create_app(
         info = ANALYSIS_MODE_INFO[payload.mode.value]
         warning = None
         if payload.mode == AnalysisMode.PROVIDER and not app.state.chat_provider.configured:
-            warning = "已改为后台模型接口，但共用模型尚未配置完整。请先到「设置 › 共用模型」保存接口和模型。"
+            warning = (
+                "已改为后台模型接口，但共用模型尚未配置完整。"
+                "请先到「设置 › 共用模型」保存接口和模型。"
+            )
         return {
             "status": "分析方式已保存",
             "analysis_mode": payload.mode.value,

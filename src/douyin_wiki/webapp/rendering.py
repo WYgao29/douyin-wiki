@@ -75,6 +75,14 @@ def _rewrite_url(url: str, source_path: Path, catalog: LibraryCatalog) -> str:
     parsed = urlsplit(decoded)
     if parsed.scheme in {"http", "https", "mailto"} or decoded.startswith("#"):
         return decoded
+    if (
+        not parsed.scheme
+        and not parsed.query
+        and not parsed.fragment
+        and re.fullmatch(r"/articles/([A-Za-z0-9_-]+)", parsed.path)
+    ):
+        entry_id = parsed.path.removeprefix("/articles/")
+        return parsed.path if catalog.get(entry_id) else "#"
     if parsed.scheme or decoded.startswith("/"):
         return "#"
     target = (source_path.parent / parsed.path).resolve()

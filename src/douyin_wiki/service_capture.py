@@ -50,7 +50,6 @@ class CaptureMixin:
                 result={"entry_id": entry.id, "media_restored": False, "skipped": True},
                 unlock=True,
             )
-        data = self.database.get_entry_data(entry.id)
         raw_parent = Path(entry.raw_path).parent
         raw_root = raw_parent.parent if raw_parent.name == "records" else raw_parent
         assets_dir = self.config.vault_path / raw_root / "assets" / entry.video_id
@@ -61,9 +60,14 @@ class CaptureMixin:
                 entry.video_id,
                 assets_dir,
             )
-        data["metadata"] = metadata.model_dump(mode="json")
         with self.vault.entry_operations_locked():
             current = self.database.get_entry(entry.id)
+            data = self.database.get_entry_data(entry.id)
+            downloaded = metadata.model_dump(mode="json")
+            latest_metadata = dict(data.get("metadata") or downloaded)
+            for field in ("media_path", "thumbnail_path", "thumbnail_kind", "image_paths"):
+                latest_metadata[field] = downloaded[field]
+            data["metadata"] = latest_metadata
             now = utc_now()
             keep = current.favorite
             updated = current.model_copy(
@@ -76,14 +80,17 @@ class CaptureMixin:
                     "updated_at": now,
                 }
             )
-            self.write_entry_documents(
+            chunks, relations, reminders = self.prepare_entry_bundle(updated, data)
+            self.persist_entry_documents_and_bundle_locked(
                 updated,
                 data,
+                chunks,
+                relations,
+                reminders,
                 action="media_restore",
                 log_summary="恢复收藏视频媒体",
-                commit_message=f"media: restore {entry.video_id} {entry.title}",
+                commit_message=f"media: restore {current.video_id} {current.title}",
             )
-            self.database.upsert_entry(updated, data)
         return self.database.update_job(
             job.id,
             status=JobStatus.COMPLETED,

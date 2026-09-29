@@ -89,7 +89,7 @@ Jinja2 模板 + 原生 JS + CSS 变量令牌。
 ## 本地预览（隔离运行实例）
 
 ```bash
-DOUYIN_WIKI_CONFIG=$PWD/.local-test/config.toml uv run douyin-wiki web run
-# 端口 8766，复用真实 Vault 只读浏览；不影响 8765 常驻实例
+# 先准备 .test-web/config.toml，使用独立临时 Vault，并将 web.port 设为 8766。
+DOUYIN_WIKI_CONFIG=$PWD/.test-web/config.toml uv run douyin-wiki web run
 uv run pytest tests/test_web.py
 ```

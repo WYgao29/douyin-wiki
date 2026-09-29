@@ -1,4 +1,4 @@
-"""R5 Major fixes: sticky analysis_candidate + correction segment ID remapping."""
+"""Correction segment normalization and analysis retry recovery."""
 
 from __future__ import annotations
 

@@ -7,8 +7,9 @@
 - `*_locked` 表示原有锁前提，重命名不改变获取锁的责任。
 - 协作方法并不自动成为 Web、CLI 或 MCP 接口；外部接口仍由各适配层显式定义。
 
-N13 将 31 个跨文件方法去掉前导 `_`，包括四个 `process_*` 调度入口及 `ocr_model` 属性。
-七个文件仍合计 121 个方法，无重名；参数、返回值、装饰器、调用顺序与锁语义不变。
-原有单文件辅助方法保持私有。不涉及 Gateway 自动唤醒（M3）。
+`process_*` 调度入口、资料发布和证据处理等跨 mixin 操作使用协作方法。调用
+`persist_entry_documents_and_bundle_locked` 前须持有 `entry_operations_locked()`；
+不持锁的调用方使用 `persist_entry_documents_and_bundle`。Worker 发布资料还会在
+SQLite 写事务中校验租约，避免已失去任务所有权的执行者覆盖新结果。
 
 后续拆分文件时，应同时核对定义、跨文件调用、测试及字符串形式的 mock 名称。

@@ -470,10 +470,17 @@ class ImportMixin:
             return
         with suppress(JobStateError):
             parent = self.database.get_job(parent_job_id)
-            if parent.kind != "creator_import" or parent.status != JobStatus.MONITORING:
+            if parent.kind != "creator_import" or parent.status not in {
+                JobStatus.MONITORING,
+                JobStatus.COMPLETED,
+                JobStatus.COMPLETED_WITH_WARNINGS,
+            }:
                 return
             child_ids = list(parent.result.get("child_job_ids", []))
+            if not child_ids:
+                return
             children = [self.database.get_job(job_id) for job_id in child_ids]
+            child_updates = {child.id: child.updated_at.isoformat() for child in children}
             terminal = {
                 JobStatus.COMPLETED,
                 JobStatus.COMPLETED_WITH_WARNINGS,
@@ -492,8 +499,11 @@ class ImportMixin:
             if children and finished < len(children):
                 self.database.update_job(
                     parent.id,
+                    status=JobStatus.MONITORING,
                     progress=0.65 + 0.35 * finished / len(children),
-                    result=result,
+                    result={**result, "completed_count": finished, "warning_count": 0},
+                    expected_updated_at=parent.updated_at,
+                    expected_child_updates=child_updates,
                 )
                 return
             warnings = counts.get(JobStatus.FAILED.value, 0) + counts.get(
@@ -505,4 +515,6 @@ class ImportMixin:
                 progress=1,
                 result={**result, "completed_count": len(children), "warning_count": warnings},
                 unlock=True,
+                expected_updated_at=parent.updated_at,
+                expected_child_updates=child_updates,
             )

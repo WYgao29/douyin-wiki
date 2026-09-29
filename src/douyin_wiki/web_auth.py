@@ -6,7 +6,7 @@ import asyncio
 import fcntl
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from .auth_guidance import auth_channel
 from .errors import BrowserAuthRequiredError, ExternalToolError, JobStateError
@@ -42,6 +42,7 @@ class WebAuthManager:
         self.service = service
         self.sleep = sleep
         self._tasks: dict[str, asyncio.Task] = {}
+        self._locks: dict[str, TextIO] = {}
 
     def _database(self):
         return self.service.database
@@ -63,9 +64,47 @@ class WebAuthManager:
     ) -> dict[str, Any]:
         if channel not in {"video", "douyin"}:
             raise ValueError("授权通道必须是 video 或 douyin")
-        existing = self._database().latest_auth_session(channel, active_only=True)
-        if existing:
-            return existing
+        lock_path = self.service.config.state_dir / f"web-auth-{channel}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_path.open("a+")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            # Another Web process (or this manager) owns the executor. Its
+            # session may still be in the short window before the DB insert.
+            for _ in range(20):
+                existing = self._database().latest_auth_session(channel, active_only=True)
+                if existing:
+                    return existing
+                await asyncio.sleep(0.05)
+            raise JobStateError("授权会话正在启动，请稍后重试") from None
+        try:
+            while existing := self._database().latest_auth_session(channel, active_only=True):
+                self._database().update_auth_session(
+                    existing["id"],
+                    stage="cancelled",
+                    error_summary="原授权进程已退出，请重新授权",
+                    complete=True,
+                )
+            session = await self._start_locked(
+                channel, lock, trigger_job_id=trigger_job_id,
+                timeout_seconds=timeout_seconds,
+            )
+            return session
+        except BaseException:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+            raise
+
+    async def _start_locked(
+        self,
+        channel: str,
+        lock: TextIO,
+        *,
+        trigger_job_id: str | None,
+        timeout_seconds: int | None,
+    ) -> dict[str, Any]:
         scope = "video" if channel == "video" else "image_note"
         if trigger_job_id:
             trigger = self.service.get_job(trigger_job_id)
@@ -86,10 +125,40 @@ class WebAuthManager:
             loop = asyncio.get_running_loop()
             task = loop.create_task(self._run(session["id"], timeout_seconds=timeout))
             self._tasks[session["id"]] = task
-            task.add_done_callback(lambda _: self._tasks.pop(session["id"], None))
+            self._locks[session["id"]] = lock
+            task.add_done_callback(lambda _: self._release(session["id"]))
         except RuntimeError:
-            await self._run(session["id"], timeout_seconds=timeout)
+            try:
+                await self._run(session["id"], timeout_seconds=timeout)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                lock.close()
         return self._database().get_auth_session(session["id"])
+
+    def _release(self, session_id: str) -> None:
+        self._tasks.pop(session_id, None)
+        lock = self._locks.pop(session_id, None)
+        if lock is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+
+    async def close(self) -> None:
+        """End only sessions whose executors belong to this Web manager."""
+        tasks = list(self._tasks.items())
+        for session_id, task in tasks:
+            current = self._database().get_auth_session(session_id)
+            if current["stage"] in ACTIVE_STAGES:
+                self._database().update_auth_session(
+                    session_id,
+                    stage="cancelled",
+                    error_summary="Web 服务已关闭，请重新授权",
+                    complete=True,
+                )
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
+        for session_id, _ in tasks:
+            self._release(session_id)
 
     def get(self, session_id: str) -> dict[str, Any]:
         return self._database().get_auth_session(session_id)
@@ -245,5 +314,3 @@ class WebAuthManager:
             retried_job_ids=retried,
             complete=True,
         )
-
-
